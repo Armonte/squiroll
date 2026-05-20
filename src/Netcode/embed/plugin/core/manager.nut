@@ -297,11 +297,14 @@ Patch("data/system/component/menu_common.nut",function() {
 	}
 });
 
-// Built-in plugins, feel free to comment out if not wanted
-LoadNativePlugin("squiroll/plugin/frame_data.nut","frame_data");
-LoadNativePlugin("squiroll/plugin/input_display.nut","input_display");
-LoadNativePlugin("squiroll/plugin/misc_input.nut","misc_input");
-LoadNativePlugin("squiroll/plugin/ping_display.nut","ping_display");
+// Built-in plugins, feel free to comment out if not wanted.
+// Temporarily disabled for skip-to-battle bring-up — they need UI/font
+// state that the menu init path normally sets up. Re-enable once we wire
+// a stripped-down UI init or get past battle.Create without them.
+//LoadNativePlugin("squiroll/plugin/frame_data.nut","frame_data");
+//LoadNativePlugin("squiroll/plugin/input_display.nut","input_display");
+//LoadNativePlugin("squiroll/plugin/misc_input.nut","misc_input");
+//LoadNativePlugin("squiroll/plugin/ping_display.nut","ping_display");
 
 ::mkdir("plugin");
 ::mkdir("plugin/config");

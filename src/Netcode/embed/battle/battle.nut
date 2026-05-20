@@ -178,9 +178,11 @@ function _SetupInputs(param) {
 
 function _SetupModifiers(param) {
 	foreach(name,modifier in modifiers) {
-		if (!modifier.enabled.call(this,param))continue;
+		::print(::format("[mod] trying %s\n",name));
+		if (!modifier.enabled.call(this,param)) { ::print(::format("[mod] %s disabled\n",name)); continue; }
+		::print(::format("[mod] %s constructing\n",name));
 		modifier.task = modifier.base_class();
-		if (!modifier.task)continue;
+		if (!modifier.task) { ::print(::format("[mod] %s null task\n",name)); continue; }
 		::print(::format("Activating %s...\n",name));
 		if (modifier.async)::loop.AddTask(modifier.task);
 		else AddTask(modifier.task);
@@ -188,15 +190,16 @@ function _SetupModifiers(param) {
 }
 
 function Create( param ) {
-	_HideNames();
-	_SetRPC(param);
-	_SetCoreFunctions();
-	_SetupBattleFuncs(param);
-	_SetupWorld(param);
-	_SetupTeams(param);
-	_SetupProfilePictures();
-	_SetupInputs(param);
-	_SetupModifiers(param);
+	::print("[bC] _HideNames\n");          _HideNames();
+	::print("[bC] _SetRPC\n");             _SetRPC(param);
+	::print("[bC] _SetCoreFunctions\n");   _SetCoreFunctions();
+	::print("[bC] _SetupBattleFuncs\n");   _SetupBattleFuncs(param);
+	::print("[bC] _SetupWorld\n");         _SetupWorld(param);
+	::print("[bC] _SetupTeams\n");         _SetupTeams(param);
+	::print("[bC] _SetupProfilePictures\n"); _SetupProfilePictures();
+	::print("[bC] _SetupInputs\n");        _SetupInputs(param);
+	::print("[bC] _SetupModifiers\n");     _SetupModifiers(param);
+	::print("[bC] done\n");
 	//::rollback.start();
 }
 

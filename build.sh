@@ -24,3 +24,10 @@ FLAGS="/Gs- /GS- /clang:-fwrapv /Zc:threadSafeInit- -mfpmath=sse -msse2 -msse -m
 
 clang-cl-19 -m32 -fuse-ld=lld /EHsc $WARNINGS $DEFINES $INCLUDES $FLAGS /Isrc/shared src/th155r/main.cpp src/th155r/th155r.res -O2 /link $LIBPATHS /OUT:th155r.exe
 clang-cl-19 -m32 -fuse-ld=lld /EHsc $WARNINGS $DEFINES $INCLUDES $FLAGS /Isrc/shared /Isrc/Netcode/include src/Netcode/*.cpp /std:c++20 -O2 /link /DLL $LIBPATHS user32.lib WS2_32.lib dbghelp.lib winmm.lib -exclude-all-symbols -kill-at /DEF:Netcode.def /OUT:Netcode.dll
+
+# Auto-deploy to the AoCF game folder so iteration doesn't need a manual cp.
+DEPLOY_DIR="/mnt/c/dev/aocf/th155"
+if [ -d "$DEPLOY_DIR" ]; then
+  cp -f Netcode.dll th155r.exe "$DEPLOY_DIR/"
+  echo "Deployed Netcode.dll + th155r.exe to $DEPLOY_DIR"
+fi
