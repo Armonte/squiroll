@@ -9,3 +9,23 @@ out/
 *.res
 *.cso
 .vscode
+
+# Generated embed headers (created by tools/make_embed_linux.run from build.sh)
+src/Netcode/embed/**/*.nut.h
+src/Netcode/embed/*.nut.h
+
+# Build tooling artifacts
+/tools/*.run
+/tools/*.exe
+
+# Linux cross-compile cache (xwin SDK download, ~1.5GB)
+/.xwin-cache/
+
+# LLVM apt installer (downloaded during toolchain bootstrap)
+/llvm.sh
+/llvm.sh.*
+
+# Runtime logs + backups
+squiroll.log
+squiroll_dbg.txt
+*.bak
