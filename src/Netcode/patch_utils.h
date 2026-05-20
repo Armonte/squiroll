@@ -35,6 +35,13 @@ void hotpatch_ret(void* target, uint16_t pop_bytes);
 void hotpatch_rel32(void* target, void* replacement);
 void hotpatch_import(void* addr, void* replacement);
 
+// For function-entry hooks with trampolines, use safetyhook::InlineHook
+// from deps/safetyhook (see live_actors.cpp for the pattern). The
+// previous hand-rolled hotpatch_entry + mini-LDE that lived here was
+// retired once safetyhook was vendored — it handled the common cases
+// but bit us twice on subtle bugs (6-byte JMP write corrupting func+5,
+// and arg-count mismatches surviving as silent stack corruption).
+
 template <typename T, typename R>
 static forceinline void hotpatch_call(T target, R replacement) {
     return hotpatch_call((void*)target, (void*)replacement);

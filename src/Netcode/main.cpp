@@ -20,6 +20,7 @@
 #include "better_game_loop.h"
 #include "discord.h"
 #include "RSACache.h"
+#include "live_actors.h"
 
 #include <shared.h>
 
@@ -290,6 +291,12 @@ bool common_init(
     mem_write(createmutex_patch_addr, PATCH_BYTES<0x68, 0x00, 0x00, 0x00, 0x00>); //mutex patch
 
     patch_netplay();
+
+    // Hook Actor2DManager::CreateActor2D* + Actor2D::Release so we have a
+    // live registry of every ManbowActor2D* the moment one comes into
+    // existence. Required by the rollback save/load path (gekko_bridge).
+    // Must run before any Squirrel-driven actor creation.
+    live_actors::install();
 
     LARGE_INTEGERX qpc_freq;
     QueryPerformanceFrequency(&qpc_freq);
