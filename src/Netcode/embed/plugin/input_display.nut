@@ -18,7 +18,7 @@ config = {
         blue = 0.0
         alpha = 1.0
         offset = 30
-        count = 13
+        list_max = 13
         timer = 200
         notation = "1,2,3,4, ,6,7,8,9,A,B,C,E,D,[B]"
         frame_count = false
@@ -34,7 +34,7 @@ config = {
         blue = 0.0
         alpha = 1.0
         offset = 30
-        count = 13
+        list_max = 13
         timer = 200
         notation = "1,2,3,4, ,6,7,8,9,A,B,C,E,D,[B]"
         frame_count = false
@@ -57,7 +57,7 @@ class modifier extends modifier {
             notation = ::split(config.notation,",");
 
             for (local i = 0; i < config.list_max; ++i) {
-                local t = ::UI.core.Text("");
+                local t = ::UI.Core.Text("");
                 t.x = config.x;
                 t.y = config.y - (i * config.offset);
                 t.sx = config.sx;
