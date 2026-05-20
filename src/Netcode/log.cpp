@@ -19,6 +19,62 @@ static int cdecl normal_mbox(const char* caption, const UINT type, const char* t
 
 mbox_t* log_mbox = &normal_mbox;
 
+// Mirror of stdout to a log file so output survives crashes. log_printf and
+// the Squirrel sq_setprintfunc handler both fan out via tee_vprintf below.
+// stdout itself is left alone (CONOUT$ from enable_debug_console), so the
+// console window keeps showing live output.
+FILE* g_log_file = nullptr;
+
+void open_log_file(const char* path) {
+    if (g_log_file) return;
+    g_log_file = fopen(path, "w");
+    if (g_log_file) {
+        setvbuf(g_log_file, nullptr, _IONBF, 0);
+        fputs("=== squiroll log start ===\n", g_log_file);
+    }
+}
+
+static void tee_vprintf(FILE* stream, const char* format, va_list va) {
+    va_list va_copy;
+    va_copy(va_copy, va);
+    vfprintf(stream, format, va_copy);
+    va_end(va_copy);
+    if (g_log_file && stream != g_log_file) {
+        vfprintf(g_log_file, format, va);
+    }
+}
+
+extern "C" void cdecl tee_printf(const char* format, ...) {
+    va_list va;
+    va_start(va, format);
+    tee_vprintf(stdout, format, va);
+    va_end(va);
+}
+
+extern "C" void cdecl tee_fprintf(FILE* stream, const char* format, ...) {
+    va_list va;
+    va_start(va, format);
+    tee_vprintf(stream, format, va);
+    va_end(va);
+}
+
+// Squirrel sq_setprintfunc handlers — same fan-out, but signature must
+// take an opaque VM handle as the first arg, which we ignore. Use void*
+// here to avoid pulling in squirrel.h.
+extern "C" void sq_print_tee(void*, const char* fmt, ...) {
+    va_list va;
+    va_start(va, fmt);
+    tee_vprintf(stdout, fmt, va);
+    va_end(va);
+}
+
+extern "C" void sq_error_tee(void*, const char* fmt, ...) {
+    va_list va;
+    va_start(va, fmt);
+    tee_vprintf(stderr, fmt, va);
+    va_end(va);
+}
+
 #if !DISABLE_ALL_LOGGING_FOR_BUILD
 
 typedef void cdecl vprintf_t(const char* format, va_list va);

@@ -258,6 +258,11 @@ bool common_init(
     if (log_type != NO_LOGGING) {
         enable_debug_console(log_type == LOG_TO_PARENT_CONSOLE);
         patch_throw_logs();
+        // Tee stdout/stderr into squiroll.log without redirecting them, so
+        // the console keeps live output AND the file survives a crash.
+        open_log_file("squiroll.log");
+        log_printf  = tee_printf;
+        log_fprintf = tee_fprintf;
     }
     else {
         log_printf = printf_dummy;

@@ -80,6 +80,16 @@ static void cdecl fprintf_dummy(FILE* stream, const char* format, ...) {
 
 void patch_throw_logs();
 
+// File mirror of stdout; opened by open_log_file in common_init. Exposed so
+// plugin.cpp can install a Squirrel print func that also fans out to it.
+extern FILE* g_log_file;
+void open_log_file(const char* path);
+extern "C" void cdecl tee_printf(const char* format, ...);
+extern "C" void cdecl tee_fprintf(FILE* stream, const char* format, ...);
+// Squirrel sq_setprintfunc handlers (signature: SQPRINTFUNCTION).
+extern "C" void sq_print_tee(void* vm, const char* fmt, ...);
+extern "C" void sq_error_tee(void* vm, const char* fmt, ...);
+
 #else
 
 #define CONNECTION_LOGGING CONNECTION_LOGGING_NONE
