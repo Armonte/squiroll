@@ -73,6 +73,7 @@ float get_timer_leniency();
 
 bool get_hide_wip_enabled();
 bool get_skip_intro_enabled();
+bool get_skip_to_battle_enabled();
 int8_t get_discord_enabled();
 bool get_dev_mode_enabled();
 void set_discord_enabled(bool state);

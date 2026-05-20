@@ -497,6 +497,7 @@ extern "C" {
                 sq_createtable(v, _SC("misc"), [](HSQUIRRELVM v){
                     sq_setbool(v, _SC("hide_wip"), get_hide_wip_enabled());
                     sq_setbool(v, _SC("skip_intro"), get_skip_intro_enabled()); // This isn't a function because it only runs once anyway
+                    sq_setbool(v, _SC("skip_to_battle"), get_skip_to_battle_enabled());
                 });
                 sq_createtable(v, _SC("network"),[](HSQUIRRELVM v){
                     sq_setfunc(v, _SC("update_consts"), update_network_constants);

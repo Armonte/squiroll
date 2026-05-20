@@ -100,6 +100,7 @@ CONFIG_FLT(PERF, TIMER_LENIENCY, "timer_leniency", 4.0);
 #define MISC_SECTION_NAME "misc"
 CONFIG_BOL(MISC, HIDE_WIP, "hide_wip", true);
 CONFIG_BOL(MISC, SKIP_INTRO, "skip_intro", true);
+CONFIG_BOL(MISC, SKIP_TO_BATTLE, "skip_to_battle", false);
 CONFIG_TST(MISC, DISCORD, "discord_integration");
 
 // DO NOT DEFINE NORMAL CONFIGS BELOW THIS LINE
@@ -148,6 +149,7 @@ static inline constexpr const char
 
         CONFIG_DEFAULT(MISC, HIDE_WIP),
         CONFIG_DEFAULT(MISC, SKIP_INTRO),
+        CONFIG_DEFAULT(MISC, SKIP_TO_BATTLE),
         CONFIG_DEFAULT(MISC, DISCORD)};
 
 static inline constexpr size_t VALIDATE_DEFAULT_CONFIGS() {
@@ -489,6 +491,11 @@ bool get_hide_wip_enabled() {
 static char MISC_SKIP_INTRO_BUFFER[8]{ '\0' };
 bool get_skip_intro_enabled() {
     return GET_BOOL_CONFIG(MISC, SKIP_INTRO);
+}
+
+static char MISC_SKIP_TO_BATTLE_BUFFER[8]{ '\0' };
+bool get_skip_to_battle_enabled() {
+    return GET_BOOL_CONFIG(MISC, SKIP_TO_BATTLE);
 }
 
 static char MISC_DISCORD_BUFFER[8]{ '\0' };
