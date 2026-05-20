@@ -47,6 +47,17 @@ struct ScriptAPI_vtbl {
 struct ScriptAPI { ScriptAPI_vtbl* vftable; };
 #define Act_ScriptAPI_ptr (*(ScriptAPI**)0xB3ACFC_R)
 
+// MSVC CRT per-thread data — holds the rand() seed at offset 0x24. Same
+// definition as rollback.cpp uses; not pulled in via a shared header
+// because rollback.cpp's struct lives inside that translation unit.
+struct ACRTThreadData {
+    char     pad0[0x24];
+    uint32_t rand_state;     // 0x24 — read/written by rand() / srand()
+    char     pad28[0x364 - 0x28];
+};
+typedef ACRTThreadData* stdcall acrt_getptd_t();
+#define acrt_getptd ((acrt_getptd_t*)0x319663_R)
+
 namespace gekko_bridge {
 
 // ------------------------------------------------------------------ state --
@@ -118,7 +129,7 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum) {
     hdr->magic      = SAVE_MAGIC;
     hdr->version    = SAVE_VERSION;
     hdr->frame      = 0; // TODO: pull current frame counter
-    hdr->rand_state = 0; // TODO: read acrt_ptd->rand_state (see rollback.cpp::acrt_getptd)
+    hdr->rand_state = acrt_getptd()->rand_state;
 
     // Snapshot live actor pointers under a fixed cap.
     static constexpr size_t MAX_ACTORS = 1024;
@@ -170,7 +181,7 @@ void load_state_from_buf(const void* buf, uint32_t len) {
         return;
     }
 
-    // TODO: restore acrt_ptd->rand_state = hdr->rand_state
+    acrt_getptd()->rand_state = hdr->rand_state;
     // TODO: restore frame counter if/where it lives
 
     const uint8_t* p = static_cast<const uint8_t*>(buf) + sizeof(SaveHeader);
