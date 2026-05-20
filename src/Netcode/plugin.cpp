@@ -306,6 +306,16 @@ extern "C" {
             // like adding squirrel globals/funcs/etc.
             sq_pushroottable(v);
 
+#if !DISABLE_ALL_LOGGING_FOR_BUILD
+            // Route Squirrel print() / error() through tee_printf so output
+            // appears in BOTH the debug console and the on-disk log file.
+            // Without this, ::print() in .nut files goes only to the console
+            // and is lost on crash.
+            sq_setprintfunc(v,
+                (SQPRINTFUNCTION)sq_print_tee,
+                (SQPRINTFUNCTION)sq_error_tee);
+#endif
+
             sq_setcompilererrorhandler(v, [](HSQUIRRELVM v, const SQChar* desc, const SQChar* src, SQInteger line, SQInteger col) {
 #if !DISABLE_ALL_LOGGING_FOR_BUILD
                 log_printf(
