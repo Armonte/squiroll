@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <windows.h>
+#include <unordered_map>
 
 #include "gekko_bridge.h"
 #include "patch_utils.h"
@@ -78,7 +79,7 @@ static uint32_t fletcher32(const uint8_t* data, size_t len) {
 
 // Header magic + version: bump version whenever the layout changes.
 static constexpr uint32_t SAVE_MAGIC   = 0x46414B47; // 'GKAF'
-static constexpr uint32_t SAVE_VERSION = 1;
+static constexpr uint32_t SAVE_VERSION = 2;          // v2: id-keyed actor blobs
 
 struct SaveHeader {
     uint32_t magic;
@@ -86,11 +87,28 @@ struct SaveHeader {
     uint32_t frame;
     uint32_t rand_state;
     uint32_t actor_count;
-    // followed by actor_count × sizeof(ManbowActor2D) raw bytes.
-    // TODO v2: per-actor sq_addref'd flag1..5 SQObjects (8 bytes each).
-    // TODO v3: Squirrel diff buffer length + bytes.
-    // TODO v4: b2ParticleSystem state.
+    // followed by actor_count records of:
+    //   uint32_t id;                          // Actor2D::id @ 0x18
+    //   uint8_t  body[sizeof(ManbowActor2D)]; // raw 0xEC bytes
+    // id is the stable join key — the live actor set is unordered so we
+    // can't trust positional ordering. On load we build an id → ptr map
+    // from the current live set and memcpy each saved blob into the
+    // matching slot. Actors saved-but-not-currently-live are skipped
+    // with a count (proper reanimation needs SharedPoolAllocator
+    // deferred-free, separate task).
+    //
+    // TODO v3: per-actor sq_addref'd flag1..5 SQObjects (8 bytes each).
+    // TODO v4: Squirrel diff buffer length + bytes.
+    // TODO v5: b2ParticleSystem state.
 };
+
+#pragma pack(push, 1)
+struct ActorRecord {
+    uint32_t id;
+    uint8_t  body[sizeof(ManbowActor2D)];
+};
+#pragma pack(pop)
+static_assert(sizeof(ActorRecord) == 4 + sizeof(ManbowActor2D));
 
 uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum) {
     if (cap < sizeof(SaveHeader)) return 0;
@@ -110,22 +128,24 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum) {
 
     p += sizeof(SaveHeader);
     uint32_t remaining = cap - sizeof(SaveHeader);
-    uint32_t need = (uint32_t)(n * sizeof(ManbowActor2D));
+    uint32_t need = (uint32_t)(n * sizeof(ActorRecord));
     if (remaining < need) {
         log_printf("gekko_bridge::save_state: buffer too small (%u/%u)\n",
                    remaining, need);
         return 0;
     }
 
-    // Raw memcpy per actor. Caveats:
+    // Per-actor record: [id][raw 0xEC body]. id (Actor2D::id @ 0x18) is
+    // the stable join key the game itself uses internally. Body caveats:
     //   - shared_ptr<AnimationController2D> @ 0x3C copied without addref
-    //     (TODO: bump refcount manually so load_state can find it valid)
     //   - SqratFunction @ 0xA8 + 0xBC holds HSQOBJECT we should sq_addref
-    //   - flag1..5 SQObjects on the SQInstance side are NOT in this struct
-    //     and need separate snapshotting (see Actor2D.h)
+    //   - flag1..5 SQObjects on the SQInstance side are NOT in this
+    //     struct and need separate snapshotting (see Actor2D.h)
     for (size_t i = 0; i < n; ++i) {
-        memcpy(p, actors[i], sizeof(ManbowActor2D));
-        p += sizeof(ManbowActor2D);
+        ActorRecord* rec = (ActorRecord*)p;
+        rec->id = (uint32_t)actors[i]->id;
+        memcpy(rec->body, actors[i], sizeof(ManbowActor2D));
+        p += sizeof(ActorRecord);
     }
 
     uint32_t written = (uint32_t)(p - static_cast<uint8_t*>(buf));
@@ -154,32 +174,46 @@ void load_state_from_buf(const void* buf, uint32_t len) {
     // TODO: restore frame counter if/where it lives
 
     const uint8_t* p = static_cast<const uint8_t*>(buf) + sizeof(SaveHeader);
-    uint32_t need = hdr->actor_count * (uint32_t)sizeof(ManbowActor2D);
+    uint32_t need = hdr->actor_count * (uint32_t)sizeof(ActorRecord);
     if (len - sizeof(SaveHeader) < need) {
-        log_printf("gekko_bridge::load_state: short actor blob\n");
+        log_printf("gekko_bridge::load_state: short actor blob "
+                   "(have %u need %u)\n",
+                   (uint32_t)(len - sizeof(SaveHeader)), need);
         return;
     }
 
-    // Naive restore: walk current live set in the same order as save_state
-    // emitted (snapshot returns whatever order the std::unordered_set
-    // happened to be in — that's NOT stable across reallocations).
-    //
-    // TODO: emit a stable key (Actor2D::id at offset 0x18) alongside each
-    // saved actor and match on id rather than position. Without that, this
-    // will desync the moment an actor was created/destroyed between
-    // save and load.
+    // Build id → live-ptr map. unordered_set iteration is unstable so
+    // positional matching from save would desync the moment one actor
+    // was created or destroyed between save and load. Actor2D::id is
+    // assigned by the manager and stays constant for the actor's
+    // lifetime, so it's the right join key.
     static constexpr size_t MAX_ACTORS = 1024;
-    ManbowActor2D* actors[MAX_ACTORS];
-    size_t n = live_actors::snapshot(actors, MAX_ACTORS);
-    if (n != hdr->actor_count) {
-        log_printf("gekko_bridge::load_state: actor count mismatch (live=%zu saved=%u) — implement id-keyed match\n",
-                   n, hdr->actor_count);
-        // Bail rather than corrupt half the pool with mismatched memcpy.
-        return;
+    ManbowActor2D* live[MAX_ACTORS];
+    size_t live_n = live_actors::snapshot(live, MAX_ACTORS);
+    std::unordered_map<uint32_t, ManbowActor2D*> by_id;
+    by_id.reserve(live_n);
+    for (size_t i = 0; i < live_n; ++i) {
+        by_id.emplace((uint32_t)live[i]->id, live[i]);
     }
-    for (size_t i = 0; i < n; ++i) {
-        memcpy(actors[i], p, sizeof(ManbowActor2D));
-        p += sizeof(ManbowActor2D);
+
+    size_t restored = 0, missing = 0;
+    for (uint32_t i = 0; i < hdr->actor_count; ++i) {
+        const ActorRecord* rec = (const ActorRecord*)p;
+        auto it = by_id.find(rec->id);
+        if (it != by_id.end()) {
+            memcpy(it->second, rec->body, sizeof(ManbowActor2D));
+            ++restored;
+        } else {
+            // Actor was snapshotted but isn't live now — would need
+            // SharedPoolAllocator reanimation. Skip for now.
+            ++missing;
+        }
+        p += sizeof(ActorRecord);
+    }
+    if (missing) {
+        log_printf("gekko_bridge::load_state: restored %zu, %zu actors "
+                   "missing from live pool (deferred-free path needed)\n",
+                   restored, missing);
     }
 }
 
