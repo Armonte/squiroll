@@ -1179,6 +1179,20 @@ void shutdown() {
 bool is_active()         { return g_active; }
 bool is_session_started(){ return g_session_started; }
 
+// Round-end disarm. The interactive fight is exactly battle.state == 8
+// (the engine's own damage code gates on `state != 8`); the round-start
+// intro, KO / time-up demos, win poses and round transitions (states
+// 2/4/64/32/128) are non-interactive and must not be rolled back. When
+// the confirmed state leaves 8 the session is torn down; g_watch_for_fight
+// is re-enabled so pre_arm_poll re-arms at the next round's Round_Fight.
+// A best-of-3 match therefore arms/disarms 1-3 times; if the match has
+// ended, state never returns to 8 and the re-armed watch simply idles.
+static void disarm_for_round_end() {
+    log_printf("[gekko_bridge] round ended (battle.state left 8) -> disarm\n");
+    shutdown();                  // preserves g_watch_dual + dual params
+    g_watch_for_fight = true;    // re-arm at the next Round_Fight
+}
+
 // Solo fast-forward. While a solo stress session owns the frame loop and
 // the backtick (`) key is held, run extra tick()s per rendered frame so a
 // run can reach time-over (~8910 logical frames) in seconds. Netplay is
@@ -1429,6 +1443,20 @@ bool tick() {
     // it once-per-real-frame here keeps audio/RPC alive without
     // polluting the deterministic battle sim.
     update_related(*INPUT_UPDATE_LIST_PTR);
+
+    // Round-end check: once the fight is over (battle.state has left 8),
+    // tear the session down so the non-interactive demo/transition runs
+    // on the vanilla loop, un-rolled-back. Only after the session has
+    // actually started, and only solo for now — dual must drive this off
+    // the confirmed (non-speculative) frame so a predicted-then-rolled-
+    // back KO can't disarm early (TODO when dual is re-tested).
+    if (g_session_started && g_solo) {
+        int st = 0;
+        if (read_battle_state(&st) && st != 8) {
+            disarm_for_round_end();
+            return advanced;
+        }
+    }
 
     // Note: rendering is driven by better_game_loop's window_render
     // call AFTER tick(), not from here. That keeps the window updating
