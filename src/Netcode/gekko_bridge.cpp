@@ -441,14 +441,30 @@ static void inject_forced_inputs_into_recorder() {
     for (size_t i = 0; i < n && i < 2; ++i) {
         auto* dev = recorder->devices[i].get();
         if (!dev) continue;
-        // Grow the ring buffer if needed and push forced bits at the
-        // next write index. The engine's read path will pull from
-        // input_vec[input_read_idx] when it polls this frame.
-        if (dev->input_write_idx >= dev->input_vec.size()) {
-            dev->input_vec.resize(dev->input_write_idx + 1);
+        if (g_evt_trace > 0 && i < 2) {
+            log_printf("[trace] inject dev%zu write=%u read=%u vec=%u in=0x%04x\n",
+                       i, (unsigned)dev->input_write_idx,
+                       (unsigned)dev->input_read_idx,
+                       (unsigned)dev->input_vec.size(), forced_inputs[i]);
         }
-        dev->input_vec[dev->input_write_idx] = forced_inputs[i];
-        ++dev->input_write_idx;
+        // Deterministic recorder feed for rollback. Write gekko's input
+        // AT the current read index and set write exactly one ahead.
+        // The battle's input device then reads input_vec[read_idx] —
+        // which is precisely our forced value — and advances read_idx.
+        //
+        // The OLD approach pushed at write_idx and let both indices
+        // climb. But the vanilla SyncInput pre-fills the ring buffer by
+        // a different amount on each peer (host had write=3/vec=7,
+        // client write=1/vec=1), so the battle read DIFFERENT inputs on
+        // each peer -> desync. The absolute index values are
+        // per-process and don't matter; only the VALUE at read_idx must
+        // match cross-peer, which writing-at-read guarantees.
+        uint32_t ri = dev->input_read_idx;
+        if (ri >= dev->input_vec.size()) {
+            dev->input_vec.resize(ri + 1);
+        }
+        dev->input_vec[ri] = forced_inputs[i];
+        dev->input_write_idx = ri + 1;
     }
 }
 
