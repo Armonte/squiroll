@@ -118,9 +118,35 @@ function Update()
 {
 	::input_all.Update();
 
+	// Gekko rollback: once the gekko session owns the frame loop, the
+	// scene must advance EXACTLY ONCE per engine frame, ungated. The
+	// vanilla netplay branch below runs the scene inside
+	// `while (::network.inst.SyncInput())` — SyncInput() is the
+	// DELAY-BASED netcode's "is the peer's input ready" check. Under
+	// gekko, inputs are supplied by gekko (injected into the recorder),
+	// not the delay-based stream; SyncInput() returns false for the
+	// first ~10 frames on the client (its delay-based stream primes
+	// asymmetrically vs the host) and the battle stalls -> the two
+	// peers' engine `count` drift apart -> desync. Bypass the gate.
+	local gekko_on = ("network" in ::setting)
+	              && ("gekko_session_started" in ::setting.network)
+	              && ::setting.network.gekko_session_started();
+
 	if (this.pause_count > 0)
 	{
 		this.pause_count--;
+	}
+	else if (gekko_on)
+	{
+		if (this.env_stack.len() > 0)
+		{
+			this.env_stack.top().Update();
+		}
+
+		foreach( v in this.task )
+		{
+			v.Update();
+		}
 	}
 	else if (::network.IsPlaying() && ::network.ready && !::network.received_request)
 	{
