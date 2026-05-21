@@ -215,29 +215,6 @@ static int blob_extract_count(const uint8_t* blob, uint32_t len) {
     return -1;
 }
 
-// Invoke the root-level Squirrel function ::__gekko_do_vs_init() — boot.nut
-// installs this when gekko is enabled. It runs the deferred vs.Initialize
-// (battle.Create + battle.Begin + loop.Begin), bringing the engine fully
-// into the battle scene. We call this the instant GekkoSessionStarted
-// fires, BEFORE the same tick's gekko_add_local_input, so gekko's frame-0
-// save captures the post-vs.Initialize battle. Returns true on success.
-static bool call_squirrel_vs_init() {
-    if (!v) return false;
-    SQInteger top0 = sq_gettop(v);
-    sq_pushroottable(v);
-    sq_pushstring(v, _SC("__gekko_do_vs_init"), -1);
-    if (SQ_FAILED(sq_get(v, -2))) {
-        log_printf("[gekko_bridge] __gekko_do_vs_init not found\n");
-        sq_settop(v, top0);
-        return false;
-    }
-    sq_pushroottable(v);  // this = root table
-    bool ok = SQ_SUCCEEDED(sq_call(v, 1, SQFalse, SQTrue));
-    if (!ok) log_printf("[gekko_bridge] __gekko_do_vs_init threw\n");
-    sq_settop(v, top0);
-    return ok;
-}
-
 // ---------------------------------------------------------------- save/load --
 
 // Header magic + version: bump version whenever the layout changes.
@@ -652,21 +629,54 @@ static bool read_battle_state(int* out) {
     return ok;
 }
 
+// Deferred-arm parameters. g_watch_dual selects init() vs init_solo();
+// the *_dual fields carry init()'s args captured at watch time.
+static bool     g_watch_dual        = false;
+static uint16_t g_watch_local_port  = 0;
+static uint16_t g_watch_remote_port = 0;
+static uint8_t  g_watch_local_idx   = 0;
+static char     g_watch_remote_ip[64] = {0};
+
 void watch_for_fight_solo() {
     g_watch_for_fight = true;
+    g_watch_dual = false;
     log_printf("[gekko_bridge] watching for Round_Fight to arm solo session\n");
+}
+
+void watch_for_fight_dual(uint16_t local_port, uint16_t remote_port,
+                          uint8_t local_idx, const char* remote_ip)
+{
+    g_watch_for_fight   = true;
+    g_watch_dual        = true;
+    g_watch_local_port  = local_port;
+    g_watch_remote_port = remote_port;
+    g_watch_local_idx   = local_idx;
+    snprintf(g_watch_remote_ip, sizeof(g_watch_remote_ip), "%s",
+             remote_ip ? remote_ip : "127.0.0.1");
+    log_printf("[gekko_bridge] watching for Round_Fight to arm dual session "
+               "(local=%u remote=%u idx=%u ip=%s)\n",
+               local_port, remote_port, (unsigned)local_idx, g_watch_remote_ip);
 }
 
 // Called every vanilla-loop frame (from better_game_loop) before any
 // session exists. Once battle.state reaches Round_Fight (8), the intro
-// is over — create the solo session so gekko frame 0 is fight frame 0.
+// is over — create the gekko session so gekko frame 0 is fight frame 0.
+// Solo arms a GekkoStressSession (started immediately); dual arms a
+// GekkoGameSession (then better_game_loop holds the frame loop until
+// the handshake fires GekkoSessionStarted).
 void pre_arm_poll() {
     if (!g_watch_for_fight || g_session) return;
     int st = 0;
     if (read_battle_state(&st) && st == 8 /* Round_Fight */) {
         g_watch_for_fight = false;
-        log_printf("[gekko_bridge] Round_Fight reached -> arming solo session\n");
-        init_solo();
+        if (g_watch_dual) {
+            log_printf("[gekko_bridge] Round_Fight reached -> arming dual session\n");
+            init(g_watch_local_port, g_watch_remote_port,
+                 g_watch_local_idx, g_watch_remote_ip);
+        } else {
+            log_printf("[gekko_bridge] Round_Fight reached -> arming solo session\n");
+            init_solo();
+        }
     }
 }
 
@@ -731,17 +741,13 @@ bool tick() {
                            e->data.disconnected.handle);
                 break;
             case GekkoSessionStarted:
-                log_printf("[gekko_bridge] SessionStarted -> running deferred vs.Initialize\n");
-                // Run vs.Initialize NOW, synchronously, before this same
-                // tick's gekko_add_local_input. That makes gekko's
-                // frame-0 save capture the fully-initialized battle
-                // (battle.Create + battle.Begin → state=2). If we let
-                // vanilla update run vs.Initialize a frame later, the
-                // battle setup would happen between gekko frames and
-                // rollback could never reproduce it.
-                call_squirrel_vs_init();
+                // vs.Initialize already ran under the vanilla loop and
+                // the intro played out before the session was created
+                // at Round_Fight — so there is nothing deferred to run
+                // here. The handshake is done: gekko now owns the frame
+                // loop, frame 0 = the held Round_Fight frame.
                 g_session_started = true;
-                log_printf("[gekko_bridge] vs.Initialize done -> gekko owns frame loop\n");
+                log_printf("[gekko_bridge] SessionStarted -> gekko owns frame loop\n");
                 break;
             case GekkoDesyncDetected: {
                 // DESYNC is loud — Gekko fires it for every frame the

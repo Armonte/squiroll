@@ -54,12 +54,15 @@ bool init(uint16_t local_port, uint16_t remote_port,
 // run) — it just creates the session and takes the frame loop.
 bool init_solo();
 
-// Deferred-arm for the solo path: boot.nut runs vs.Initialize normally
-// so the round-start intro plays under the vanilla loop, then calls
-// this. pre_arm_poll() then watches battle.state and fires init_solo()
-// the instant the intro ends and Round_Fight begins — so gekko frame 0
-// is fight frame 0 and the rollback never touches the intro.
+// Deferred-arm: boot.nut runs vs.Initialize normally so the round-start
+// intro plays under the vanilla loop, then calls one of these.
+// pre_arm_poll() watches battle.state and creates the gekko session the
+// instant Round_Fight begins — so gekko frame 0 is fight frame 0 and the
+// rollback never touches the intro. _solo arms a GekkoStressSession (no
+// handshake); _dual arms a GekkoGameSession with the given peer params.
 void watch_for_fight_solo();
+void watch_for_fight_dual(uint16_t local_port, uint16_t remote_port,
+                          uint8_t local_idx, const char* remote_ip);
 void pre_arm_poll();
 
 void shutdown();

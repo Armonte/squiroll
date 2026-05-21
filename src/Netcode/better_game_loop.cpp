@@ -137,15 +137,25 @@ void stdcall better_game_loop() {
                 gekko_bridge::tick();
             }
             frames_this_sec += window_render();
+        } else if (gekko_bridge::is_active()) {
+            // Dual handshake hold: the GekkoGameSession was created at
+            // Round_Fight and its UDP handshake is in flight. Pump
+            // tick() so the handshake completes and SessionStarted can
+            // fire, but DO NOT advance the engine — the game holds on
+            // fight-frame-0 until both peers are connected, so gekko
+            // frame 0 is the identical Round_Fight state on both sides.
+            // (Solo never reaches here — init_solo() sets is_active and
+            // is_session_started together, so it goes straight to the
+            // branch above.)
+            gekko_bridge::tick();
+            frames_this_sec += window_render();
         } else {
-            if (gekko_bridge::is_active()) {
-                gekko_bridge::tick();   // background UDP poll + handshake
-            }
+            // Pre-arm: the menu and the round-start intro run here under
+            // the vanilla loop. pre_arm_poll() arms the gekko session
+            // the instant battle.state hits Round_Fight, so gekko never
+            // rolls back the intro.
             run_update_list(*input_update_list);
             window_update_frame();
-            // Solo: the intro runs here under the vanilla loop; this
-            // arms the gekko session the instant battle.state hits
-            // Round_Fight, so gekko never rolls back the intro.
             gekko_bridge::pre_arm_poll();
             // NOTE: Not handling "SkipRender" because that doesn't seem to be used in AoCF
             frames_this_sec += window_render();

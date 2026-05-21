@@ -82,32 +82,25 @@ function OverrideCSSForAutoConnect() {
             return;
         }
 
-        // Gekko path: kick off the session BEFORE vs.Initialize. The
-        // actual vs.Initialize is deferred — gekko_bridge invokes
-        // ::__gekko_do_vs_init() from C++ the instant GekkoSessionStarted
-        // fires, so the battle is created exactly once, synchronously,
-        // right before gekko takes its frame-0 save. No vanilla update
-        // runs between battle creation and gekko taking over.
+        // Gekko path: run vs.Initialize NOW so the round-start intro
+        // plays out under the vanilla loop. Both peers run the intro
+        // locally — it is deterministic from the shared rand_seed, so
+        // they reach Round_Fight with identical battle state. The
+        // GekkoGameSession is created at Round_Fight by pre_arm_poll;
+        // the game then holds at fight-frame-0 until the handshake
+        // completes (SessionStarted). gekko never rolls back the intro.
         local gk_port_base = ::setting.network.peer_port;
         local local_port  = ::network.is_client ? gk_port_base + 11 : gk_port_base + 10;
         local remote_port = ::network.is_client ? gk_port_base + 10 : gk_port_base + 11;
 
-        ::gekko_pending_param <- param;
-        ::__gekko_do_vs_init <- function () {
-            ::print("[squiroll boot] __gekko_do_vs_init -> vs.Initialize\n");
-            ::vs.Initialize(::gekko_pending_param);
-            ::print("[squiroll boot] vs.Initialize complete\n");
-        };
-
-        ::print("[squiroll boot] gekko_init local=" + local_port
-                + " remote=" + remote_port
-                + " idx=" + our_slot
+        ::print("[squiroll boot] dual: vs.Initialize (intro runs vanilla); "
+                + "watch_for_fight_dual local=" + local_port
+                + " remote=" + remote_port + " idx=" + our_slot
                 + " ip=" + ::setting.network.peer_ip + "\n");
-        local ok = ::setting.network.gekko_init(local_port, remote_port,
-                                                our_slot,
-                                                ::setting.network.peer_ip);
-        ::print("[squiroll boot] gekko_init returned " + ok
-                + " (waiting for SessionStarted; vs.Initialize deferred)\n");
+        ::vs.Initialize(param);
+        ::setting.network.gekko_watch_for_fight_dual(local_port, remote_port,
+                                                     our_slot,
+                                                     ::setting.network.peer_ip);
     };
 }
 

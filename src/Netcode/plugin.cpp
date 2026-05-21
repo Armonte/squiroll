@@ -528,6 +528,29 @@ extern "C" {
                         gekko_bridge::watch_for_fight_solo();
                         return 0;
                     });
+                    // gekko_watch_for_fight_dual(local_port, remote_port,
+                    // local_idx, remote_ip) — dual netplay. boot.nut calls
+                    // this AFTER vs.Initialize; the GekkoGameSession is
+                    // created when battle.state hits Round_Fight.
+                    sq_setfunc(v, _SC("gekko_watch_for_fight_dual"), [](HSQUIRRELVM v) -> SQInteger {
+                        SQInteger local_port, remote_port, local_idx;
+                        const SQChar* remote_ip;
+                        if (sq_gettop(v) != 5 ||
+                            SQ_FAILED(sq_getinteger(v, 2, &local_port)) ||
+                            SQ_FAILED(sq_getinteger(v, 3, &remote_port)) ||
+                            SQ_FAILED(sq_getinteger(v, 4, &local_idx)) ||
+                            SQ_FAILED(sq_getstring(v, 5, &remote_ip))
+                        ) {
+                            return sq_throwerror(v,
+                                "Invalid arguments, expected: "
+                                "<local_port:int> <remote_port:int> "
+                                "<local_idx:int> <remote_ip:string>");
+                        }
+                        gekko_bridge::watch_for_fight_dual(
+                            (uint16_t)local_port, (uint16_t)remote_port,
+                            (uint8_t)local_idx, remote_ip);
+                        return 0;
+                    });
                     sq_setfunc(v, _SC("gekko_shutdown"), [](HSQUIRRELVM v) -> SQInteger {
                         gekko_bridge::shutdown();
                         return 0;
