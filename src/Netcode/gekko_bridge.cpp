@@ -82,6 +82,8 @@ static uint8_t       g_local_idx = 0;
 static bool          g_active          = false; // session exists; UDP handshake can run
 static bool          g_session_started = false; // SessionStarted fired + vs.Initialize done;
                                                  // gekko owns the frame counter
+static bool          g_solo            = false; // single-process GekkoStressSession:
+                                                 // both players local, no networking
 static uint32_t      g_evt_trace = 0;            // diagnostic: # of Save/Load/
                                                  // Advance events to trace with
                                                  // engine count. 0 = off (set
@@ -567,14 +569,57 @@ bool init(uint16_t local_port, uint16_t remote_port,
     return true;
 }
 
+bool init_solo() {
+    if (g_session) return false;
+
+    g_solo = true;
+    gekko_create(&g_session, GekkoStressSession);
+
+    GekkoConfig config = {};
+    config.desync_detection = true;
+    config.input_size = sizeof(uint16_t);
+    config.state_size = 2 * 1024 * 1024;
+    config.max_spectators = 0;
+    config.num_players = 2;
+    // Roll back 8 frames every frame: the stress session re-simulates
+    // current-8 .. current each tick, so save + load + advance all run
+    // hard, in one process. This is the rig for rollback determinism /
+    // perf iteration.
+    config.check_distance = 8;
+
+    gekko_start(g_session, &config);
+
+    // Both players are local — no net adapter, no handshake.
+    g_local_idx = 0;
+    for (int i = 0; i < 2; ++i) {
+        gekko_add_actor(g_session, GekkoLocalPlayer, nullptr);
+        gekko_set_local_delay(g_session, i, 1);
+    }
+
+    g_active = true;
+    live_actors::set_defer_release(true);
+
+    // A stress session never emits GekkoSessionStarted, so run the
+    // deferred vs.Initialize here, synchronously, before the first
+    // tick's gekko_add_local_input — same ordering the dual path gets
+    // from its SessionStarted handler.
+    call_squirrel_vs_init();
+    g_session_started = true;
+
+    log_printf("gekko_bridge: SOLO stress session up. check_distance=%u\n",
+               config.check_distance);
+    return true;
+}
+
 void shutdown() {
     if (g_session) {
-        gekko_default_adapter_destroy();
+        if (!g_solo) gekko_default_adapter_destroy();
         gekko_destroy(&g_session);
         g_session = nullptr;
     }
     g_active = false;
     g_session_started = false;
+    g_solo = false;
     // Flush any actors held by defer-release so the engine can actually
     // reclaim their slots once we're done with the session.
     live_actors::set_defer_release(false);
@@ -660,6 +705,12 @@ bool tick() {
     if (g_session_started) {
         uint16_t my_input = read_local_input_bits();
         gekko_add_local_input(g_session, g_local_idx, &my_input);
+        // Solo stress session: both players are local, so drive the
+        // second one too. Same input bits — a stress run exercises the
+        // save/load/rollback path, it is not a real match.
+        if (g_solo) {
+            gekko_add_local_input(g_session, 1, &my_input);
+        }
     }
 
     count = 0;

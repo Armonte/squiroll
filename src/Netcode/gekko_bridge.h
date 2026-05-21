@@ -46,6 +46,12 @@ namespace gekko_bridge {
 // Lifecycle (call from common_init, after Squirrel + Netcode are up).
 bool init(uint16_t local_port, uint16_t remote_port,
           uint8_t local_player_idx, const char* remote_ip);
+// Single-process stress session: a GekkoStressSession with both players
+// local and no networking. It rolls back `check_distance` frames every
+// frame, so the full save/load path is exercised hard in one instance —
+// the rig for iterating on rollback determinism and perf without two
+// processes. No handshake, so it self-triggers vs.Initialize.
+bool init_solo();
 void shutdown();
 bool is_active();          // session exists; UDP poll runs in background
 bool is_session_started(); // GekkoSessionStarted fired; tick() owns the frame

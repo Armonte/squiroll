@@ -520,6 +520,14 @@ extern "C" {
                         sq_pushbool(v, ok ? SQTrue : SQFalse);
                         return 1;
                     });
+                    // gekko_init_solo() — single-process stress session.
+                    // No args: both players local, no networking. Used by
+                    // boot.nut when auto_connect == "solo".
+                    sq_setfunc(v, _SC("gekko_init_solo"), [](HSQUIRRELVM v) -> SQInteger {
+                        bool ok = gekko_bridge::init_solo();
+                        sq_pushbool(v, ok ? SQTrue : SQFalse);
+                        return 1;
+                    });
                     sq_setfunc(v, _SC("gekko_shutdown"), [](HSQUIRRELVM v) -> SQInteger {
                         gekko_bridge::shutdown();
                         return 0;

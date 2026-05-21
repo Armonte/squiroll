@@ -166,6 +166,58 @@ function Initialize() {
             return;
         }
 
+        if (auto_connect == "solo") {
+            // Single-process gekko stress session. Boots straight into a
+            // VS match (same param as skip_to_battle) but hands the frame
+            // loop to a GekkoStressSession — one instance, full rollback
+            // save/load path exercised. No networking, no second client.
+            ::print("[squiroll boot] entering SOLO gekko stress session\n");
+            local param = ::vs.InitializeParam();
+            param.game_mode      = 1;
+            param.difficulty     = 0;
+            param.device_id[0]   = -1;
+            param.device_id[1]   = -1;
+            param.mode[0]        = 0;
+            param.mode[1]        = 0;
+            param.master_name[0] = "reimu";
+            param.slave_name[0]  = "marisa";
+            param.master_name[1] = "reimu";
+            param.slave_name[1]  = "marisa";
+            param.master_color[0] = 0;
+            param.slave_color[0]  = 0;
+            param.master_color[1] = 1;
+            param.slave_color[1]  = 1;
+            param.spell[0]       = 0;
+            param.spell[1]       = 0;
+            param.background_id  = 26;
+            param.bgm_id         = 1;
+            param.seed           = ::manbow.timeGetTime();
+
+            ::menu.title.Initialize();
+            ::menu.title.Suspend();
+            ::menu.character_select.Initialize(param.game_mode, param.difficulty);
+            ::menu.character_select.Suspend();
+            InstallLoopEndGuard();
+
+            if (!::setting.network.gekko_enabled) {
+                ::print("[squiroll boot] solo: gekko_enabled=false, plain vs.Initialize\n");
+                ::vs.Initialize(param);
+                return;
+            }
+
+            // gekko_init_solo() runs __gekko_do_vs_init synchronously
+            // (a stress session has no SessionStarted handshake).
+            ::gekko_pending_param <- param;
+            ::__gekko_do_vs_init <- function () {
+                ::print("[squiroll boot] __gekko_do_vs_init -> vs.Initialize\n");
+                ::vs.Initialize(::gekko_pending_param);
+                ::print("[squiroll boot] vs.Initialize complete\n");
+            };
+            local ok = ::setting.network.gekko_init_solo();
+            ::print("[squiroll boot] gekko_init_solo returned " + ok + "\n");
+            return;
+        }
+
         if (skip_to_battle) {
             ::print("[squiroll boot] entering SkipToBattle (solo)\n");
             local param = ::vs.InitializeParam();
