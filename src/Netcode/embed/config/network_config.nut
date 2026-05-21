@@ -1,4 +1,5 @@
-::print("FIX:network_config.nut will crash upon compilation\nSRC:UI core code\n");
+// network_config UI page is stubbed out — the UI-core code below is
+// disabled. This file just returns; it does not crash.
 return;
 // ::UI.Menu.call(this,
 // 	::UI.Page(
