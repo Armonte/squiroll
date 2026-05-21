@@ -31,6 +31,10 @@
 ::__gekko_state._skip_keys <- {
     device_id   = true,  // engine input-device slot index (0 local, -1 remote)
     input       = true,  // TF4InputDevice ref — bound to local input recorder
+    last_snap   = true,  // rollback.nut plugin cache — injected into
+                         // PlayerTeamData + actor classes; process-local,
+                         // not part of the gekko snapshot. Skipping it
+                         // keeps the depth-6 walk out of plugin internals.
 };
 
 // Singleton sentinel that the deserializer returns for `?;` (skip)
@@ -51,6 +55,19 @@
 
 // Per-load state: saved-id -> live-instance (filled during apply).
 ::__gekko_state._live_by_id <- null;
+
+// Live-value side table. battleUpdate (a closure — possibly an inline
+// anonymous one), infoActor (array of actor weakrefs) and ::battle.task
+// (table of task instances) cannot survive the text blob: a closure has
+// no serializable form and a weakref/instance ref would round-trip to a
+// bare table. But the objects they point at outlive the rollback window
+// (actors are pinned by live_actors defer-release; a parked closure is
+// kept alive by the strong ref below). So save_battle parks them here in
+// a ring keyed by the Gekko frame, and load_battle reads the same slot.
+// Process-local, like _skip_keys — nothing here enters the checksummed
+// blob, so it cannot cause a desync.
+::__gekko_state._keep_ring <- 256;
+::__gekko_state._keep      <- array(256, null);
 
 ::__gekko_state._pretty_type <- function (t) {
     if (typeof t != "string") return "" + t;
@@ -383,13 +400,13 @@
 //       Combo emitted empty)
 //   5 = depth cap 4
 //   6 = depth cap 6 (current production target)
-::__gekko_state._bisect_level <- 4;
+::__gekko_state._bisect_level <- 6;
 
 // Snapshot ::battle. Wraps everything in a root table so the serializer
 // can walk it with identity tagging. The first instance encountered
 // (typically team[0].master) gets saved-id 1, second 2, etc. References
 // to already-seen instances become R<id>;.
-::__gekko_state.save_battle <- function () {
+::__gekko_state.save_battle <- function (frame = 0) {
     if (::__gekko_state._bisect_level == 0) return "";
     ::__gekko_state._seen = [];
     ::__gekko_state._next_id = 1;
@@ -415,30 +432,39 @@
     foreach (f in ::__gekko_state._battle_fields) {
         if (f in ::battle) out[f] <- ::battle[f];
     }
-    // battleUpdate is a closure — capture WHICH named method of ::battle
-    // it currently points at, restore by name on load.
-    out.battleUpdate_name <- "";
-    if ("battleUpdate" in ::battle && ::battle.battleUpdate != null) {
-        foreach (k, val in ::battle) {
-            if (k != "battleUpdate" && typeof val == "function" &&
-                val == ::battle.battleUpdate)
-            {
-                out.battleUpdate_name = k;
-                break;
-            }
-        }
-    }
+    // Park the live-value side table for this frame: battleUpdate (a
+    // closure — named method OR an inline anonymous one), infoActor (array
+    // of actor weakrefs) and ::battle.task (task instance table). These
+    // are NOT in the text blob; load_battle restores them from _keep.
+    // infoActor/task are shallow-cloned so a later in-place mutation of
+    // the live container can't corrupt the parked snapshot.
+    local slot = frame % ::__gekko_state._keep_ring;
+    local ia = ("infoActor" in ::battle) ? ::battle.infoActor : null;
+    local tk = ("task" in ::battle) ? ::battle.task : null;
+    ::__gekko_state._keep[slot] = {
+        battleUpdate = ("battleUpdate" in ::battle) ? ::battle.battleUpdate : null,
+        infoActor    = (typeof ia == "array") ? (clone ia) : ia,
+        task         = (typeof tk == "table") ? (clone tk) : null,
+    };
     // Periodic snapshot log so we can see the round phase machine
     // actually advancing (state 2->4->8->64) across the match.
     ::__gekko_state._save_tick = (::__gekko_state._save_tick + 1) % 1200;
     if (::__gekko_state._save_tick == 0) {
         local ewd = ("endWinDemo" in ::battle && ::battle.endWinDemo != null)
             ? (::battle.endWinDemo[0] + "/" + ::battle.endWinDemo[1]) : "?";
+        local bu = "?";
+        if ("battleUpdate" in ::battle && ::battle.battleUpdate != null) {
+            bu = "anon";
+            foreach (k, val in ::battle) {
+                if (k != "battleUpdate" && typeof val == "function" &&
+                    val == ::battle.battleUpdate) { bu = k; break; }
+            }
+        }
         ::print("[gekko_state] snapshot state=" + ("state" in out ? out.state : "?")
                 + " demoCount=" + ("demoCount" in out ? out.demoCount : "?")
                 + " time=" + ("time" in out ? out.time : "?")
                 + " endWinDemo=" + ewd
-                + " bu=" + out.battleUpdate_name + "\n");
+                + " bu=" + bu + "\n");
     }
     if (::__gekko_state._bisect_level >= 2 && "team"  in ::battle) {
         // Put the team_data instances (PlayerTeamData — pure Squirrel)
@@ -464,7 +490,7 @@
 };
 
 ::__gekko_state._load_log_quota <- 4;
-::__gekko_state.load_battle <- function (str) {
+::__gekko_state.load_battle <- function (str, frame = 0) {
     if (::__gekko_state._load_log_quota > 0) {
         ::__gekko_state._load_log_quota--;
         ::print("[gekko_state] load_battle called len=" + str.len() + "\n");
@@ -499,17 +525,32 @@
             ::battle[f] = sv;
         }
     }
-    // Restore battleUpdate by the method name we captured.
-    if ("battleUpdate_name" in data && typeof data.battleUpdate_name == "string" &&
-        data.battleUpdate_name.len() > 0 &&
-        data.battleUpdate_name in ::battle && "battleUpdate" in ::battle)
-    {
-        ::battle.battleUpdate = ::battle[data.battleUpdate_name];
+    // Restore the live-value side table parked by save_battle for this
+    // frame: battleUpdate closure, infoActor weakref array, task table.
+    local kept = ::__gekko_state._keep[frame % ::__gekko_state._keep_ring];
+    if (kept != null) {
+        if ("battleUpdate" in ::battle) {
+            ::battle.battleUpdate = kept.battleUpdate;
+        }
+        if ("infoActor" in ::battle) {
+            ::battle.infoActor = kept.infoActor;
+        }
+        // Rebuild ::battle.task IN PLACE — a caller may hold the table
+        // reference, so we mutate the live table rather than replace it.
+        if (kept.task != null && "task" in ::battle &&
+            typeof ::battle.task == "table")
+        {
+            local live = ::battle.task;
+            local old_keys = [];
+            foreach (k, _ in live) old_keys.append(k);
+            foreach (k in old_keys) delete live[k];
+            foreach (k, val in kept.task) live[k] <- val;
+        }
     }
     if (::__gekko_state._load_log_quota > 0) {
         ::print("[gekko_state] restore time " + pre_time + " -> " + ::battle.time
                 + ", state " + pre_state + " -> " + ::battle.state
-                + ", bu=" + (("battleUpdate_name" in data) ? data.battleUpdate_name : "?")
+                + ", kept=" + (kept != null ? "y" : "n")
                 + "\n");
     }
     if ("teams" in data && "team" in ::battle) {

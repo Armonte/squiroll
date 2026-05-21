@@ -80,9 +80,16 @@ extern bool     forced_inputs_active;
 
 // State serialization hooks (implemented in gekko_bridge.cpp).
 // Returns bytes written. The buffer is owned by Gekko; size is configured
-// via GekkoConfig::state_size at init.
-uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum);
+// via GekkoConfig::state_size at init. `frame` is the Gekko frame number
+// — stored in the header and used to key __gekko_state._keep.
+uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
+                           uint32_t frame);
 void     load_state_from_buf(const void* buf, uint32_t len);
+
+// Solo fast-forward multiplier: number of tick()s better_game_loop should
+// run per rendered frame. 1 normally; >1 when the solo stress session is
+// active and the turbo key is held.
+int turbo_ticks();
 
 // Drive one logic-frame without rendering. Calls update_related(...) +
 // Act::ScriptAPI->Update() directly, bypassing the screenshot-key polling

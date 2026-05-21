@@ -139,7 +139,7 @@ namespace gekko_bridge {
 // Call ::__gekko_state.save_battle() and copy its returned string into
 // out (up to cap bytes). Returns bytes written; 0 if anything failed
 // (the Save event then has empty squirrel data — still consistent).
-static uint32_t call_squirrel_save(uint8_t* out, uint32_t cap) {
+static uint32_t call_squirrel_save(uint8_t* out, uint32_t cap, uint32_t frame) {
     if (!v) return 0;
     SQInteger top0 = sq_gettop(v);
     sq_pushroottable(v);
@@ -149,7 +149,8 @@ static uint32_t call_squirrel_save(uint8_t* out, uint32_t cap) {
     if (SQ_FAILED(sq_get(v, -2))) { sq_settop(v, top0); return 0; }
     // stack: root, gekko_state, save_battle
     sq_push(v, -2);  // `this` = gekko_state table
-    if (SQ_FAILED(sq_call(v, 1, SQTrue, SQTrue))) { sq_settop(v, top0); return 0; }
+    sq_pushinteger(v, (SQInteger)frame);  // save_battle(frame) — keys _keep
+    if (SQ_FAILED(sq_call(v, 2, SQTrue, SQTrue))) { sq_settop(v, top0); return 0; }
     const SQChar* sqstr = nullptr;
     if (SQ_FAILED(sq_getstring(v, -1, &sqstr)) || !sqstr) {
         sq_settop(v, top0);
@@ -170,7 +171,7 @@ static uint32_t call_squirrel_save(uint8_t* out, uint32_t cap) {
     return (uint32_t)n;
 }
 
-static void call_squirrel_load(const uint8_t* data, uint32_t len) {
+static void call_squirrel_load(const uint8_t* data, uint32_t len, uint32_t frame) {
     if (!v || len == 0) return;
     SQInteger top0 = sq_gettop(v);
     sq_pushroottable(v);
@@ -183,7 +184,8 @@ static void call_squirrel_load(const uint8_t* data, uint32_t len) {
     // 7-bit ASCII output with no embedded NULs so passing as a C string
     // is safe. If we ever switch to binary we'll need a different bind.
     sq_pushstring(v, (const SQChar*)data, (SQInteger)len);
-    if (SQ_FAILED(sq_call(v, 2, SQFalse, SQTrue))) {
+    sq_pushinteger(v, (SQInteger)frame);  // load_battle(str, frame) — keys _keep
+    if (SQ_FAILED(sq_call(v, 3, SQFalse, SQTrue))) {
         log_printf("[gekko_bridge] __gekko_state.load_battle threw\n");
     }
     sq_settop(v, top0);
@@ -285,14 +287,15 @@ static_assert(sizeof(ActorRecord) == 4 + sizeof(ManbowActor2D));
 // empty body).
 static bool g_sq_save_enabled = true;
 
-uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum) {
+uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
+                           uint32_t frame) {
     if (cap < sizeof(SaveHeader)) return 0;
 
     uint8_t* p = static_cast<uint8_t*>(buf);
     SaveHeader* hdr = reinterpret_cast<SaveHeader*>(p);
     hdr->magic      = SAVE_MAGIC;
     hdr->version    = SAVE_VERSION;
-    hdr->frame      = 0; // TODO: pull current frame counter
+    hdr->frame      = frame; // Gekko frame — keys __gekko_state._keep
     hdr->rand_state = acrt_getptd()->rand_state;
 
     // Snapshot live actor pointers under a fixed cap.
@@ -327,7 +330,7 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum) {
     uint32_t* sq_len_field = (uint32_t*)p;
     p += 4;
     uint32_t sq_cap = (cap - actors_end - 4);
-    uint32_t sq_n = g_sq_save_enabled ? call_squirrel_save(p, sq_cap) : 0;
+    uint32_t sq_n = g_sq_save_enabled ? call_squirrel_save(p, sq_cap, frame) : 0;
     *sq_len_field = sq_n;
     p += sq_n;
 
@@ -417,7 +420,7 @@ void load_state_from_buf(const void* buf, uint32_t len) {
                            "(quota_remaining=%u)\n",
                            sq_len, sq_load_log_quota);
             }
-            call_squirrel_load(p, sq_len);
+            call_squirrel_load(p, sq_len, hdr->frame);
         } else if (sq_load_log_quota > 0) {
             --sq_load_log_quota;
             log_printf("[gekko_bridge] SKIP call_squirrel_load sq_len=%u "
@@ -686,6 +689,15 @@ void shutdown() {
 bool is_active()         { return g_active; }
 bool is_session_started(){ return g_session_started; }
 
+// Solo fast-forward. While a solo stress session owns the frame loop and
+// the backtick (`) key is held, run extra tick()s per rendered frame so a
+// run can reach time-over (~8910 logical frames) in seconds. Netplay is
+// network-paced — turbo is gated to g_solo so it can't desync a match.
+int turbo_ticks() {
+    if (g_solo && (GetAsyncKeyState(VK_OEM_3) & 0x8000)) return 8;
+    return 1;
+}
+
 // ------------------------------------------------------------------- tick --
 
 bool tick() {
@@ -791,7 +803,8 @@ bool tick() {
                 uint32_t n = save_state_to_buf(
                     e->data.save.state,
                     /*cap=*/ 2 * 1024 * 1024,  // must match GekkoConfig::state_size
-                    &cs
+                    &cs,
+                    (uint32_t)e->data.save.frame
                 );
                 *e->data.save.state_len = n;
                 *e->data.save.checksum = cs;

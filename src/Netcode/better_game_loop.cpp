@@ -129,7 +129,13 @@ void stdcall better_game_loop() {
             // battle.count / the round timer twice per frame while a
             // rollback re-sim (entirely inside tick()) steps once — the
             // counters desync and the round machine races. Render only.
-            gekko_bridge::tick();
+            // turbo_ticks() is 1 normally; >1 when a solo stress session
+            // is fast-forwarding. Extra tick()s advance more logical
+            // frames without an extra render — render stays once per
+            // real frame so the window keeps repainting at full rate.
+            for (int i = 0, n = gekko_bridge::turbo_ticks(); i < n; ++i) {
+                gekko_bridge::tick();
+            }
             frames_this_sec += window_render();
         } else {
             if (gekko_bridge::is_active()) {
