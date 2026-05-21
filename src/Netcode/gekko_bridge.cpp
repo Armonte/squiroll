@@ -2,9 +2,13 @@
 // design notes. Each TODO below is a concrete next step.
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <windows.h>
+#include <algorithm>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "gekko_bridge.h"
 #include "patch_utils.h"
@@ -135,6 +139,299 @@ extern HSQUIRRELVM v;
 namespace gekko_bridge {
 
 // ----------------------------------------------------------- squirrel hook --
+
+// ============================================================================
+// C++ Squirrel-state serializer — fast drop-in for gekko_state.nut's ser().
+//
+// The Squirrel walker spent ~24ms/save recursing the battle graph inside the
+// interpreter. This emits the SAME text format (gekko_state.nut's deser()
+// parses it unchanged) but in native code. Bound as ::__gekko_cpp_ser;
+// save_battle() calls it instead of the Squirrel ser().
+//
+// Format (must stay byte-compatible with deser()):
+//   n;  i<N>;  f<N>;  b0;/b1;  s<LEN>:<DATA>;  a<N>:[...]  t<N>:{kv...}
+//   I<ID>:<M>:{kv...} (instance first-sight)  R<ID>; (instance ref)  ?; (skip)
+// ============================================================================
+
+namespace {
+
+struct CppSer {
+    HSQUIRRELVM vm = nullptr;
+    std::string out;
+    std::unordered_map<void*, int> seen;   // instance ptr -> assigned id
+    int next_id   = 1;
+    int cur_depth = 0;
+    int max_depth = 6;
+};
+
+static void ser_append_int(std::string& s, long long n) {
+    char b[24];
+    int len = snprintf(b, sizeof(b), "%lld", n);
+    if (len > 0) s.append(b, (size_t)len);
+}
+
+// device_id / input / last_snap — per-peer process-local slots; serialized
+// as `?;` so a rollback never restores them across peers.
+static bool ser_is_skip_key(const char* k, size_t n) {
+    return (n == 9 && memcmp(k, "device_id", 9) == 0)
+        || (n == 5 && memcmp(k, "input", 5) == 0)
+        || (n == 9 && memcmp(k, "last_snap", 9) == 0);
+}
+
+static bool ser_type_is_fn(SQObjectType t) {
+    return t == OT_CLOSURE || t == OT_NATIVECLOSURE || t == OT_CLASS
+        || t == OT_USERDATA || t == OT_THREAD || t == OT_FUNCPROTO;
+}
+
+static void cpp_ser_value(CppSer& c, SQInteger idx);
+
+static void cpp_ser_string(CppSer& c, SQInteger idx) {
+    const SQChar* sp = nullptr;
+    sq_getstring(c.vm, idx, &sp);
+    SQInteger slen = sq_getsize(c.vm, idx);
+    if (slen < 0) slen = 0;
+    c.out += 's';
+    ser_append_int(c.out, (long long)slen);
+    c.out += ':';
+    if (sp && slen > 0) c.out.append(sp, (size_t)slen);
+    c.out += ';';
+}
+
+static void cpp_ser_table(CppSer& c, SQInteger idx) {
+    HSQUIRRELVM v = c.vm;
+    struct Ent {
+        int kind = 0;           // 0=int key, 1=string key, 2=other
+        long long ki = 0;
+        std::string ks;
+        HSQOBJECT key, val;
+    };
+    std::vector<Ent> ents;
+    sq_pushnull(v);
+    while (SQ_SUCCEEDED(sq_next(v, idx))) {
+        Ent e;
+        sq_resetobject(&e.key);
+        sq_resetobject(&e.val);
+        SQObjectType kt = sq_gettype(v, -2);
+        if (kt == OT_INTEGER) {
+            SQInteger ki = 0; sq_getinteger(v, -2, &ki);
+            e.kind = 0; e.ki = (long long)ki;
+        } else if (kt == OT_STRING) {
+            const SQChar* ks = nullptr; sq_getstring(v, -2, &ks);
+            SQInteger kl = sq_getsize(v, -2);
+            e.kind = 1;
+            if (ks && kl > 0) e.ks.assign(ks, (size_t)kl);
+        } else {
+            e.kind = 2;
+        }
+        sq_getstackobj(v, -2, &e.key); sq_addref(v, &e.key);
+        sq_getstackobj(v, -1, &e.val); sq_addref(v, &e.val);
+        ents.push_back(std::move(e));
+        sq_pop(v, 2);
+    }
+    sq_pop(v, 1);   // iterator
+
+    // Deterministic key order — cross-peer and original-vs-resim must
+    // emit identical bytes (Squirrel hash-bucket order is not stable).
+    std::stable_sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) {
+        if (a.kind != b.kind) return a.kind < b.kind;
+        if (a.kind == 0)      return a.ki < b.ki;
+        if (a.kind == 1)      return a.ks < b.ks;
+        return false;
+    });
+
+    c.out += 't';
+    ser_append_int(c.out, (long long)ents.size());
+    c.out += ":{";
+    for (auto& e : ents) {
+        sq_pushobject(v, e.key); cpp_ser_value(c, sq_gettop(v)); sq_pop(v, 1);
+        sq_pushobject(v, e.val); cpp_ser_value(c, sq_gettop(v)); sq_pop(v, 1);
+    }
+    c.out += '}';
+    for (auto& e : ents) { sq_release(v, &e.key); sq_release(v, &e.val); }
+}
+
+static void cpp_ser_instance(CppSer& c, SQInteger idx) {
+    HSQUIRRELVM v = c.vm;
+    HSQOBJECT iobj;
+    sq_resetobject(&iobj);
+    sq_getstackobj(v, idx, &iobj);
+    void* ip = (void*)iobj._unVal.pInstance;
+
+    auto it = c.seen.find(ip);
+    if (it != c.seen.end()) {
+        c.out += 'R';
+        ser_append_int(c.out, it->second);
+        c.out += ';';
+        return;
+    }
+    int my_id = c.next_id++;
+    c.seen[ip] = my_id;
+
+    // Depth cap (instance descent only) — emit an empty body.
+    if (c.cur_depth >= c.max_depth || SQ_FAILED(sq_getclass(v, idx))) {
+        c.out += 'I';
+        ser_append_int(c.out, my_id);
+        c.out += ":0:{}";
+        return;
+    }
+    SQInteger cls_idx = sq_gettop(v);
+
+    // Enumerate members from the CLASS — never read the instance's
+    // function-typed members (Sqrat accessor closures with engine side
+    // effects); those are gated to `?;` without an instance read.
+    struct Member { std::string name; bool is_fn = false; };
+    std::vector<Member> members;
+    sq_pushnull(v);
+    while (SQ_SUCCEEDED(sq_next(v, cls_idx))) {
+        Member m;
+        m.is_fn = ser_type_is_fn(sq_gettype(v, -1));
+        if (sq_gettype(v, -2) == OT_STRING) {
+            const SQChar* nm = nullptr; sq_getstring(v, -2, &nm);
+            SQInteger nl = sq_getsize(v, -2);
+            if (nm && nl > 0) m.name.assign(nm, (size_t)nl);
+        }
+        members.push_back(std::move(m));
+        sq_pop(v, 2);
+    }
+    sq_pop(v, 1);   // iterator
+    sq_pop(v, 1);   // class
+
+    std::stable_sort(members.begin(), members.end(),
+                     [](const Member& a, const Member& b) { return a.name < b.name; });
+
+    c.out += 'I';
+    ser_append_int(c.out, my_id);
+    c.out += ':';
+    ser_append_int(c.out, (long long)members.size());
+    c.out += ":{";
+    c.cur_depth++;
+    for (auto& m : members) {
+        c.out += 's';
+        ser_append_int(c.out, (long long)m.name.size());
+        c.out += ':';
+        c.out += m.name;
+        c.out += ';';
+        if (m.is_fn || ser_is_skip_key(m.name.data(), m.name.size())) {
+            c.out += "?;";
+            continue;
+        }
+        sq_pushstring(v, m.name.data(), (SQInteger)m.name.size());
+        if (SQ_FAILED(sq_get(v, idx))) {
+            c.out += "n;";
+            continue;
+        }
+        if (ser_type_is_fn(sq_gettype(v, sq_gettop(v)))) {
+            c.out += "?;";
+        } else {
+            cpp_ser_value(c, sq_gettop(v));
+        }
+        sq_pop(v, 1);
+    }
+    c.cur_depth--;
+    c.out += '}';
+}
+
+static void cpp_ser_value(CppSer& c, SQInteger idx) {
+    HSQUIRRELVM v = c.vm;
+    switch (sq_gettype(v, idx)) {
+    case OT_NULL:
+        c.out += "n;";
+        return;
+    case OT_INTEGER: {
+        SQInteger i = 0; sq_getinteger(v, idx, &i);
+        c.out += 'i';
+        ser_append_int(c.out, (long long)i);
+        c.out += ';';
+        return;
+    }
+    case OT_FLOAT: {
+        SQFloat f = 0; sq_getfloat(v, idx, &f);
+        char b[40];
+        int len = snprintf(b, sizeof(b), "%.17g", (double)f);
+        c.out += 'f';
+        if (len > 0) c.out.append(b, (size_t)len);
+        c.out += ';';
+        return;
+    }
+    case OT_BOOL: {
+        SQBool b = 0; sq_getbool(v, idx, &b);
+        c.out += (b ? "b1;" : "b0;");
+        return;
+    }
+    case OT_STRING:
+        cpp_ser_string(c, idx);
+        return;
+    case OT_ARRAY: {
+        SQInteger n = sq_getsize(v, idx);
+        if (n < 0) n = 0;
+        c.out += 'a';
+        ser_append_int(c.out, (long long)n);
+        c.out += ":[";
+        for (SQInteger i = 0; i < n; ++i) {
+            sq_pushinteger(v, i);
+            if (SQ_SUCCEEDED(sq_get(v, idx))) {
+                cpp_ser_value(c, sq_gettop(v));
+                sq_pop(v, 1);
+            } else {
+                c.out += "n;";
+            }
+        }
+        c.out += ']';
+        return;
+    }
+    case OT_TABLE:
+        cpp_ser_table(c, idx);
+        return;
+    case OT_WEAKREF:
+        if (SQ_SUCCEEDED(sq_getweakrefval(v, idx))) {
+            cpp_ser_value(c, sq_gettop(v));
+            sq_pop(v, 1);
+        } else {
+            c.out += "n;";
+        }
+        return;
+    case OT_INSTANCE:
+        cpp_ser_instance(c, idx);
+        return;
+    default:
+        // closure / nativeclosure / userdata / thread / class / funcproto
+        c.out += "?;";
+        return;
+    }
+}
+
+} // anonymous namespace
+
+// Bound as ::__gekko_cpp_ser(value, max_depth). save_battle() calls this.
+static SQInteger gekko_cpp_ser(HSQUIRRELVM vm) {
+    try {
+        sq_reservestack(vm, 1024);
+        CppSer c;
+        c.vm = vm;
+        SQInteger md = 6;
+        if (sq_gettop(vm) >= 3) sq_getinteger(vm, 3, &md);
+        c.max_depth = (int)md;
+        c.out.reserve(192 * 1024);
+        cpp_ser_value(c, 2);   // arg 1 — stack idx 2 (idx 1 = this)
+        sq_pushstring(vm, c.out.data(), (SQInteger)c.out.size());
+        return 1;
+    } catch (...) {
+        return sq_throwerror(vm, _SC("gekko_cpp_ser: exception"));
+    }
+}
+
+// Register ::__gekko_cpp_ser on the root table. Idempotent; called from
+// init()/init_solo() once the Squirrel VM is up.
+static void register_cpp_ser() {
+    static bool done = false;
+    if (done || !v) return;
+    done = true;
+    SQInteger top = sq_gettop(v);
+    sq_pushroottable(v);
+    sq_setfunc(v, _SC("__gekko_cpp_ser"), &gekko_cpp_ser);
+    sq_settop(v, top);
+    log_printf("[gekko_bridge] registered __gekko_cpp_ser (native walker)\n");
+}
 
 // Call ::__gekko_state.save_battle() and copy its returned string into
 // out (up to cap bytes). Returns bytes written; 0 if anything failed
@@ -547,6 +844,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
           uint8_t local_player_idx, const char* remote_ip)
 {
     if (g_session) return false;
+    register_cpp_ser();
 
     gekko_create(&g_session, GekkoGameSession);
 
@@ -598,6 +896,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
 
 bool init_solo() {
     if (g_session) return false;
+    register_cpp_ser();
 
     g_solo = true;
     gekko_create(&g_session, GekkoStressSession);

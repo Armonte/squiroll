@@ -407,6 +407,17 @@
 // can walk it with identity tagging. The first instance encountered
 // (typically team[0].master) gets saved-id 1, second 2, etc. References
 // to already-seen instances become R<id>;.
+// Serialize `out`. Prefers the native walker ::__gekko_cpp_ser (bound by
+// gekko_bridge — ~20x faster than the Squirrel ser); falls back to the
+// Squirrel ser() if the native one is not registered. Both emit the same
+// text format, so deser() is unchanged either way.
+::__gekko_state._ser_out <- function (out) {
+    if ("__gekko_cpp_ser" in ::getroottable()) {
+        return ::__gekko_cpp_ser(out, ::__gekko_state._max_depth);
+    }
+    return ::__gekko_state._ser_out(out);
+};
+
 ::__gekko_state.save_battle <- function (frame = 0) {
     if (::__gekko_state._bisect_level == 0) return "";
     ::__gekko_state._seen = {};
@@ -422,7 +433,7 @@
                                             : 6;
 
     local out = {};
-    if (!("battle" in this.getroottable())) return ::__gekko_state.ser(out);
+    if (!("battle" in this.getroottable())) return ::__gekko_state._ser_out(out);
 
     // Battle-level phase-machine + round state. `battleUpdate` is the
     // per-frame phase function pointer (Game_BeginUpdate → ReadyUpdate →
@@ -487,7 +498,7 @@
             ::print("[gekko_state] team[0].master sqrat-type=" + lt + "\n");
         }
     }
-    return ::__gekko_state.ser(out);
+    return ::__gekko_state._ser_out(out);
 };
 
 ::__gekko_state._load_log_quota <- 4;
