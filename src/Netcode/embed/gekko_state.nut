@@ -366,6 +366,11 @@
     "demoCount", "count", "winner", "match_num",
     "time_stop_count", "slow_count", "is_time_stop",
     "endWinDemo", "endLoseDemo", "time_unit",
+    // Round-phase gates mutated at every round transition (Round_Begin /
+    // Round_Fight / KO / TimeUP / RoundReset). Without these, a rollback
+    // across a round boundary would restore the timer-enable and
+    // contact-test flags to stale values and the round machine diverges.
+    "enableTimeCount", "enableTimeUp", "enable_contact_test", "skipDemo",
 ];
 
 // DIAGNOSTIC: bisect mode. Higher = walks deeper into Sqrat-bound state.
