@@ -120,8 +120,16 @@ void stdcall better_game_loop() {
         // advance_one_frame from gekko Advance events) and we skip the
         // vanilla run_update_list to avoid double-stepping the engine.
         if (gekko_bridge::is_session_started()) {
+            // tick() IS the frame loop now — it steps the engine via
+            // advance_one_frame() for every gekko Advance event (and
+            // ticks the background ScriptAPI itself). We must NOT also
+            // call window_update_frame() (== update_logic, 0xE1A0):
+            // that runs another full RunOneFrame, double-stepping the
+            // engine every real frame. The forward pass would advance
+            // battle.count / the round timer twice per frame while a
+            // rollback re-sim (entirely inside tick()) steps once — the
+            // counters desync and the round machine races. Render only.
             gekko_bridge::tick();
-            window_update_frame();
             frames_this_sec += window_render();
         } else {
             if (gekko_bridge::is_active()) {
@@ -129,6 +137,10 @@ void stdcall better_game_loop() {
             }
             run_update_list(*input_update_list);
             window_update_frame();
+            // Solo: the intro runs here under the vanilla loop; this
+            // arms the gekko session the instant battle.state hits
+            // Round_Fight, so gekko never rolls back the intro.
+            gekko_bridge::pre_arm_poll();
             // NOTE: Not handling "SkipRender" because that doesn't seem to be used in AoCF
             frames_this_sec += window_render();
         }

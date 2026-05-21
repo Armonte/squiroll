@@ -205,16 +205,15 @@ function Initialize() {
                 return;
             }
 
-            // gekko_init_solo() runs __gekko_do_vs_init synchronously
-            // (a stress session has no SessionStarted handshake).
-            ::gekko_pending_param <- param;
-            ::__gekko_do_vs_init <- function () {
-                ::print("[squiroll boot] __gekko_do_vs_init -> vs.Initialize\n");
-                ::vs.Initialize(::gekko_pending_param);
-                ::print("[squiroll boot] vs.Initialize complete\n");
-            };
-            local ok = ::setting.network.gekko_init_solo();
-            ::print("[squiroll boot] gekko_init_solo returned " + ok + "\n");
+            // Run vs.Initialize NOW so the round-start intro plays out
+            // under the vanilla loop. gekko_watch_for_fight_solo() then
+            // arms the stress session the instant the intro ends and
+            // Round_Fight begins — gekko frame 0 = fight frame 0, and
+            // the rollback never touches the intro's demoCount machine.
+            ::print("[squiroll boot] solo: vs.Initialize (intro runs vanilla)\n");
+            ::vs.Initialize(param);
+            ::setting.network.gekko_watch_for_fight_solo();
+            ::print("[squiroll boot] solo: watching for Round_Fight to arm gekko\n");
             return;
         }
 

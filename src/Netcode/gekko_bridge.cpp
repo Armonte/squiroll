@@ -84,6 +84,8 @@ static bool          g_session_started = false; // SessionStarted fired + vs.Ini
                                                  // gekko owns the frame counter
 static bool          g_solo            = false; // single-process GekkoStressSession:
                                                  // both players local, no networking
+static bool          g_watch_for_fight = false; // solo: armed by boot.nut, pre_arm_poll
+                                                 // creates the session at Round_Fight
 static uint32_t      g_evt_trace = 0;            // diagnostic: # of Save/Load/
                                                  // Advance events to trace with
                                                  // engine count. 0 = off (set
@@ -499,13 +501,28 @@ void advance_one_frame() {
     if (forced_inputs_active) {
         inject_forced_inputs_into_recorder();
     }
-    // update_logic() is the engine's real main-thread per-frame
-    // (RunOneFrame(g_main) + HasPendingFrame catch-up + ScriptAPI::Update).
-    // The HasPendingFrame catch-up IS required — without it the
-    // character intro animations stall and the round never leaves
-    // Round_Begin. The count/demoCount drift seen across speculative vs
-    // re-sim saves is being chased separately; it is NOT caused by this.
-    update_logic();
+    // Strict 1 gekko-Advance = 1 logical frame.
+    //
+    // We deliberately do NOT call update_logic() (0xE1A0) here. Its body
+    // is:
+    //     RunOneFrame(g_main_scriptapi);
+    //     if (HasPendingFrame()) RunOneFrame(g_main_scriptapi);  // catch-up
+    //     Act::ScriptAPI::Update();
+    //     ++g_frame_counter;
+    //     <PrtScn screenshot polling>
+    // The conditional second RunOneFrame is a real-time frame-pacing
+    // catch-up: battle.count / demoCount (and per-actor count) increment
+    // once per RunOneFrame, so update_logic advanced the round-phase
+    // machine 1 OR 2 steps per call depending on HasPendingFrame(). A
+    // rollback re-simulation lands that conditional differently than the
+    // original run, the counters drift, and the HUD races/staggers
+    // rounds. Deterministic rollback requires exactly one logical step
+    // per Advance — so we call RunOneFrame exactly once. We also skip
+    // the PrtScn polling (GetAsyncKeyState — non-deterministic real-time
+    // input) and the QPC bookkeeping (real-time pacing only).
+    update_related(*MAIN_SCRIPTAPI_PTR);                    // RunOneFrame(g_main), once
+    Act_ScriptAPI_ptr->vftable->Update(Act_ScriptAPI_ptr);  // Act::ScriptAPI::Update
+    ++*(uint32_t*)(0x4DACE0_R);                             // g_frame_counter
     if (log_quota > 0) {
         log_printf("[gekko_bridge] advance_one_frame: exit\n");
     }
@@ -599,16 +616,55 @@ bool init_solo() {
     g_active = true;
     live_actors::set_defer_release(true);
 
-    // A stress session never emits GekkoSessionStarted, so run the
-    // deferred vs.Initialize here, synchronously, before the first
-    // tick's gekko_add_local_input — same ordering the dual path gets
-    // from its SessionStarted handler.
-    call_squirrel_vs_init();
+    // The battle is already created — vs.Initialize ran under the
+    // vanilla loop during the intro. A stress session has no handshake
+    // and emits no GekkoSessionStarted, so we are started immediately:
+    // gekko owns the frame loop from here, frame 0 = this Round_Fight
+    // frame.
     g_session_started = true;
 
     log_printf("gekko_bridge: SOLO stress session up. check_distance=%u\n",
                config.check_distance);
     return true;
+}
+
+// Read ::battle.state from the Squirrel VM. Returns false if the table
+// or field is not reachable yet.
+static bool read_battle_state(int* out) {
+    if (!v) return false;
+    SQInteger top = sq_gettop(v);
+    sq_pushroottable(v);
+    sq_pushstring(v, _SC("battle"), -1);
+    bool ok = SQ_SUCCEEDED(sq_get(v, -2));
+    if (ok) {
+        sq_pushstring(v, _SC("state"), -1);
+        ok = SQ_SUCCEEDED(sq_get(v, -2));
+        if (ok) {
+            SQInteger st = 0;
+            ok = SQ_SUCCEEDED(sq_getinteger(v, -1, &st));
+            if (ok) *out = (int)st;
+        }
+    }
+    sq_settop(v, top);
+    return ok;
+}
+
+void watch_for_fight_solo() {
+    g_watch_for_fight = true;
+    log_printf("[gekko_bridge] watching for Round_Fight to arm solo session\n");
+}
+
+// Called every vanilla-loop frame (from better_game_loop) before any
+// session exists. Once battle.state reaches Round_Fight (8), the intro
+// is over — create the solo session so gekko frame 0 is fight frame 0.
+void pre_arm_poll() {
+    if (!g_watch_for_fight || g_session) return;
+    int st = 0;
+    if (read_battle_state(&st) && st == 8 /* Round_Fight */) {
+        g_watch_for_fight = false;
+        log_printf("[gekko_bridge] Round_Fight reached -> arming solo session\n");
+        init_solo();
+    }
 }
 
 void shutdown() {
@@ -620,6 +676,7 @@ void shutdown() {
     g_active = false;
     g_session_started = false;
     g_solo = false;
+    g_watch_for_fight = false;
     // Flush any actors held by defer-release so the engine can actually
     // reclaim their slots once we're done with the session.
     live_actors::set_defer_release(false);
@@ -744,36 +801,32 @@ bool tick() {
                 // `diff sq_blob_p0_f90.txt sq_blob_p1_f90.txt` then shows
                 // exactly which actor field diverged across peers.
                 {
-                    // Dump every save of frame 90 to its own numbered
-                    // file. The SAME peer saves frame 90 multiple times
-                    // (speculative, then post-rollback re-sims). With
-                    // identical inputs those MUST be byte-identical;
-                    // diffing _s0 vs _s1 shows exactly what state the
-                    // sim mutated that save/load did NOT restore — i.e.
-                    // the missing piece of the snapshot.
+                    // Dump every save of DUMP_FRAME to its own numbered
+                    // file — the WHOLE blob (header + actor records +
+                    // Squirrel). The SAME peer saves a frame multiple
+                    // times (speculative, then post-rollback re-sims).
+                    // With identical inputs those MUST be byte-identical;
+                    // diffing _s0 vs _s1 shows exactly which section (and
+                    // offset) the sim mutated that save/load did NOT
+                    // restore — i.e. the missing piece of the snapshot.
+                    // Set to the frame run_solo.sh reports the DESYNC at.
+                    static const int DUMP_FRAME = 2;
                     int fr = e->data.save.frame;
-                    static int f90_save_count = 0;
-                    if (fr == 90 && f90_save_count < 4 &&
-                        n >= sizeof(SaveHeader) + 4)
-                    {
-                        const SaveHeader* hdr_ = (const SaveHeader*)e->data.save.state;
-                        const uint8_t* pp = (const uint8_t*)e->data.save.state + sizeof(SaveHeader);
-                        pp += hdr_->actor_count * sizeof(ActorRecord);
-                        uint32_t sql = *(const uint32_t*)pp;
-                        pp += 4;
+                    static int dump_save_count = 0;
+                    if (fr == DUMP_FRAME && dump_save_count < 6) {
                         char path[128];
                         snprintf(path, sizeof(path),
-                                 "C:\\dev\\aocf\\th155\\sq_blob_p%u_f90_s%d.txt",
-                                 (unsigned)g_local_idx, f90_save_count);
+                                 "C:\\dev\\aocf\\th155\\sq_blob_p%u_f%d_s%d.bin",
+                                 (unsigned)g_local_idx, fr, dump_save_count);
                         FILE* f = fopen(path, "wb");
                         if (f) {
-                            fwrite(pp, 1, sql, f);
+                            fwrite(e->data.save.state, 1, n, f);
                             fclose(f);
-                            log_printf("[gekko_bridge] Save frame=90 #%d len=%u"
+                            log_printf("[gekko_bridge] Save frame=%d #%d len=%u"
                                        " cs=0x%08x -> %s\n",
-                                       f90_save_count, n, cs, path);
+                                       fr, dump_save_count, n, cs, path);
                         }
-                        ++f90_save_count;
+                        ++dump_save_count;
                     }
                 }
                 // TRACE: correlate gekko frame ↔ engine `count` so we

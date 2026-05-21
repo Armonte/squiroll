@@ -50,8 +50,18 @@ bool init(uint16_t local_port, uint16_t remote_port,
 // local and no networking. It rolls back `check_distance` frames every
 // frame, so the full save/load path is exercised hard in one instance —
 // the rig for iterating on rollback determinism and perf without two
-// processes. No handshake, so it self-triggers vs.Initialize.
+// processes. Assumes the battle is ALREADY created (vs.Initialize has
+// run) — it just creates the session and takes the frame loop.
 bool init_solo();
+
+// Deferred-arm for the solo path: boot.nut runs vs.Initialize normally
+// so the round-start intro plays under the vanilla loop, then calls
+// this. pre_arm_poll() then watches battle.state and fires init_solo()
+// the instant the intro ends and Round_Fight begins — so gekko frame 0
+// is fight frame 0 and the rollback never touches the intro.
+void watch_for_fight_solo();
+void pre_arm_poll();
+
 void shutdown();
 bool is_active();          // session exists; UDP poll runs in background
 bool is_session_started(); // GekkoSessionStarted fired; tick() owns the frame

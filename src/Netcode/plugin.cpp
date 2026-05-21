@@ -520,13 +520,13 @@ extern "C" {
                         sq_pushbool(v, ok ? SQTrue : SQFalse);
                         return 1;
                     });
-                    // gekko_init_solo() — single-process stress session.
-                    // No args: both players local, no networking. Used by
-                    // boot.nut when auto_connect == "solo".
-                    sq_setfunc(v, _SC("gekko_init_solo"), [](HSQUIRRELVM v) -> SQInteger {
-                        bool ok = gekko_bridge::init_solo();
-                        sq_pushbool(v, ok ? SQTrue : SQFalse);
-                        return 1;
+                    // gekko_watch_for_fight_solo() — single-process stress
+                    // session. boot.nut calls this AFTER vs.Initialize so
+                    // the intro runs vanilla; the GekkoStressSession is
+                    // created when battle.state hits Round_Fight.
+                    sq_setfunc(v, _SC("gekko_watch_for_fight_solo"), [](HSQUIRRELVM v) -> SQInteger {
+                        gekko_bridge::watch_for_fight_solo();
+                        return 0;
                     });
                     sq_setfunc(v, _SC("gekko_shutdown"), [](HSQUIRRELVM v) -> SQInteger {
                         gekko_bridge::shutdown();
