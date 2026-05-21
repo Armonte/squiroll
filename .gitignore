@@ -14,6 +14,9 @@ out/
 src/Netcode/embed/**/*.nut.h
 src/Netcode/embed/*.nut.h
 
+# Generated embed manifest includes (PR #28)
+*.inc
+
 # Build tooling artifacts
 /tools/*.run
 /tools/*.exe

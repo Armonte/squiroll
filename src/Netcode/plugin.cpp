@@ -156,29 +156,11 @@ static inline void set_network_constants(HSQUIRRELVM v) {
     //sq_setbool(v, _SC("hide_lobby"), false);//more useful once we get custom lobbies
 }
 
-static inline void set_binds_constants(HSQUIRRELVM v) {
-    sq_setstring(v, _SC("config_section"),"binds");
-    sq_setinteger(v, _SC("hide_ui"), get_binds_hide_ui());
-    sq_setinteger(v, _SC("step_frame"), get_binds_step_frame());
-    sq_setinteger(v, _SC("step_toggle"), get_binds_step_toggle());
-}
-
 SQInteger update_network_constants(HSQUIRRELVM v) {
     sq_pushroottable(v);
 
     sq_edit(v, _SC("setting"),[](HSQUIRRELVM v){
         sq_edit(v, _SC("network"),set_network_constants);
-    });
-
-    sq_pop(v, 1);
-    return 0;
-}
-
-SQInteger update_binds_constants(HSQUIRRELVM v) {
-    sq_pushroottable(v);
-
-    sq_edit(v, _SC("setting"),[](HSQUIRRELVM v) {
-        sq_edit(v, _SC("binds"), set_binds_constants);
     });
 
     sq_pop(v, 1);
@@ -492,12 +474,6 @@ extern "C" {
             sq_createtable(v, _SC("setting"), [](HSQUIRRELVM v) {
                 sq_setinteger(v, _SC("version"), PLUGIN_VERSION);
                 sq_setinteger(v, _SC("revision"), PLUGIN_REVISION);
-                // sq_setfunc(v, _SC("hitbox"), [](HSQUIRRELVM v) {
-                //     sq_setbool(v, _SC("enabled"), [](HSQUIRRELVM v) -> SQInteger {
-                //         sq_pushbool(v, get_hitbox_vis_enabled());
-                //         return 1;
-                //     });
-                // });
                 sq_setfunc(v,_SC("save"),[](HSQUIRRELVM v) -> SQInteger {
                     const char* section;
                     const char* key;
@@ -561,10 +537,6 @@ extern "C" {
                         sq_pushbool(v, gekko_bridge::is_session_started() ? SQTrue : SQFalse);
                         return 1;
                     });
-                });
-                sq_createtable(v, _SC("binds"), [](HSQUIRRELVM v) {
-                    sq_setfunc(v, _SC("update_consts"), update_binds_constants);
-                    set_binds_constants(v);
                 });
                 sq_createtable(v, _SC("frame_data"), [](HSQUIRRELVM v) {
                     sq_setfunc(v, _SC("IsFrameActive"), [](HSQUIRRELVM v) -> SQInteger {
@@ -859,8 +831,6 @@ extern "C" {
                 }, 0);
                 sq_rawset(v, -3);
 
-                // sq_setfunc(v, _SC("compilebuffer"), sq_compile_buffer);
-                // sq_setfunc(v, _SC("LoadCSVBuffer"), loadCSVBuffer);
                 sq_setfunc(v, _SC("SetClipboardString"), copy_to_clipboard);
             });
 
