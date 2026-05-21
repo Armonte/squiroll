@@ -141,260 +141,229 @@ namespace gekko_bridge {
 // ----------------------------------------------------------- squirrel hook --
 
 // ============================================================================
-// C++ Squirrel-state serializer — fast drop-in for gekko_state.nut's ser().
+// Native Squirrel-state serializer — raw-struct walker.
 //
-// The Squirrel walker spent ~24ms/save recursing the battle graph inside the
-// interpreter. This emits the SAME text format (gekko_state.nut's deser()
-// parses it unchanged) but in native code. Bound as ::__gekko_cpp_ser;
-// save_battle() calls it instead of the Squirrel ser().
+// Walks the battle object graph by reading th155's Squirrel 3.0.6 object
+// structs DIRECTLY — zero Squirrel C API calls in the hot path — and emits
+// the text format gekko_state.nut's deser() parses unchanged. Bound as
+// ::__gekko_cpp_ser; save_battle() reaches it via _ser_out().
 //
-// Format (must stay byte-compatible with deser()):
+// Struct layouts below are th155's, verified in rollback.cpp. SQObject
+// (HSQOBJECT) is 16 bytes (SQUSEDOUBLE build). Nothing runs Squirrel code
+// during the walk (pure C++ memory reads), so the GC cannot move objects
+// mid-walk and raw pointers stay valid.
+//
+// Format (byte-compatible with deser()):
 //   n;  i<N>;  f<N>;  b0;/b1;  s<LEN>:<DATA>;  a<N>:[...]  t<N>:{kv...}
 //   I<ID>:<M>:{kv...} (instance first-sight)  R<ID>; (instance ref)  ?; (skip)
 // ============================================================================
 
 namespace {
 
-struct CppSer {
-    HSQUIRRELVM vm = nullptr;
+// th155 Squirrel internal layouts — offsets verified in rollback.cpp.
+struct SqObjVec   { SQObject* vals; uint32_t size; uint32_t alloc; };
+struct SqString   { char _pad[0x14]; int32_t len; uint32_t hash; char val[1]; };
+struct SqWeakRef  { char _pad[0x0C]; SQObject obj; };
+struct SqHashNode { SQObject val; SQObject key; SqHashNode* next; };
+struct SqTable    { char _pad[0x20]; SqHashNode* nodes; int32_t numofnodes; };
+struct SqArray    { char _pad[0x18]; SqObjVec values; };
+struct SqClass    { char _pad[0x18]; SqTable* members; };
+struct SqInstance { char _pad[0x1C]; SqClass* cls; char _pad2[0x0C]; SQObject values[1]; };
+
+// SQClass._members maps a member name -> an OT_INTEGER encoding the member
+// kind (method bit in the high byte) + the slot index in the low 24 bits.
+static const long long SQ_MEMBER_METHOD = 0x01000000;
+
+struct RawSer {
     std::string out;
-    std::unordered_map<void*, int> seen;   // instance ptr -> assigned id
+    std::unordered_map<const void*, int> seen;   // instance ptr -> assigned id
     int next_id   = 1;
     int cur_depth = 0;
     int max_depth = 6;
 };
 
-static void ser_append_int(std::string& s, long long n) {
+static void raw_ser_append_int(std::string& s, long long n) {
     char b[24];
     int len = snprintf(b, sizeof(b), "%lld", n);
     if (len > 0) s.append(b, (size_t)len);
 }
 
-// device_id / input / last_snap — per-peer process-local slots; serialized
-// as `?;` so a rollback never restores them across peers.
-static bool ser_is_skip_key(const char* k, size_t n) {
+// device_id / input / last_snap — per-peer process-local; emitted as `?;`.
+static bool raw_is_skip_key(const SqString* s) {
+    if (!s || s->len <= 0) return false;
+    int32_t n = s->len;
+    const char* k = s->val;
     return (n == 9 && memcmp(k, "device_id", 9) == 0)
         || (n == 5 && memcmp(k, "input", 5) == 0)
         || (n == 9 && memcmp(k, "last_snap", 9) == 0);
 }
 
-static bool ser_type_is_fn(SQObjectType t) {
-    return t == OT_CLOSURE || t == OT_NATIVECLOSURE || t == OT_CLASS
-        || t == OT_USERDATA || t == OT_THREAD || t == OT_FUNCPROTO;
+static void raw_emit_string(std::string& out, const SqString* s) {
+    int32_t len = (s && s->len > 0) ? s->len : 0;
+    out += 's';
+    raw_ser_append_int(out, len);
+    out += ':';
+    if (len > 0) out.append(s->val, (size_t)len);
+    out += ';';
 }
 
-static void cpp_ser_value(CppSer& c, SQInteger idx);
-
-static void cpp_ser_string(CppSer& c, SQInteger idx) {
-    const SQChar* sp = nullptr;
-    sq_getstring(c.vm, idx, &sp);
-    SQInteger slen = sq_getsize(c.vm, idx);
-    if (slen < 0) slen = 0;
-    c.out += 's';
-    ser_append_int(c.out, (long long)slen);
-    c.out += ':';
-    if (sp && slen > 0) c.out.append(sp, (size_t)slen);
-    c.out += ';';
+// Lexicographic byte order over two Squirrel strings (deterministic key sort).
+static bool raw_str_less(const SqString* a, const SqString* b) {
+    int32_t la = (a && a->len > 0) ? a->len : 0;
+    int32_t lb = (b && b->len > 0) ? b->len : 0;
+    int32_t m = la < lb ? la : lb;
+    int cmp = (m > 0) ? memcmp(a->val, b->val, (size_t)m) : 0;
+    if (cmp) return cmp < 0;
+    return la < lb;
 }
 
-static void cpp_ser_table(CppSer& c, SQInteger idx) {
-    HSQUIRRELVM v = c.vm;
-    struct Ent {
-        int kind = 0;           // 0=int key, 1=string key, 2=other
-        long long ki = 0;
-        std::string ks;
-        HSQOBJECT key, val;
-    };
-    std::vector<Ent> ents;
-    sq_pushnull(v);
-    while (SQ_SUCCEEDED(sq_next(v, idx))) {
-        Ent e;
-        sq_resetobject(&e.key);
-        sq_resetobject(&e.val);
-        SQObjectType kt = sq_gettype(v, -2);
-        if (kt == OT_INTEGER) {
-            SQInteger ki = 0; sq_getinteger(v, -2, &ki);
-            e.kind = 0; e.ki = (long long)ki;
-        } else if (kt == OT_STRING) {
-            const SQChar* ks = nullptr; sq_getstring(v, -2, &ks);
-            SQInteger kl = sq_getsize(v, -2);
-            e.kind = 1;
-            if (ks && kl > 0) e.ks.assign(ks, (size_t)kl);
-        } else {
-            e.kind = 2;
+static void raw_ser(RawSer& c, const SQObject& o);
+
+static void raw_ser_table(RawSer& c, const SqTable* t) {
+    struct KV { int kind; long long ki; const SqString* ks; const SQObject* val; };
+    std::vector<KV> kvs;
+    if (t && t->nodes) {
+        for (int32_t i = 0; i < t->numofnodes; ++i) {
+            const SqHashNode* nd = &t->nodes[i];
+            if (nd->key._type == OT_NULL) continue;   // empty bucket
+            KV kv;
+            kv.kind = 2; kv.ki = 0; kv.ks = nullptr;
+            if (nd->key._type == OT_INTEGER) {
+                kv.kind = 0; kv.ki = (long long)nd->key._unVal.nInteger;
+            } else if (nd->key._type == OT_STRING) {
+                kv.kind = 1; kv.ks = (const SqString*)nd->key._unVal.pString;
+            }
+            kv.val = &nd->val;
+            kvs.push_back(kv);
         }
-        sq_getstackobj(v, -2, &e.key); sq_addref(v, &e.key);
-        sq_getstackobj(v, -1, &e.val); sq_addref(v, &e.val);
-        ents.push_back(std::move(e));
-        sq_pop(v, 2);
     }
-    sq_pop(v, 1);   // iterator
-
-    // Deterministic key order — cross-peer and original-vs-resim must
-    // emit identical bytes (Squirrel hash-bucket order is not stable).
-    std::stable_sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) {
+    std::stable_sort(kvs.begin(), kvs.end(), [](const KV& a, const KV& b) {
         if (a.kind != b.kind) return a.kind < b.kind;
         if (a.kind == 0)      return a.ki < b.ki;
-        if (a.kind == 1)      return a.ks < b.ks;
+        if (a.kind == 1)      return raw_str_less(a.ks, b.ks);
         return false;
     });
-
     c.out += 't';
-    ser_append_int(c.out, (long long)ents.size());
+    raw_ser_append_int(c.out, (long long)kvs.size());
     c.out += ":{";
-    for (auto& e : ents) {
-        sq_pushobject(v, e.key); cpp_ser_value(c, sq_gettop(v)); sq_pop(v, 1);
-        sq_pushobject(v, e.val); cpp_ser_value(c, sq_gettop(v)); sq_pop(v, 1);
+    for (const KV& kv : kvs) {
+        if (kv.kind == 0)      { c.out += 'i'; raw_ser_append_int(c.out, kv.ki); c.out += ';'; }
+        else if (kv.kind == 1) { raw_emit_string(c.out, kv.ks); }
+        else                   { c.out += "n;"; }
+        raw_ser(c, *kv.val);
     }
     c.out += '}';
-    for (auto& e : ents) { sq_release(v, &e.key); sq_release(v, &e.val); }
 }
 
-static void cpp_ser_instance(CppSer& c, SQInteger idx) {
-    HSQUIRRELVM v = c.vm;
-    HSQOBJECT iobj;
-    sq_resetobject(&iobj);
-    sq_getstackobj(v, idx, &iobj);
-    void* ip = (void*)iobj._unVal.pInstance;
+static void raw_ser_instance(RawSer& c, const SQObject& o) {
+    const SqInstance* inst = (const SqInstance*)o._unVal.pInstance;
 
-    auto it = c.seen.find(ip);
+    auto it = c.seen.find(inst);
     if (it != c.seen.end()) {
         c.out += 'R';
-        ser_append_int(c.out, it->second);
+        raw_ser_append_int(c.out, it->second);
         c.out += ';';
         return;
     }
     int my_id = c.next_id++;
-    c.seen[ip] = my_id;
+    c.seen[inst] = my_id;
 
-    // Depth cap (instance descent only) — emit an empty body.
-    if (c.cur_depth >= c.max_depth || SQ_FAILED(sq_getclass(v, idx))) {
+    const SqClass* cls     = inst ? inst->cls : nullptr;
+    const SqTable* members = cls  ? cls->members : nullptr;
+    if (c.cur_depth >= c.max_depth || !members || !members->nodes) {
         c.out += 'I';
-        ser_append_int(c.out, my_id);
+        raw_ser_append_int(c.out, my_id);
         c.out += ":0:{}";
         return;
     }
-    SQInteger cls_idx = sq_gettop(v);
 
-    // Enumerate members from the CLASS — never read the instance's
-    // function-typed members (Sqrat accessor closures with engine side
-    // effects); those are gated to `?;` without an instance read.
-    struct Member { std::string name; bool is_fn = false; };
-    std::vector<Member> members;
-    sq_pushnull(v);
-    while (SQ_SUCCEEDED(sq_next(v, cls_idx))) {
-        Member m;
-        m.is_fn = ser_type_is_fn(sq_gettype(v, -1));
-        if (sq_gettype(v, -2) == OT_STRING) {
-            const SQChar* nm = nullptr; sq_getstring(v, -2, &nm);
-            SQInteger nl = sq_getsize(v, -2);
-            if (nm && nl > 0) m.name.assign(nm, (size_t)nl);
-        }
-        members.push_back(std::move(m));
-        sq_pop(v, 2);
+    struct Mem { const SqString* name; bool is_method; int idx; };
+    std::vector<Mem> ms;
+    for (int32_t i = 0; i < members->numofnodes; ++i) {
+        const SqHashNode* nd = &members->nodes[i];
+        if (nd->key._type != OT_STRING) continue;
+        long long enc = (long long)nd->val._unVal.nInteger;
+        Mem m;
+        m.name      = (const SqString*)nd->key._unVal.pString;
+        m.is_method = (enc & SQ_MEMBER_METHOD) != 0;
+        m.idx       = (int)(enc & 0x00FFFFFF);
+        ms.push_back(m);
     }
-    sq_pop(v, 1);   // iterator
-    sq_pop(v, 1);   // class
-
-    std::stable_sort(members.begin(), members.end(),
-                     [](const Member& a, const Member& b) { return a.name < b.name; });
+    std::stable_sort(ms.begin(), ms.end(), [](const Mem& a, const Mem& b) {
+        return raw_str_less(a.name, b.name);
+    });
 
     c.out += 'I';
-    ser_append_int(c.out, my_id);
+    raw_ser_append_int(c.out, my_id);
     c.out += ':';
-    ser_append_int(c.out, (long long)members.size());
+    raw_ser_append_int(c.out, (long long)ms.size());
     c.out += ":{";
     c.cur_depth++;
-    for (auto& m : members) {
-        c.out += 's';
-        ser_append_int(c.out, (long long)m.name.size());
-        c.out += ':';
-        c.out += m.name;
-        c.out += ';';
-        if (m.is_fn || ser_is_skip_key(m.name.data(), m.name.size())) {
+    for (const Mem& m : ms) {
+        raw_emit_string(c.out, m.name);
+        // Methods (incl. Sqrat-bound native accessors) and per-peer skip
+        // keys emit `?;` — never read off the instance.
+        if (m.is_method || raw_is_skip_key(m.name)) {
             c.out += "?;";
             continue;
         }
-        sq_pushstring(v, m.name.data(), (SQInteger)m.name.size());
-        if (SQ_FAILED(sq_get(v, idx))) {
-            c.out += "n;";
-            continue;
-        }
-        if (ser_type_is_fn(sq_gettype(v, sq_gettop(v)))) {
-            c.out += "?;";
-        } else {
-            cpp_ser_value(c, sq_gettop(v));
-        }
-        sq_pop(v, 1);
+        raw_ser(c, inst->values[m.idx]);   // FIELD — raw instance value slot
     }
     c.cur_depth--;
     c.out += '}';
 }
 
-static void cpp_ser_value(CppSer& c, SQInteger idx) {
-    HSQUIRRELVM v = c.vm;
-    switch (sq_gettype(v, idx)) {
+static void raw_ser(RawSer& c, const SQObject& o) {
+    switch (o._type) {
     case OT_NULL:
         c.out += "n;";
         return;
-    case OT_INTEGER: {
-        SQInteger i = 0; sq_getinteger(v, idx, &i);
+    case OT_BOOL:
+        c.out += (o._unVal.nInteger ? "b1;" : "b0;");
+        return;
+    case OT_INTEGER:
         c.out += 'i';
-        ser_append_int(c.out, (long long)i);
+        raw_ser_append_int(c.out, (long long)o._unVal.nInteger);
         c.out += ';';
         return;
-    }
     case OT_FLOAT: {
-        SQFloat f = 0; sq_getfloat(v, idx, &f);
         char b[40];
-        int len = snprintf(b, sizeof(b), "%.17g", (double)f);
+        int len = snprintf(b, sizeof(b), "%.17g", (double)o._unVal.fFloat);
         c.out += 'f';
         if (len > 0) c.out.append(b, (size_t)len);
         c.out += ';';
         return;
     }
-    case OT_BOOL: {
-        SQBool b = 0; sq_getbool(v, idx, &b);
-        c.out += (b ? "b1;" : "b0;");
-        return;
-    }
     case OT_STRING:
-        cpp_ser_string(c, idx);
+        raw_emit_string(c.out, (const SqString*)o._unVal.pString);
         return;
     case OT_ARRAY: {
-        SQInteger n = sq_getsize(v, idx);
-        if (n < 0) n = 0;
+        const SqArray* a = (const SqArray*)o._unVal.pArray;
+        uint32_t n = a ? a->values.size : 0;
         c.out += 'a';
-        ser_append_int(c.out, (long long)n);
+        raw_ser_append_int(c.out, (long long)n);
         c.out += ":[";
-        for (SQInteger i = 0; i < n; ++i) {
-            sq_pushinteger(v, i);
-            if (SQ_SUCCEEDED(sq_get(v, idx))) {
-                cpp_ser_value(c, sq_gettop(v));
-                sq_pop(v, 1);
-            } else {
-                c.out += "n;";
-            }
+        if (a && a->values.vals) {
+            for (uint32_t i = 0; i < n; ++i) raw_ser(c, a->values.vals[i]);
         }
         c.out += ']';
         return;
     }
     case OT_TABLE:
-        cpp_ser_table(c, idx);
+        raw_ser_table(c, (const SqTable*)o._unVal.pTable);
         return;
-    case OT_WEAKREF:
-        if (SQ_SUCCEEDED(sq_getweakrefval(v, idx))) {
-            cpp_ser_value(c, sq_gettop(v));
-            sq_pop(v, 1);
-        } else {
-            c.out += "n;";
-        }
+    case OT_WEAKREF: {
+        const SqWeakRef* w = (const SqWeakRef*)o._unVal.pWeakRef;
+        if (w) raw_ser(c, w->obj);
+        else   c.out += "n;";
         return;
+    }
     case OT_INSTANCE:
-        cpp_ser_instance(c, idx);
+        raw_ser_instance(c, o);
         return;
     default:
-        // closure / nativeclosure / userdata / thread / class / funcproto
+        // closure / nativeclosure / class / userdata / thread / generator /
+        // funcproto / outer / userpointer — not serializable.
         c.out += "?;";
         return;
     }
@@ -402,17 +371,21 @@ static void cpp_ser_value(CppSer& c, SQInteger idx) {
 
 } // anonymous namespace
 
-// Bound as ::__gekko_cpp_ser(value, max_depth). save_battle() calls this.
+// Bound as ::__gekko_cpp_ser(value, max_depth). save_battle() calls this
+// instead of the Squirrel ser(); walks `value` via raw struct access.
 static SQInteger gekko_cpp_ser(HSQUIRRELVM vm) {
     try {
-        sq_reservestack(vm, 1024);
-        CppSer c;
-        c.vm = vm;
+        HSQOBJECT arg;
+        sq_resetobject(&arg);
+        if (SQ_FAILED(sq_getstackobj(vm, 2, &arg))) {
+            return sq_throwerror(vm, _SC("gekko_cpp_ser: missing argument"));
+        }
         SQInteger md = 6;
         if (sq_gettop(vm) >= 3) sq_getinteger(vm, 3, &md);
+        RawSer c;
         c.max_depth = (int)md;
         c.out.reserve(192 * 1024);
-        cpp_ser_value(c, 2);   // arg 1 — stack idx 2 (idx 1 = this)
+        raw_ser(c, arg);
         sq_pushstring(vm, c.out.data(), (SQInteger)c.out.size());
         return 1;
     } catch (...) {
