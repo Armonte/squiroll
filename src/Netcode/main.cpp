@@ -22,6 +22,8 @@
 #include "RSACache.h"
 #include "live_actors.h"
 #include "focus_input.h"
+#include "crash_handler.h"
+#include "sq_arena.h"
 
 #include <shared.h>
 
@@ -296,12 +298,24 @@ bool common_init(
     disable_original_game_logging();
 #endif
 
+    // VEH crash logger — install before any of our patches/hooks so a
+    // fault anywhere lands a module+RVA report in aocf_crash.log.
+    crash_handler::install();
+
     hotpatch_rel32(0x1DC5A_R, parse_command_line);
 
     // Turn off scroll lock to simplify static management for the toggle func
     SetScrollLockState(false);
 
-    //patch_allocman();
+    // Route the Squirrel VM heap into a fixed arena (sq_arena) — the basis
+    // for the giuroll-style raw memory snapshot of the VM state. The three
+    // Squirrel allocator wrappers (sq_malloc/realloc/free_base) are hooked;
+    // a caller whose return address is in the Squirrel VM code block
+    // [0x17FDB0, 0x1A6000) is routed to the arena, everyone else to the
+    // real CRT heap. Must run before the Squirrel VM is created (sq_open) —
+    // common_init is well before that. (Supersedes the old alloc_man
+    // patch_allocman() tracking approach.)
+    sq_arena::install(0x17FDB0_R, 0x1A6000_R);
 
     // Allow launching multiple instances of the game
     mem_write(createmutex_patch_addr, PATCH_BYTES<0x68, 0x00, 0x00, 0x00, 0x00>); //mutex patch

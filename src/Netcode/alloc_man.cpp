@@ -83,10 +83,12 @@ struct AllocData {
         struct {
             bool rollback_tag : 1;
             bool has_record : 1;
+            bool sq_dead : 1; // sq_heap: deferred-freed, memory retained
         };
     };
-    // two bytes of padding
-    alignas(__STDCPP_DEFAULT_NEW_ALIGNMENT__) unsigned char data[]; // 0x10
+    uint32_t serial;     // sq_heap: monotonic birth order
+    uint32_t death_tick; // sq_heap: on_advance() tick when deferred-freed
+    alignas(__STDCPP_DEFAULT_NEW_ALIGNMENT__) unsigned char data[];
     
     static forceinline AllocData* get_from_ptr(void* ptr) {
         return (AllocData*)((uintptr_t)ptr - offsetof(AllocData, data));
@@ -101,6 +103,9 @@ struct AllocData {
         this->free_timer = 0;
         this->rollback_tag = false;
         this->has_record = false;
+        this->sq_dead = false;
+        this->serial = 0;     // set by my_malloc
+        this->death_tick = 0;
     }
     
     void reinit(size_t size) {
@@ -329,7 +334,21 @@ static AllocManager alloc_man;
 
 static SpinLock alloc_lock;
 
+// --- sq_heap state (giuroll-style Squirrel VM heap snapshot) ----------------
+static bool     g_sq_armed  = false;
+static uint32_t g_sq_tick   = 0;   // advanced once per committed real frame
+static uint32_t g_sq_serial = 1;   // monotonic alloc birth counter
+
 static void free_alloc(AllocData* alloc) {
+    if (g_sq_armed) {
+        // Armed: defer. Keep the block + its address so the rollback
+        // snapshot's raw pointers stay valid across the window; mark it dead.
+        if (!alloc->sq_dead) {
+            alloc->sq_dead = true;
+            alloc->death_tick = g_sq_tick;
+        }
+        return;
+    }
     if (alloc->has_record) {
         alloc->start_free();
     } else {
@@ -364,6 +383,7 @@ void* cdecl my_malloc(size_t size) {
     if (expect(real_alloc != NULL, true)) {
         std::lock_guard<SpinLock> lock(alloc_lock);
         real_alloc->init(size);
+        real_alloc->serial = g_sq_serial++;
         alloc_man.append(real_alloc);
         return &real_alloc->data;
     }
@@ -477,5 +497,121 @@ void patch_allocman() {
     hotpatch_jump(msize_base_addr, my_msize);
 #endif
 }
+
+// --- giuroll-style Squirrel VM heap snapshot --------------------------------
+//
+// Snapshots the whole live Squirrel allocation list as raw memory. Lossless:
+// every VM object (table/array/instance/closure/weakref/string/...) is an
+// allocation and is captured byte-for-byte, including all internal pointers.
+// While armed, frees are deferred (free_alloc above) so every block keeps a
+// stable address — raw pointers in a snapshot stay valid on restore.
+//
+// Save/load run on the game thread inside Gekko's Save/Load event handling,
+// never while Squirrel code is executing, so the alloc list is stable
+// (no my_malloc / my_free races) — no locking needed here.
+namespace sq_heap {
+
+#pragma pack(push, 1)
+struct Hdr {
+    uint32_t magic;        // MAGIC
+    uint32_t count;        // # of live (non-dead) allocs in the blob
+    uint32_t birth_limit;  // g_sq_serial at save time
+    uint32_t bytes;        // total blob size
+};
+struct Rec {
+    uint32_t id;      // AllocData* — process-local join key
+    uint32_t serial;  // birth order
+    uint32_t size;    // == AllocData::size; `size` data bytes follow
+};
+#pragma pack(pop)
+
+static constexpr uint32_t MAGIC = 0x50485153; // 'SQHP'
+
+void set_armed(bool on) { g_sq_armed = on; }
+
+void on_advance() {
+    ++g_sq_tick;
+    // Hard-free blocks dead longer than the rollback window. The window
+    // (committed frames) must exceed Gekko's max rollback distance
+    // (runahead + prediction window ~18); 256 is a wide safety margin.
+    static constexpr uint32_t DEAD_WINDOW = 256;
+    alloc_man.for_each_alloc([](AllocData* a) {
+        if (a->sq_dead && (g_sq_tick - a->death_tick) > DEAD_WINDOW) {
+            a->free();  // no save in Gekko's ring can still reference it
+        }
+    });
+}
+
+void flush() {
+    alloc_man.for_each_alloc([](AllocData* a) {
+        if (a->sq_dead) a->free();
+    });
+}
+
+uint32_t save(uint8_t* out, uint32_t cap) {
+    if (cap < sizeof(Hdr)) return 0;
+    uint8_t* p   = out + sizeof(Hdr);
+    uint8_t* end = out + cap;
+    uint32_t count = 0;
+    bool overflow = false;
+    alloc_man.for_each_alloc([&](AllocData* a) {
+        if (overflow || a->sq_dead) return;
+        uint32_t need = (uint32_t)sizeof(Rec) + (uint32_t)a->size;
+        if (p + need > end) { overflow = true; return; }
+        Rec* r = (Rec*)p;
+        r->id     = (uint32_t)a;
+        r->serial = a->serial;
+        r->size   = (uint32_t)a->size;
+        memcpy(p + sizeof(Rec), a->data, a->size);
+        p += need;
+        ++count;
+    });
+    if (overflow) return 0;
+    Hdr* h = (Hdr*)out;
+    h->magic       = MAGIC;
+    h->count       = count;
+    h->birth_limit = g_sq_serial;
+    h->bytes       = (uint32_t)(p - out);
+    return h->bytes;
+}
+
+void load(const uint8_t* blob, uint32_t len) {
+    if (len < sizeof(Hdr)) return;
+    const Hdr* h = (const Hdr*)blob;
+    if (h->magic != MAGIC) return;
+
+    // Pass 1: restore each saved alloc's bytes in place; collect its id.
+    // Every saved block is guaranteed still allocated — deferred-free keeps
+    // it across the window, and DEAD_WINDOW >> Gekko's rollback distance.
+    std::unordered_set<uint32_t> live_ids;
+    live_ids.reserve(h->count * 2 + 8);
+    const uint8_t* p   = blob + sizeof(Hdr);
+    const uint8_t* end = blob + len;
+    for (uint32_t i = 0; i < h->count; ++i) {
+        if (p + sizeof(Rec) > end) break;
+        const Rec* r = (const Rec*)p;
+        const uint8_t* data = p + sizeof(Rec);
+        if (data + r->size > end) break;
+        AllocData* a = (AllocData*)r->id;
+        memcpy(a->data, data, r->size);
+        a->sq_dead = false;
+        live_ids.insert(r->id);
+        p += sizeof(Rec) + r->size;
+    }
+
+    // Pass 2: reconcile every other tracked alloc.
+    //  - serial >= birth_limit and absent from the blob -> born at/after the
+    //    saved frame, never existed there: hard-free it.
+    //  - older but absent -> existed earlier, already dead by the saved
+    //    frame: keep the block (an older save may need it), mark dead.
+    const uint32_t birth_limit = h->birth_limit;
+    alloc_man.for_each_alloc([&](AllocData* a) {
+        if (live_ids.count((uint32_t)a)) return;
+        if (a->serial >= birth_limit) a->free();
+        else                          a->sq_dead = true;
+    });
+}
+
+} // namespace sq_heap
 
 #endif

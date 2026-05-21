@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "gekko_bridge.h"
@@ -18,6 +19,9 @@
 #include "log.h"
 #include "Actor2D.h"
 #include "live_actors.h"
+#include "alloc_man.h"  // sq_heap — giuroll-style Squirrel VM heap snapshot
+#include "sq_arena.h"   // Squirrel VM heap arena
+#include "battle_pools.h" // C++ battle object pools
 #include <squirrel.h>
 // squiroll routes every sq_* call through a runtime-filled KITE table —
 // without this header the bare sq_pushroottable etc. show up as undefined
@@ -516,7 +520,19 @@ static int blob_extract_count(const uint8_t* blob, uint32_t len) {
 
 // Header magic + version: bump version whenever the layout changes.
 static constexpr uint32_t SAVE_MAGIC   = 0x46414B47; // 'GKAF'
-static constexpr uint32_t SAVE_VERSION = 3;          // v3: + Squirrel blob trailer
+static constexpr uint32_t SAVE_VERSION = 4;          // v4: + anim controller snapshot
+
+// ManbowActor2D::anim_controller is a std::shared_ptr at +0x3C; its first
+// 4 bytes are the ManbowAnimationController2D*.
+static constexpr uint32_t ACTOR_ANIM_CTRL_OFF = 0x3C;
+// Bytes of the controller we snapshot — covers the base playback fields
+// and the 2D playback block (motion @0x1C .. __bool13E @0x13E). The
+// controller's std::vectors (collision boxes @0x78-0x9C, sprites @0x224)
+// are deliberately NOT in this range and never restored: they own heap
+// buffers and are derived state, recomputed every frame from the
+// animation. Only the playback fields drive end-of-motion callback
+// timing, which is what desyncs across rollback (#58).
+static constexpr uint32_t ANIM_SNAP_BYTES = 0x140;
 
 struct SaveHeader {
     uint32_t magic;
@@ -545,21 +561,33 @@ struct ActorRecord {
     // state. Heap addresses are stable within a process (no ASLR mid-
     // game) and live_actors' deferred-release queue keeps the memory
     // alive across the rollback window, so the same actor sits at the
-    // same address from save through load. Attempted Actor2D::id (offset
-    // 0x18) first — that field is NOT a stable integer in practice; the
-    // value observed was a pointer-like 0x23fef990, churning between
-    // frames. Pointer is straightforwardly stable.
+    // same address from save through load.
     uintptr_t ptr;
-    uint8_t   body[sizeof(ManbowActor2D)];
+    uint8_t   body[sizeof(ManbowActor2D)];   // raw 0xEC ManbowActor2D
+    uint32_t  ctrl_present;                  // 1 if anim_controller != null
+    uint8_t   ctrl[ANIM_SNAP_BYTES];         // ManbowAnimationController2D head
 };
 #pragma pack(pop)
-static_assert(sizeof(ActorRecord) == 4 + sizeof(ManbowActor2D));
+static_assert(sizeof(ActorRecord) ==
+              4 + sizeof(ManbowActor2D) + 4 + ANIM_SNAP_BYTES);
 
 // SQ walker is always enabled. The fine-grained "what depth do we walk"
 // is controlled by ::__gekko_state._bisect_level in gekko_state.nut
 // (default level 3 — walk team_data scalars, leave sub-instances at
 // empty body).
 static bool g_sq_save_enabled = true;
+
+// Use the giuroll-style raw Squirrel-heap snapshot for save/restore. OFF:
+// the build falls back to the text walker for restore (non-crashing, but
+// #58 desync). The raw heap snapshot is implemented and lossless for the
+// Squirrel VM, but a Squirrel-heap-only snapshot is INSUFFICIENT — the
+// C++ engine (Sqrat: actor update_func/sq_obj, global bindings, the
+// battle's C++ side) holds Squirrel object references that contribute to
+// Squirrel refcounts. Rolling back only the Squirrel heap desyncs those
+// refcounts against the un-rolled-back C++ side → use-after-free (crash in
+// sq_release, VEH-confirmed). Turning this ON requires snapshotting the
+// C++ game state in the same consistent unit (the real giuroll model).
+static bool g_sq_heap_rollback = false;
 
 uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                            uint32_t frame) {
@@ -573,7 +601,7 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
     hdr->rand_state = acrt_getptd()->rand_state;
 
     // Snapshot live actor pointers under a fixed cap.
-    static constexpr size_t MAX_ACTORS = 1024;
+    static constexpr size_t MAX_ACTORS = 2048;
     ManbowActor2D* actors[MAX_ACTORS];
     size_t n = live_actors::snapshot(actors, MAX_ACTORS);
     hdr->actor_count = (uint32_t)n;
@@ -587,42 +615,72 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         return 0;
     }
 
-    // Per-actor record: [ptr][raw 0xEC body]. See ActorRecord comment
-    // re: pointer join-key.
+    // Per-actor record: [ptr][raw 0xEC body][ctrl_present][ctrl head].
     for (size_t i = 0; i < n; ++i) {
         ActorRecord* rec = (ActorRecord*)p;
         rec->ptr = (uintptr_t)actors[i];
         memcpy(rec->body, actors[i], sizeof(ManbowActor2D));
+        // Snapshot the animation controller's playback head. The actor's
+        // anim_controller is a shared_ptr at +0x3C; deref to the
+        // ManbowAnimationController2D and copy its first ANIM_SNAP_BYTES.
+        void* ctrl = *(void**)((char*)actors[i] + ACTOR_ANIM_CTRL_OFF);
+        if (ctrl) {
+            rec->ctrl_present = 1;
+            memcpy(rec->ctrl, ctrl, ANIM_SNAP_BYTES);
+        } else {
+            rec->ctrl_present = 0;
+            memset(rec->ctrl, 0, ANIM_SNAP_BYTES);
+        }
         p += sizeof(ActorRecord);
     }
 
-    // Trailer: [uint32 squirrel_len][bytes]. Lets the C++ state ride
-    // alongside the dynamic per-character Squirrel state captured by
-    // ::__gekko_state.save_battle (task #22).
+    // Trailer 1: [uint32 text_len][text blob]. The value-based Squirrel
+    // walker. Kept ONLY to compute the desync checksum — it encodes
+    // value-by-value (no raw addresses) so it is identical cross-peer when
+    // state matches. It is NOT used to restore state anymore (the raw
+    // sq_heap snapshot below does that, losslessly).
     uint32_t actors_end = (uint32_t)(p - static_cast<uint8_t*>(buf));
     if (actors_end + 4 > cap) return actors_end;
     uint32_t* sq_len_field = (uint32_t*)p;
     p += 4;
     uint32_t sq_cap = (cap - actors_end - 4);
+    uint8_t* text_blob = p;
     uint32_t sq_n = g_sq_save_enabled ? call_squirrel_save(p, sq_cap, frame) : 0;
     *sq_len_field = sq_n;
     p += sq_n;
 
-    uint32_t written = (uint32_t)(p - static_cast<uint8_t*>(buf));
     if (out_checksum) {
-        // Checksum ONLY the Squirrel blob (deterministic text representation).
-        // The C++ ActorRecord includes a per-process pointer field (the join
-        // key), so two peers naturally produce different bytes even when
-        // their game state is identical — that would spuriously trip
-        // Gekko's desync detector every frame. The Squirrel text blob, by
-        // contrast, encodes value-by-value via getclass() foreach and is
-        // identical cross-peer when state matches.
-        if (sq_n > 0) {
-            *out_checksum = fletcher32(p - sq_n, sq_n);
-        } else {
-            *out_checksum = 0;
+        // Checksum the value-based text blob — address-independent, so two
+        // peers (or a speculative save vs a rollback re-sim) produce the
+        // same checksum whenever the logical state matches.
+        *out_checksum = sq_n > 0 ? fletcher32(text_blob, sq_n) : 0;
+    }
+
+    // Trailer 2: [uint32 sqheap_len][raw sq_heap snapshot]. The lossless
+    // giuroll-style raw capture of the entire live Squirrel VM heap. Only
+    // emitted when g_sq_heap_rollback is on (see its declaration).
+    uint32_t after_text = (uint32_t)(p - static_cast<uint8_t*>(buf));
+    if (after_text + 4 > cap) return after_text;
+    uint32_t* heap_len_field = (uint32_t*)p;
+    p += 4;
+    uint32_t heap_n = 0;
+    if (g_sq_heap_rollback) {
+        heap_n = sq_heap::save(p, cap - after_text - 4);
+        static uint32_t heap_log_quota = 4;
+        if (heap_log_quota > 0) {
+            --heap_log_quota;
+            log_printf("[sq_heap] save frame=%u heap_blob=%u bytes "
+                       "(text=%u)\n", frame, heap_n, sq_n);
+        }
+        if (heap_n == 0) {
+            log_printf("[sq_heap] !! save OVERFLOW frame=%u — bump "
+                       "state_size\n", frame);
         }
     }
+    *heap_len_field = heap_n;
+    p += heap_n;
+
+    uint32_t written = (uint32_t)(p - static_cast<uint8_t*>(buf));
     return written;
 }
 
@@ -650,15 +708,24 @@ void load_state_from_buf(const void* buf, uint32_t len) {
         return;
     }
 
-    // Pointer-as-join-key: build a flat set of live actor pointers and
-    // memcpy each saved body if its source pointer is still live. With
-    // live_actors::set_defer_release(true), the pointer is the most
-    // stable thing we have — Release won't reclaim the slot until
-    // disarm, so a save+load within one rollback window finds the same
-    // address occupied by the same logical actor.
-    static constexpr size_t MAX_ACTORS = 1024;
+    // Pointer-as-join-key: match each saved record to a still-live actor
+    // by address. The raw 0xEC ManbowActor2D body is, however,
+    // intentionally NOT restored — see the loop body.
+    static constexpr size_t MAX_ACTORS = 2048;
     ManbowActor2D* live[MAX_ACTORS];
     size_t live_n = live_actors::snapshot(live, MAX_ACTORS);
+
+    // saved_ptrs = the exact live actor set at the frame being loaded.
+    // Anything live now but absent from it was spawned AFTER this frame.
+    std::unordered_set<uintptr_t> saved_ptrs;
+    saved_ptrs.reserve(hdr->actor_count * 2 + 8);
+    {
+        const uint8_t* q = p;
+        for (uint32_t i = 0; i < hdr->actor_count; ++i) {
+            saved_ptrs.insert(((const ActorRecord*)q)->ptr);
+            q += sizeof(ActorRecord);
+        }
+    }
 
     size_t restored = 0, missing = 0;
     for (uint32_t i = 0; i < hdr->actor_count; ++i) {
@@ -668,45 +735,117 @@ void load_state_from_buf(const void* buf, uint32_t len) {
             if ((uintptr_t)live[j] == rec->ptr) { target = live[j]; break; }
         }
         if (target) {
-            memcpy(target, rec->body, sizeof(ManbowActor2D));
+            // Roll back the actor's alive/inert state. active_flags (@0x70,
+            // a single byte) is what the group's per-frame loop tests:
+            // it ticks/renders only actors with bit 0 set. Restoring it
+            // from the saved body re-activates an actor that a prior
+            // rollback parked inert, and is a pure value write — no
+            // pointer/satellite hazard.
+            target->active_flags = rec->body[0x70];
+            // The raw 0xEC ManbowActor2D body is NOT memcpy'd back: it is
+            // dense with pointers to satellite heap objects not in the
+            // snapshot — the task linked-list (head @ 0xD0), the
+            // SqratFunction HSQOBJECTs (0xA8 / 0xBC). Restoring those raw
+            // makes them dangle (a stale 0xD0 head walks Actor2D::Update
+            // into a freed task node — crash at th155.exe+0xC12B9,
+            // VEH-confirmed). The actor's spatial state is carried by the
+            // Squirrel blob; the C++ task-list rollback is separate work.
+            //
+            // The animation controller IS restored. It is a stable
+            // per-actor object (lives with the actor, not reallocated
+            // mid-round) so its playback fields can be written back in
+            // place. It is NOT in the Squirrel blob — without this, a
+            // rollback leaves the C++ anim frame un-rewound, end-of-motion
+            // callbacks fire off-by-one, and they reset the character's
+            // Squirrel `count` at the wrong frame: the round-transition
+            // desync (#58). Restore only the playback fields:
+            //   base   0x1C..0x28 — motion, key_take, key_frame
+            //   2D     0x124..0x13F — anim_set, take, animation_data,
+            //                         frame, frame_again, speed, flags
+            // Skip the colour/matrix render state and the hitbox
+            // std::vectors (derived; recomputed each frame).
+            if (rec->ctrl_present) {
+                void* ctrl = *(void**)((char*)target + ACTOR_ANIM_CTRL_OFF);
+                if (ctrl) {
+                    memcpy((char*)ctrl + 0x1C,  rec->ctrl + 0x1C,  0x28 - 0x1C);
+                    memcpy((char*)ctrl + 0x124, rec->ctrl + 0x124, 0x13F - 0x124);
+                }
+            }
             ++restored;
         } else {
             ++missing;
         }
         p += sizeof(ActorRecord);
     }
-    // Only chatter when something went wrong with the restore.
-    if (missing) {
-        log_printf("gekko_bridge::load_state: restored %zu/%u (%zu missing)\n",
-                   restored, hdr->actor_count, missing);
+
+    // Reconcile the live actor SET back to the saved frame. Any actor live
+    // now but absent from the save was spawned by a forward-sim Advance
+    // that this rollback is undoing — e.g. a round-transition effect
+    // actor. `live_actors`' g_live is process-global and never shrinks
+    // (defer_release), so without this every re-sim that crosses a spawn
+    // accumulates a duplicate and the actor set at a given gekko frame
+    // becomes path-dependent — the round-transition desync (#58, proven:
+    // frame 234 saved with 12 actors on most paths, 13 on the minimal
+    // re-sim). Park each stray inert: active_flags=4 is the engine's
+    // released value (bit 0 clear → the group loop skips it for
+    // update+render). We deliberately do NOT set group->pending_release,
+    // so the group's cleanup pass never runs and the actor is never
+    // pool-freed mid-window — that pool-free is what crashed earlier
+    // (VEH-confirmed). The object leaks until disarm; bounded by round
+    // length. The re-sim re-creates whatever the deterministic logic
+    // spawns.
+    size_t culled = 0;
+    for (size_t j = 0; j < live_n; ++j) {
+        if (saved_ptrs.find((uintptr_t)live[j]) == saved_ptrs.end()) {
+            live[j]->active_flags = 4;
+            ++culled;
+        }
     }
 
-    // Squirrel trailer (v3+). Layout after actor records:
-    //   uint32_t squirrel_len; <bytes>
-    if (len - sizeof(SaveHeader) >= need + 4) {
-        const uint32_t sq_len = *(const uint32_t*)p;
-        p += 4;
-        static uint32_t sq_load_log_quota = 4;
-        if (sq_len > 0 && (size_t)(p - static_cast<const uint8_t*>(buf)) + sq_len <= len) {
-            if (sq_load_log_quota > 0) {
-                --sq_load_log_quota;
-                log_printf("[gekko_bridge] call_squirrel_load sq_len=%u "
-                           "(quota_remaining=%u)\n",
-                           sq_len, sq_load_log_quota);
-            }
-            call_squirrel_load(p, sq_len, hdr->frame);
-        } else if (sq_load_log_quota > 0) {
-            --sq_load_log_quota;
-            log_printf("[gekko_bridge] SKIP call_squirrel_load sq_len=%u "
-                       "(empty or out-of-bounds)\n", sq_len);
-        }
-    } else {
+    // Only chatter when the restore was not a clean 1:1.
+    if (missing || culled) {
+        log_printf("gekko_bridge::load_state: restored %zu/%u "
+                   "(%zu missing, %zu culled)\n",
+                   restored, hdr->actor_count, missing, culled);
+    }
+
+    // Trailer 1: [uint32 text_len][text blob].
+    if (len - sizeof(SaveHeader) < need + 4) {
         static bool no_trailer_logged = false;
         if (!no_trailer_logged) {
             no_trailer_logged = true;
-            log_printf("[gekko_bridge] load: NO trailer (len=%u sizeof(SH)=%u need=%u)\n",
-                       len, (uint32_t)sizeof(SaveHeader), need);
+            log_printf("[gekko_bridge] load: NO trailer (len=%u need=%u)\n",
+                       len, need);
         }
+        return;
+    }
+    const uint32_t text_len = *(const uint32_t*)p;
+    const uint8_t* text_blob = p + 4;
+
+    if (!g_sq_heap_rollback) {
+        // Text-walker restore path (fallback while the raw heap snapshot
+        // awaits C++-side state capture — see g_sq_heap_rollback).
+        if (text_len > 0 &&
+            (size_t)(text_blob - static_cast<const uint8_t*>(buf)) + text_len <= len) {
+            call_squirrel_load(text_blob, text_len, hdr->frame);
+        }
+        return;
+    }
+
+    // Raw sq_heap restore path. Trailer 2: [uint32 sqheap_len][snapshot].
+    p += 4 + text_len;
+    if ((size_t)(p - static_cast<const uint8_t*>(buf)) + 4 > len) return;
+    const uint32_t heap_len = *(const uint32_t*)p;
+    p += 4;
+    if (heap_len > 0 &&
+        (size_t)(p - static_cast<const uint8_t*>(buf)) + heap_len <= len) {
+        static uint32_t heap_load_quota = 4;
+        if (heap_load_quota > 0) {
+            --heap_load_quota;
+            log_printf("[sq_heap] load frame=%u heap_blob=%u\n",
+                       hdr->frame, heap_len);
+        }
+        sq_heap::load(p, heap_len);
     }
 }
 
@@ -824,11 +963,11 @@ bool init(uint16_t local_port, uint16_t remote_port,
     GekkoConfig config = {};
     config.desync_detection = true;
     config.input_size = sizeof(uint16_t);
-    // 2 MB: observed actor-walker blob alone ~ 204 KB per actor at
-    // depth 6, and that's just team.master/slave (no projectiles/effects
-    // yet). Bumping ahead of the eventual full live_actors enumeration.
-    // Memory: Gekko keeps ~10 saves in flight → 20 MB working set.
-    config.state_size = 2 * 1024 * 1024;
+    // 16 MB: the sq_heap snapshot is the full live Squirrel VM heap (every
+    // tracked allocation), plus the text checksum blob + actor records.
+    // Gekko keeps ~10-20 saves in flight. Logged per save ([sq_heap] save)
+    // so the real size can be measured and this dialed in.
+    config.state_size = 16 * 1024 * 1024;
     config.max_spectators = 0;
     config.input_prediction_window = 10;
     config.num_players = 2;
@@ -859,6 +998,12 @@ bool init(uint16_t local_port, uint16_t remote_port,
     // flight); if Release was still un-deferred during that window the
     // saved actors would be gone by the time the matching Load fires.
     live_actors::set_defer_release(true);
+    // Defer Squirrel VM frees too, so every object keeps a stable address
+    // for the raw heap snapshot (giuroll model).
+    sq_heap::set_armed(true);
+    // Pre-grow the C++ battle object pools so their block set is frozen
+    // for the match — the rollback snapshot copies those blocks raw.
+    battle_pools::pregrow();
     apply_test_round_frames();
 
     log_printf("gekko_bridge: session up. local=%u port=%u remote=%s (remote_addr_len=%u)\n",
@@ -877,7 +1022,7 @@ bool init_solo() {
     GekkoConfig config = {};
     config.desync_detection = true;
     config.input_size = sizeof(uint16_t);
-    config.state_size = 2 * 1024 * 1024;
+    config.state_size = 16 * 1024 * 1024;  // full Squirrel VM heap snapshot
     config.max_spectators = 0;
     config.num_players = 2;
     // Roll back 8 frames every frame: the stress session re-simulates
@@ -897,6 +1042,8 @@ bool init_solo() {
 
     g_active = true;
     live_actors::set_defer_release(true);
+    sq_heap::set_armed(true);  // defer Squirrel frees for the heap snapshot
+    battle_pools::pregrow();   // freeze the C++ battle pools' block set
 
     // The battle is already created — vs.Initialize ran under the
     // vanilla loop during the intro. A stress session has no handshake
@@ -1024,6 +1171,9 @@ void shutdown() {
     // reclaim their slots once we're done with the session.
     live_actors::set_defer_release(false);
     live_actors::flush_deferred();
+    // Stop deferring Squirrel frees and hard-free every block we held back.
+    sq_heap::set_armed(false);
+    sq_heap::flush();
 }
 
 bool is_active()         { return g_active; }
@@ -1059,6 +1209,19 @@ int turbo_ticks() {
 
 bool tick() {
     if (!g_active) return false;
+
+    // DIAGNOSTIC: confirm the Squirrel VM heap is living in the arena.
+    // Logged every 600 frames while a session runs — `used` is the arena
+    // high-water, `live` is currently-handed-out bytes.
+    if (g_session_started) {
+        static uint32_t arena_log = 0;
+        if ((arena_log++ % 600) == 0) {
+            log_printf("[sq_arena] used=%u KB live=%u KB cap=%u MB\n",
+                       sq_arena::used() / 1024,
+                       (uint32_t)(sq_arena::live_bytes() / 1024),
+                       sq_arena::capacity() / (1024 * 1024));
+        }
+    }
 
     // Always poll the network so the GekkoNet sync handshake
     // (SyncRequest/SyncResponse / session_magic exchange) can complete
@@ -1155,7 +1318,7 @@ bool tick() {
                 uint32_t cs = 0;
                 uint32_t n = save_state_to_buf(
                     e->data.save.state,
-                    /*cap=*/ 2 * 1024 * 1024,  // must match GekkoConfig::state_size
+                    /*cap=*/ 16 * 1024 * 1024,  // must match GekkoConfig::state_size
                     &cs,
                     (uint32_t)e->data.save.frame
                 );
@@ -1176,23 +1339,25 @@ bool tick() {
                     // offset) the sim mutated that save/load did NOT
                     // restore — i.e. the missing piece of the snapshot.
                     // Set to the frame run_solo.sh reports the DESYNC at.
-                    static const int DUMP_FRAME = 2;
+                    static const int DUMP_LO = 230, DUMP_HI = 235;
                     int fr = e->data.save.frame;
-                    static int dump_save_count = 0;
-                    if (fr == DUMP_FRAME && dump_save_count < 6) {
-                        char path[128];
-                        snprintf(path, sizeof(path),
-                                 "C:\\dev\\aocf\\th155\\sq_blob_p%u_f%d_s%d.bin",
-                                 (unsigned)g_local_idx, fr, dump_save_count);
-                        FILE* f = fopen(path, "wb");
-                        if (f) {
-                            fwrite(e->data.save.state, 1, n, f);
-                            fclose(f);
-                            log_printf("[gekko_bridge] Save frame=%d #%d len=%u"
-                                       " cs=0x%08x -> %s\n",
-                                       fr, dump_save_count, n, cs, path);
+                    if (fr >= DUMP_LO && fr <= DUMP_HI) {
+                        static int dump_cnt[DUMP_HI - DUMP_LO + 1] = {0};
+                        int* dc = &dump_cnt[fr - DUMP_LO];
+                        if (*dc < 10) {
+                            char path[128];
+                            snprintf(path, sizeof(path),
+                                     "C:\\dev\\aocf\\th155\\sq_blob_p%u_f%d_s%d.bin",
+                                     (unsigned)g_local_idx, fr, *dc);
+                            FILE* f = fopen(path, "wb");
+                            if (f) {
+                                fwrite(e->data.save.state, 1, n, f);
+                                fclose(f);
+                                log_printf("[gekko_bridge] Save frame=%d #%d "
+                                           "len=%u cs=0x%08x\n", fr, *dc, n, cs);
+                            }
+                            ++*dc;
                         }
-                        ++dump_save_count;
                     }
                 }
                 // TRACE: correlate gekko frame ↔ engine `count` so we
