@@ -84,11 +84,12 @@
     return t;
 };
 
+// _seen maps instance -> assigned id. A Squirrel table keys instances
+// by reference identity, so this is an O(1) lookup — the old linear
+// scan over an array of [instance,id] pairs was O(instances^2) across a
+// full walk.
 ::__gekko_state._find_seen_id <- function (v) {
-    foreach (entry in ::__gekko_state._seen) {
-        if (entry[0] == v) return entry[1];
-    }
-    return null;
+    return (v in ::__gekko_state._seen) ? ::__gekko_state._seen[v] : null;
 };
 
 ::__gekko_state.ser <- function (v) {
@@ -137,7 +138,7 @@
 
     if (::__gekko_state._cur_depth >= ::__gekko_state._max_depth) {
         local my_id = ::__gekko_state._next_id++;
-        ::__gekko_state._seen.append([v, my_id]);
+        ::__gekko_state._seen[v] <- my_id;
         return "I" + my_id + ":0:{}";
     }
 
@@ -145,12 +146,12 @@
     try { cls = v.getclass(); } catch (_) { cls = null; }
     if (cls == null) {
         local mid = ::__gekko_state._next_id++;
-        ::__gekko_state._seen.append([v, mid]);
+        ::__gekko_state._seen[v] <- mid;
         return "I" + mid + ":0:{}";
     }
 
     local my_id = ::__gekko_state._next_id++;
-    ::__gekko_state._seen.append([v, my_id]);
+    ::__gekko_state._seen[v] <- my_id;
 
     // Enumerate members from the class. For each member, the iteration
     // value `cdef` is the class-level default/binding. If `cdef` is a
@@ -408,7 +409,7 @@
 // to already-seen instances become R<id>;.
 ::__gekko_state.save_battle <- function (frame = 0) {
     if (::__gekko_state._bisect_level == 0) return "";
-    ::__gekko_state._seen = [];
+    ::__gekko_state._seen = {};
     ::__gekko_state._next_id = 1;
     ::__gekko_state._cur_depth = 0;
     // Depth cap drives how far ser() recurses into instance branches.

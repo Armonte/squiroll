@@ -150,7 +150,21 @@ static uint32_t call_squirrel_save(uint8_t* out, uint32_t cap, uint32_t frame) {
     // stack: root, gekko_state, save_battle
     sq_push(v, -2);  // `this` = gekko_state table
     sq_pushinteger(v, (SQInteger)frame);  // save_battle(frame) — keys _keep
-    if (SQ_FAILED(sq_call(v, 2, SQTrue, SQTrue))) { sq_settop(v, top0); return 0; }
+    // PERF: time the Squirrel walker. Logs avg us every 600 saves.
+    LARGE_INTEGER _ps0, _ps1, _psf;
+    QueryPerformanceFrequency(&_psf);
+    QueryPerformanceCounter(&_ps0);
+    SQRESULT _sr = sq_call(v, 2, SQTrue, SQTrue);
+    QueryPerformanceCounter(&_ps1);
+    {
+        static uint64_t acc = 0, cnt = 0;
+        acc += (uint64_t)(_ps1.QuadPart - _ps0.QuadPart) * 1000000ull / _psf.QuadPart;
+        if (++cnt % 600 == 0) {
+            log_printf("[perf] save_battle: avg %llu us/call over %llu calls\n",
+                       acc / cnt, cnt);
+        }
+    }
+    if (SQ_FAILED(_sr)) { sq_settop(v, top0); return 0; }
     const SQChar* sqstr = nullptr;
     if (SQ_FAILED(sq_getstring(v, -1, &sqstr)) || !sqstr) {
         sq_settop(v, top0);
@@ -185,7 +199,20 @@ static void call_squirrel_load(const uint8_t* data, uint32_t len, uint32_t frame
     // is safe. If we ever switch to binary we'll need a different bind.
     sq_pushstring(v, (const SQChar*)data, (SQInteger)len);
     sq_pushinteger(v, (SQInteger)frame);  // load_battle(str, frame) — keys _keep
-    if (SQ_FAILED(sq_call(v, 3, SQFalse, SQTrue))) {
+    LARGE_INTEGER _pl0, _pl1, _plf;
+    QueryPerformanceFrequency(&_plf);
+    QueryPerformanceCounter(&_pl0);
+    SQRESULT _lr = sq_call(v, 3, SQFalse, SQTrue);
+    QueryPerformanceCounter(&_pl1);
+    {
+        static uint64_t acc = 0, cnt = 0;
+        acc += (uint64_t)(_pl1.QuadPart - _pl0.QuadPart) * 1000000ull / _plf.QuadPart;
+        if (++cnt % 600 == 0) {
+            log_printf("[perf] load_battle: avg %llu us/call over %llu calls\n",
+                       acc / cnt, cnt);
+        }
+    }
+    if (SQ_FAILED(_lr)) {
         log_printf("[gekko_bridge] __gekko_state.load_battle threw\n");
     }
     sq_settop(v, top0);
