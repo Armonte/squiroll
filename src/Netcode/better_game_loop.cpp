@@ -137,6 +137,12 @@ void stdcall better_game_loop() {
         perf_api.EndEvent();
 #endif
 
+        // Drain the log buffers once per frame. The log file + console
+        // are fully buffered (see open_log_file); flushing here keeps
+        // them current without the per-line disk/console writes that
+        // were stalling the frame.
+        log_flush();
+
         uint64_t now = current_qpc();
         if (now < qpc_target) {
             timer.wait();

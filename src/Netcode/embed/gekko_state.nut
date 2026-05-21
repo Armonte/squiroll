@@ -425,7 +425,7 @@
     }
     // Periodic snapshot log so we can see the round phase machine
     // actually advancing (state 2->4->8->64) across the match.
-    ::__gekko_state._save_tick = (::__gekko_state._save_tick + 1) % 180;
+    ::__gekko_state._save_tick = (::__gekko_state._save_tick + 1) % 1200;
     if (::__gekko_state._save_tick == 0) {
         local ewd = ("endWinDemo" in ::battle && ::battle.endWinDemo != null)
             ? (::battle.endWinDemo[0] + "/" + ::battle.endWinDemo[1]) : "?";

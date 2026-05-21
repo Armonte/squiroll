@@ -29,9 +29,25 @@ void open_log_file(const char* path) {
     if (g_log_file) return;
     g_log_file = fopen(path, "w");
     if (g_log_file) {
-        setvbuf(g_log_file, nullptr, _IONBF, 0);
+        // Fully buffered, NOT _IONBF. Unbuffered meant every log line
+        // was a synchronous disk write — with the per-frame netcode
+        // tracing that stalled the game hard. log_flush() drains the
+        // buffer once per frame from better_game_loop, so a crash still
+        // only loses at most one frame of log.
+        setvbuf(g_log_file, nullptr, _IOFBF, 1 << 16);
         fputs("=== squiroll log start ===\n", g_log_file);
     }
+    // The console (stdout) tee is just as slow per-call — WriteConsole
+    // per line chokes under heavy logging. Fully buffer it too; the
+    // per-frame log_flush() keeps the console window ~60 Hz live.
+    setvbuf(stdout, nullptr, _IOFBF, 1 << 16);
+}
+
+// Flush both sinks. Call once per frame (better_game_loop), NOT per
+// log line — per-line flushing is what made logging a frame-time sink.
+void log_flush() {
+    if (g_log_file) fflush(g_log_file);
+    fflush(stdout);
 }
 
 static void tee_vprintf(FILE* stream, const char* format, va_list va) {

@@ -82,9 +82,11 @@ static uint8_t       g_local_idx = 0;
 static bool          g_active          = false; // session exists; UDP handshake can run
 static bool          g_session_started = false; // SessionStarted fired + vs.Initialize done;
                                                  // gekko owns the frame counter
-static uint32_t      g_evt_trace = 450;          // diagnostic: log this many
-                                                 // Save/Load/Advance events with
-                                                 // engine count, then stop
+static uint32_t      g_evt_trace = 0;            // diagnostic: # of Save/Load/
+                                                 // Advance events to trace with
+                                                 // engine count. 0 = off (set
+                                                 // non-zero only when debugging
+                                                 // the count/desync path)
 
 uint16_t forced_inputs[2] = {0, 0};
 bool     forced_inputs_active = false;

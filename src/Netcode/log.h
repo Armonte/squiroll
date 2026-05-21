@@ -84,6 +84,9 @@ void patch_throw_logs();
 // plugin.cpp can install a Squirrel print func that also fans out to it.
 extern FILE* g_log_file;
 void open_log_file(const char* path);
+// Drain the buffered log + console sinks. Call once per frame, never
+// per log line — per-line flushing is what stalled the game.
+void log_flush();
 extern "C" void cdecl tee_printf(const char* format, ...);
 extern "C" void cdecl tee_fprintf(FILE* stream, const char* format, ...);
 // Squirrel sq_setprintfunc handlers (signature: SQPRINTFUNCTION).
