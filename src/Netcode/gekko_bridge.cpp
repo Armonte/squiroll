@@ -514,6 +514,8 @@ void render_one_frame() {
 
 // ---------------------------------------------------------------- session --
 
+static void apply_test_round_frames();  // defined below; used by init/init_solo
+
 bool init(uint16_t local_port, uint16_t remote_port,
           uint8_t local_player_idx, const char* remote_ip)
 {
@@ -559,6 +561,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
     // flight); if Release was still un-deferred during that window the
     // saved actors would be gone by the time the matching Load fires.
     live_actors::set_defer_release(true);
+    apply_test_round_frames();
 
     log_printf("gekko_bridge: session up. local=%u port=%u remote=%s (remote_addr_len=%u)\n",
                local_player_idx, local_port, remote_addr,
@@ -601,6 +604,7 @@ bool init_solo() {
     // and emits no GekkoSessionStarted, so we are started immediately:
     // gekko owns the frame loop from here, frame 0 = this Round_Fight
     // frame.
+    apply_test_round_frames();
     g_session_started = true;
 
     log_printf("gekko_bridge: SOLO stress session up. check_distance=%u\n",
@@ -636,6 +640,33 @@ static uint16_t g_watch_local_port  = 0;
 static uint16_t g_watch_remote_port = 0;
 static uint8_t  g_watch_local_idx   = 0;
 static char     g_watch_remote_ip[64] = {0};
+
+// TEST hook: if SQUIROLL_ROUND_FRAMES=N is set, overwrite battle.time
+// with N at session-arm — once, before the first save, so it is
+// deterministic and re-sims reproduce it. Shortens round 1 so a harness
+// run reaches the round transition (time-over -> round 2) quickly.
+// Both dual peers read the same env -> same value -> still in sync.
+static void apply_test_round_frames() {
+    static int rf = -1;
+    if (rf < 0) {
+        char buf[16] = {0};
+        DWORD n = GetEnvironmentVariableA("SQUIROLL_ROUND_FRAMES", buf, sizeof(buf));
+        rf = (n > 0 && n < sizeof(buf)) ? atoi(buf) : 0;
+        if (rf < 0) rf = 0;
+    }
+    if (rf <= 0 || !v) return;
+    SQInteger top = sq_gettop(v);
+    sq_pushroottable(v);
+    sq_pushstring(v, _SC("battle"), -1);
+    if (SQ_SUCCEEDED(sq_get(v, -2))) {
+        sq_pushstring(v, _SC("time"), -1);
+        sq_pushinteger(v, rf);
+        if (SQ_SUCCEEDED(sq_set(v, -3))) {
+            log_printf("[gekko_bridge] TEST: round timer shortened to %d frames\n", rf);
+        }
+    }
+    sq_settop(v, top);
+}
 
 void watch_for_fight_solo() {
     g_watch_for_fight = true;
@@ -704,8 +735,25 @@ bool is_session_started(){ return g_session_started; }
 // run can reach time-over (~8910 logical frames) in seconds. Netplay is
 // network-paced — turbo is gated to g_solo so it can't desync a match.
 int turbo_ticks() {
-    if (g_solo && (GetAsyncKeyState(VK_OEM_3) & 0x8000)) return 8;
-    return 1;
+    // Turbo only applies to the solo stress session — dual would need
+    // both peers fast-forwarding in lockstep.
+    if (!g_solo) return 1;
+    // Env override: SQUIROLL_TURBO=N runs N logical frames per real
+    // frame with no key held, so the harness can fast-forward to
+    // time-over for short cross-round tests. Read once, cached.
+    static int env_turbo = -1;
+    if (env_turbo < 0) {
+        char buf[16] = {0};
+        DWORD n = GetEnvironmentVariableA("SQUIROLL_TURBO", buf, sizeof(buf));
+        env_turbo = (n > 0 && n < sizeof(buf)) ? atoi(buf) : 1;
+        if (env_turbo < 1)  env_turbo = 1;
+        if (env_turbo > 64) env_turbo = 64;
+    }
+    // Backtick (VK_OEM_3) held = manual boost, at least 8x.
+    if (GetAsyncKeyState(VK_OEM_3) & 0x8000) {
+        return env_turbo > 8 ? env_turbo : 8;
+    }
+    return env_turbo;
 }
 
 // ------------------------------------------------------------------- tick --
