@@ -4,7 +4,8 @@
 #define LIVE_ACTORS_H 1
 
 // Tracks every live ManbowActor2D in the game by hooking
-// Manbow::Actor2DManager::CreateActor2D* (registration) and
+// Manbow::Actor2DManager::AllocateActor (registration — the single
+// chokepoint all five CreateActor2D* variants funnel through) and
 // Manbow::Actor2D::Release (unregistration).
 //
 // Backs the GekkoNet save_state / load_state path — we need to be able to

@@ -11,7 +11,18 @@
 #include "log.h"
 
 // Live ManbowActor2D* registry, maintained via function-entry hooks on
-// the five Actor2DManager::CreateActor2D* variants plus Actor2D::Release.
+// Manbow::Actor2DManager::AllocateActor (registration) and
+// Manbow::Actor2D::Release (unregistration).
+//
+// AllocateActor is the single chokepoint every actor birth funnels
+// through: all five CreateActor2D* variants (CreateActor2D / *Trail /
+// *Stencil / *Dynamic / CreateActor3D) call it and it RETURNS the real
+// ManbowActor2D*. The earlier code hooked the five CreateActor2D*
+// entries and registered their 2nd argument — but that arg is an
+// OUT-param: a caller stack buffer where a Sqrat::Object result is
+// constructed, NOT the actor. So g_live filled with stack-address
+// garbage. Verified in IDA: AllocateActor @ 0x9E250 returns the actor;
+// CreateActor2D's a2 is `*(a2)=&Sqrat::Object::vftable; ... return a2`.
 //
 // Hooks are installed with safetyhook::InlineHook — handles trampoline
 // allocation, length-disassembly via Zydis, RIP-relative fix-ups, thread
@@ -64,37 +75,20 @@ static inline void g_live_remove(ManbowActor2D* a) {
 // One SafetyHookInline per target. Default-constructed = inactive.
 // safetyhook::create_inline() returns one of these and tears it down
 // when the SafetyHookInline goes out of scope (here = process exit).
-static SafetyHookInline g_create_hook{};
-static SafetyHookInline g_create_trail_hook{};
-static SafetyHookInline g_create_stencil_hook{};
-static SafetyHookInline g_create_dyn_hook{};
-static SafetyHookInline g_create_3d_hook{};
+static SafetyHookInline g_allocate_hook{};
 static SafetyHookInline g_release_hook{};
 
-// Hook bodies. Declared __thiscall so the prologue matches the game's
-// MSVC __thiscall ABI. We use safetyhook's `thiscall<RetT>(args...)`
-// helper to invoke the original — it routes through a proper thiscall
-// function-pointer cast, no manual register juggling.
-//
-// Manager::CreateActor2D* take 8 args total (this + 7 stack): the
-// decompiler initially showed 7 but missed [ebp+0x20]. Get this wrong
-// and `ret N` will pop the wrong byte count → garbage return address.
-
-#define MAKE_CREATE_HOOK(NAME, HOOK)                                          \
-    int thiscall NAME(void* self,                                           \
-                        ManbowActor2D* type, uint32_t* unk,                   \
-                        int x, int y, int dir, int unk2, int unk3)            \
-    {                                                                         \
-        int r = HOOK.unsafe_thiscall<int>(self, type, unk, x, y, dir, unk2, unk3);   \
-        if (type) g_live_add(type);                                           \
-        return r;                                                             \
-    }
-
-MAKE_CREATE_HOOK(hook_create,         g_create_hook)
-MAKE_CREATE_HOOK(hook_create_trail,   g_create_trail_hook)
-MAKE_CREATE_HOOK(hook_create_stencil, g_create_stencil_hook)
-MAKE_CREATE_HOOK(hook_create_dyn,     g_create_dyn_hook)
-MAKE_CREATE_HOOK(hook_create_3d,      g_create_3d_hook)
+// AllocateActor entry hook. __thiscall, 3 args (this + 2 stack); it
+// returns the freshly-pooled ManbowActor2D* in eax — that return value
+// IS the actor, so register it. The actor isn't fully wired up yet
+// (group / anim_controller get set by the caller right after), but we
+// only store the pointer; it is complete long before any save runs.
+ManbowActor2D* thiscall hook_allocate(void* self, int a2, int a3) {
+    ManbowActor2D* actor =
+        (ManbowActor2D*)g_allocate_hook.unsafe_thiscall<int>(self, a2, a3);
+    if (actor) g_live_add(actor);
+    return actor;
+}
 
 int thiscall hook_release(ManbowActor2D* self) {
     if (!self) return g_release_hook.unsafe_thiscall<int>(self);
@@ -116,33 +110,22 @@ int thiscall hook_release(ManbowActor2D* self) {
 } // namespace
 
 // --- Function entry RVAs ----------------------------------------------------
-// Verified by reading prologue bytes directly from the on-disk th155.exe
-// (file ImageBase 0x400000). If the binary updates, re-verify in IDA
-// (fresh IDB at proper ImageBase) and update these.
-#define CREATE_ACTOR2D_ADDR         (0x9E340_R)
-#define CREATE_ACTOR2D_TRAIL_ADDR   (0x9E470_R)
-#define CREATE_ACTOR2D_STENCIL_ADDR (0x9E610_R)
-#define CREATE_ACTOR2D_DYNAMIC_ADDR (0x9E7B0_R)
-#define CREATE_ACTOR3D_ADDR         (0x9E950_R)
-#define ACTOR2D_RELEASE_ADDR        (0xC1230_R)
+// Verified in IDA against th155 (th155_fresh.exe.i64). If the binary
+// updates, re-verify and update these.
+//   AllocateActor: Manbow::Actor2DManager::AllocateActor — the single
+//                  birth chokepoint for all CreateActor2D* variants.
+//   Release:       Manbow::Actor2D::Release.
+#define ALLOCATE_ACTOR_ADDR  (0x9E250_R)
+#define ACTOR2D_RELEASE_ADDR (0xC1230_R)
 
 namespace live_actors {
 
 void install() {
-    g_create_hook         = safetyhook::create_inline((void*)CREATE_ACTOR2D_ADDR,         (void*)hook_create);
-    g_create_trail_hook   = safetyhook::create_inline((void*)CREATE_ACTOR2D_TRAIL_ADDR,   (void*)hook_create_trail);
-    g_create_stencil_hook = safetyhook::create_inline((void*)CREATE_ACTOR2D_STENCIL_ADDR, (void*)hook_create_stencil);
-    g_create_dyn_hook     = safetyhook::create_inline((void*)CREATE_ACTOR2D_DYNAMIC_ADDR, (void*)hook_create_dyn);
-    g_create_3d_hook      = safetyhook::create_inline((void*)CREATE_ACTOR3D_ADDR,         (void*)hook_create_3d);
-    g_release_hook        = safetyhook::create_inline((void*)ACTOR2D_RELEASE_ADDR,        (void*)hook_release);
+    g_allocate_hook = safetyhook::create_inline((void*)ALLOCATE_ACTOR_ADDR, (void*)hook_allocate);
+    g_release_hook  = safetyhook::create_inline((void*)ACTOR2D_RELEASE_ADDR, (void*)hook_release);
 
-    int ok = g_create_hook.enabled()
-           + g_create_trail_hook.enabled()
-           + g_create_stencil_hook.enabled()
-           + g_create_dyn_hook.enabled()
-           + g_create_3d_hook.enabled()
-           + g_release_hook.enabled();
-    log_printf("live_actors::install: %d/6 safetyhook InlineHooks active\n", ok);
+    int ok = g_allocate_hook.enabled() + g_release_hook.enabled();
+    log_printf("live_actors::install: %d/2 safetyhook InlineHooks active\n", ok);
 }
 
 size_t snapshot(ManbowActor2D** out_buf, size_t max_count) {
