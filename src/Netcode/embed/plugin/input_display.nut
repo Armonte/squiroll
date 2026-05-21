@@ -18,7 +18,7 @@ config = {
         blue = 0.0
         alpha = 1.0
         offset = 30
-        list_max = 13
+        count = 13
         timer = 200
         notation = "1,2,3,4, ,6,7,8,9,A,B,C,E,D,[B]"
         frame_count = false
@@ -34,7 +34,7 @@ config = {
         blue = 0.0
         alpha = 1.0
         offset = 30
-        list_max = 13
+        count = 13
         timer = 200
         notation = "1,2,3,4, ,6,7,8,9,A,B,C,E,D,[B]"
         frame_count = false
@@ -146,7 +146,7 @@ class modifier extends modifier {
                 else {
                     if (++data[0][1] > config.timer)data = [[0,0]];
                 }
-                while(data.len() > config.list_max)data.pop();
+                while(data.len() > config.count)data.pop();
             }else data = [[0,0]];
             Render();
         }
