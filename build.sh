@@ -68,12 +68,20 @@ if [ -d "$SQ_DIR/squirrel" ] && [ -f "$SQCHECK_SRC" ]; then
   fi
 fi
 
-# src/Netcode/file_replacement.cpp uses C23 `#embed "embed/*.nut"` to
-# splice every .nut into its compiled .obj. Our mtime check only sees
-# the .cpp itself, so when only a .nut changes we'd skip rebuilding
-# file_replacement.obj and the embed would be stale. Bump the .cpp's
-# mtime when any .nut is newer than the .obj.
-NUT_NEWEST=
+# --- Stage 0.5: generate embed includes (PR #28 manifest system) -----------
+# generate_embeds.py reads src/Netcode/embed_manifest.txt and writes
+# embed_declarations.inc / embed_map.inc, which file_replacement.cpp
+# #include's. Both .inc files are .gitignore'd, so this must run every
+# build. Fast (pure text), so just always run it.
+echo "=== Stage 0.5: generate embeds ==="
+python3 generate_embeds.py
+
+# src/Netcode/file_replacement.cpp #include's the generated .inc files,
+# which in turn `#embed` every .nut. Our mtime check only sees the .cpp
+# itself, so when only a .nut or the manifest changes we'd skip
+# rebuilding file_replacement.obj and the embed would be stale. Bump the
+# .cpp's mtime when any .nut or the manifest is newer than the .obj.
+NUT_NEWEST=src/Netcode/embed_manifest.txt
 shopt -s globstar nullglob
 for nut in src/Netcode/embed/**/*.nut src/Netcode/embed/*.nut; do
   [ -f "$nut" ] || continue

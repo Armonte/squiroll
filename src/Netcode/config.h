@@ -59,6 +59,7 @@ bool get_hide_name_enabled();
 bool get_hide_profile_pictures_enabled();
 void set_ipv6_state(bool state);
 
+const char* get_network_blacklist();
 const char* get_auto_connect();
 const char* get_peer_ip();
 int32_t get_peer_port();
