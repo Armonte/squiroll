@@ -31,6 +31,17 @@ size_t snapshot(ManbowActor2D** out_buf, size_t max_count);
 // Cheap accessor for size — useful for sizing the save buffer.
 size_t count();
 
+// Deferred-release control. When set true (by gekko_bridge during a
+// rollback-active round), hook_release stops calling the original
+// Manbow::Actor2D::Release and instead pushes the actor onto a deferred
+// queue. The actor stays in the live registry, active_flags untouched,
+// task vector still holding its SqratFunctions — so rollback can
+// restore it via state memcpy without resurrecting freed memory.
+// flush_deferred() actually invokes the original Release on every
+// queued actor (call at round end / disarm).
+void set_defer_release(bool on);
+void flush_deferred();
+
 } // namespace live_actors
 
 #endif // LIVE_ACTORS_H

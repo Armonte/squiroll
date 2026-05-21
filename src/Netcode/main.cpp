@@ -21,6 +21,7 @@
 #include "discord.h"
 #include "RSACache.h"
 #include "live_actors.h"
+#include "focus_input.h"
 
 #include <shared.h>
 
@@ -261,7 +262,22 @@ bool common_init(
         patch_throw_logs();
         // Tee stdout/stderr into squiroll.log without redirecting them, so
         // the console keeps live output AND the file survives a crash.
-        open_log_file("squiroll.log");
+        // Dual-instance test runs use SQUIROLL_LOG_NAME for a full
+        // filename override (e.g. aocf_net_p1.log), or fall back to
+        // SQUIROLL_LOG_SUFFIX which produces squiroll_<suffix>.log.
+        char log_name[64] = "squiroll.log";
+        char override_buf[64] = {0};
+        DWORD n = GetEnvironmentVariableA("SQUIROLL_LOG_NAME", override_buf, sizeof(override_buf));
+        if (n > 0 && n < sizeof(override_buf)) {
+            snprintf(log_name, sizeof(log_name), "%s", override_buf);
+        } else {
+            char suffix[24] = {0};
+            n = GetEnvironmentVariableA("SQUIROLL_LOG_SUFFIX", suffix, sizeof(suffix));
+            if (n > 0 && n < sizeof(suffix)) {
+                snprintf(log_name, sizeof(log_name), "squiroll_%s.log", suffix);
+            }
+        }
+        open_log_file(log_name);
         log_printf  = tee_printf;
         log_fprintf = tee_fprintf;
     }
@@ -297,6 +313,12 @@ bool common_init(
     // existence. Required by the rollback save/load path (gekko_bridge).
     // Must run before any Squirrel-driven actor creation.
     live_actors::install();
+
+    // Two-instance local testing: gate XInput reads by which window has
+    // focus, so the same controller drives whichever player owns the
+    // foreground process. DInput already does this natively via the
+    // game's DISCL_FOREGROUND cooperative-level setup.
+    focus_input::install();
 
     LARGE_INTEGERX qpc_freq;
     QueryPerformanceFrequency(&qpc_freq);
@@ -345,12 +367,18 @@ static void yes_tampering() {
         //0x130630,
         0x132AF0
     };
-    
+
     uintptr_t base = base_address;
     nounroll for (size_t i = 0; i < countof(tamper_patch_addrs); ++i) {
         hotpatch_ret(based_pointer(base, tamper_patch_addrs[i]), 0);
     }
 }
+
+// Note: the WinMain mutex check at 0x41DC81 was previously patched here
+// via JNZ -> JMP. That's redundant — squiroll already neutralizes the
+// CreateMutexA by replacing the mutex-name push with `push 0` at
+// `createmutex_patch_addr` (line 299), turning the named mutex into an
+// anonymous one so a second instance never collides.
 
 typedef BOOL cdecl globalconfig_get_boolean_t(const char* key, const BOOL default_value);
 typedef const char* cdecl runconfig_runcfg_fn_get_t();

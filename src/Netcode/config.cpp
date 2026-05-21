@@ -91,6 +91,21 @@ CONFIG_BOL(NETWORK, PREVENT_INPUT_DROPS, "prevent_input_drops", true);
 CONFIG_BOL(NETWORK, HIDE_PROFILE_PICTURES, "hide_profile_pictures", false);
 // CONFIG_BOL(NETWORK, AUTO_SWITCH,"auto_seach_host",true);
 CONFIG_STR(NETWORK, BLACKLIST,"blacklist","");
+// Auto-connect: "host" / "client" / "" — boot.nut drives StartupServer/
+// StartupClient on its own when set, so two windows can pair up without
+// menu navigation. Used for rollback local two-client testing.
+CONFIG_STR(NETWORK, AUTO_CONNECT, "auto_connect", "");
+CONFIG_STR(NETWORK, PEER_IP, "peer_ip", "127.0.0.1");
+CONFIG_INT(NETWORK, PEER_PORT, "peer_port", 10800);
+// Which local input device to bind to this instance (0 = first
+// keyboard/controller). Two instances on one machine should use
+// different IDs so they don't both grab the same controller.
+CONFIG_INT(NETWORK, DEVICE_ID, "device_id", 0);
+// Gate Gekko rollback. Default off so the two-client auto-connect path
+// runs pure squiroll delay-based netcode (proven, character-accurate).
+// Flip on (config.ini [network] gekko_enabled=true OR env var
+// SQUIROLL_GEKKO_ENABLED=1) to layer Gekko on top.
+CONFIG_BOL(NETWORK, GEKKO_ENABLED, "gekko_enabled", false);
 
 #define PERF_SECTION_NAME "performance"
 CONFIG_BOL(PERF, CACHE_RSA, "cache_rsa", true);
@@ -142,6 +157,11 @@ static inline constexpr const char
         CONFIG_DEFAULT(NETWORK, HIDE_PROFILE_PICTURES),
         // CONFIG_DEFAULT(NETWORK, AUTO_SWITCH),
         CONFIG_DEFAULT(NETWORK,BLACKLIST),
+        CONFIG_DEFAULT(NETWORK, AUTO_CONNECT),
+        CONFIG_DEFAULT(NETWORK, PEER_IP),
+        CONFIG_DEFAULT(NETWORK, PEER_PORT),
+        CONFIG_DEFAULT(NETWORK, DEVICE_ID),
+        CONFIG_DEFAULT(NETWORK, GEKKO_ENABLED),
 
         CONFIG_DEFAULT(PERF, CACHE_RSA),
         CONFIG_DEFAULT(PERF, BETTER_GAME_LOOP),
@@ -469,7 +489,11 @@ void set_ipv6_state(bool state) {
 
 static char NETWORK_BLACKLIST_BUFFER[1024]{ '\0' };
 const char* get_network_blacklist() {
-    const char* blacklist;
+    // Init to empty so callers (e.g. plugin.cpp's sq_setstring) never
+    // see a stack-garbage pointer when config lookup misses. Latent UB
+    // before; /Od exposed it via a NULL pointer crashing
+    // ::setting.network.blacklist consumers in Squirrel.
+    const char* blacklist = NETWORK_BLACKLIST_DEFAULT;
     if (
         use_config &&
         get_config_string(NETWORK_SECTION_NAME, NETWORK_BLACKLIST_KEY, NETWORK_BLACKLIST_BUFFER)
@@ -477,6 +501,106 @@ const char* get_network_blacklist() {
         blacklist = NETWORK_BLACKLIST_BUFFER;
     }
     return blacklist;
+}
+
+// Env-var overrides let one config.ini drive two instances in the same
+// folder: host.bat and client.bat each set SQUIROLL_AUTO_CONNECT plus
+// SQUIROLL_PEER_PORT (and SQUIROLL_PEER_IP for the client). Values are
+// cached per-process on first read.
+static const char* read_env_static(const char* name, char* buf, size_t buf_len) {
+    DWORD n = GetEnvironmentVariableA(name, buf, (DWORD)buf_len);
+    if (n == 0 || n >= buf_len) return nullptr;
+    return buf;
+}
+
+static char NETWORK_AUTO_CONNECT_BUFFER[32]{ '\0' };
+const char* get_auto_connect() {
+    static char env_buf[32];
+    static int env_state = 0;  // 0=unread, 1=found, 2=missing
+    if (env_state == 0) {
+        env_state = read_env_static("SQUIROLL_AUTO_CONNECT", env_buf, sizeof(env_buf))
+            ? 1 : 2;
+    }
+    if (env_state == 1) return env_buf;
+
+    if (
+        use_config &&
+        get_config_string(NETWORK_SECTION_NAME, NETWORK_AUTO_CONNECT_KEY, NETWORK_AUTO_CONNECT_BUFFER)
+    ) {
+        return NETWORK_AUTO_CONNECT_BUFFER;
+    }
+    return NETWORK_AUTO_CONNECT_DEFAULT;
+}
+
+static char NETWORK_PEER_IP_BUFFER[256]{ '\0' };
+const char* get_peer_ip() {
+    static char env_buf[256];
+    static int env_state = 0;
+    if (env_state == 0) {
+        env_state = read_env_static("SQUIROLL_PEER_IP", env_buf, sizeof(env_buf))
+            ? 1 : 2;
+    }
+    if (env_state == 1) return env_buf;
+
+    if (
+        use_config &&
+        get_config_string(NETWORK_SECTION_NAME, NETWORK_PEER_IP_KEY, NETWORK_PEER_IP_BUFFER)
+    ) {
+        return NETWORK_PEER_IP_BUFFER;
+    }
+    return NETWORK_PEER_IP_DEFAULT;
+}
+
+static char NETWORK_PEER_PORT_BUFFER[16]{ '\0' };
+int32_t get_peer_port() {
+    static char env_buf[16];
+    static int env_cached = 0;
+    static int32_t env_val = 0;
+    if (env_cached == 0) {
+        if (read_env_static("SQUIROLL_PEER_PORT", env_buf, sizeof(env_buf))) {
+            env_val = atoi(env_buf);
+            env_cached = 1;
+        } else {
+            env_cached = 2;
+        }
+    }
+    if (env_cached == 1) return env_val;
+    return GET_INT_CONFIG(NETWORK, PEER_PORT);
+}
+
+static char NETWORK_GEKKO_ENABLED_BUFFER[8]{ '\0' };
+bool get_gekko_enabled() {
+    static char env_buf[8];
+    static int env_cached = 0;
+    static bool env_val = false;
+    if (env_cached == 0) {
+        if (read_env_static("SQUIROLL_GEKKO_ENABLED", env_buf, sizeof(env_buf))) {
+            env_val = (env_buf[0] == '1' || env_buf[0] == 't' || env_buf[0] == 'T'
+                       || env_buf[0] == 'y' || env_buf[0] == 'Y');
+            env_cached = 1;
+        } else {
+            env_cached = 2;
+        }
+    }
+    if (env_cached == 1) return env_val;
+    return GET_BOOL_CONFIG(NETWORK, GEKKO_ENABLED);
+}
+
+static char NETWORK_DEVICE_ID_BUFFER[16]{ '\0' };
+int32_t get_device_id() {
+    static char env_buf[16];
+    static int env_cached = 0;
+    static int32_t env_val = 0;
+    if (env_cached == 0) {
+        if (read_env_static("SQUIROLL_DEVICE_ID", env_buf, sizeof(env_buf))) {
+            env_val = atoi(env_buf);
+            env_cached = 1;
+        } else {
+            env_cached = 2;
+        }
+    }
+    if (env_cached == 1) return env_val;
+    return GET_INT_CONFIG(NETWORK, DEVICE_ID);
 }
 
 // ====================

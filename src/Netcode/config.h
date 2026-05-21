@@ -67,6 +67,12 @@ bool get_hide_profile_pictures_enabled();
 const char* get_network_blacklist();
 void set_ipv6_state(bool state);
 
+const char* get_auto_connect();
+const char* get_peer_ip();
+int32_t get_peer_port();
+int32_t get_device_id();
+bool    get_gekko_enabled();
+
 bool get_cache_rsa_enabled();
 bool get_better_game_loop_enabled();
 float get_timer_leniency();

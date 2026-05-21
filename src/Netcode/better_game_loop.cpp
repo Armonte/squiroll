@@ -11,6 +11,7 @@
 #include "patch_utils.h"
 #include "util.h"
 #include "config.h"
+#include "gekko_bridge.h"
 
 // Superluminal markers for debugging frametime spikes
 #define PROFILING 0
@@ -112,10 +113,25 @@ void stdcall better_game_loop() {
         uint64_t qpc_target = current_qpc() + qpc_frame_frequency;
         timer.set(166667 - leniency);
 
-        run_update_list(*input_update_list);
-        window_update_frame();
-        // NOTE: Not handling "SkipRender" because that doesn't seem to be used in AoCF
-        frames_this_sec += window_render();
+        // tick() pumps the UDP poll + session events whenever a session
+        // exists. Pre-SessionStarted it does only that, so the vanilla
+        // update path still drives the menu UI through the sync handshake.
+        // Post-SessionStarted, tick() owns the frame loop (calls
+        // advance_one_frame from gekko Advance events) and we skip the
+        // vanilla run_update_list to avoid double-stepping the engine.
+        if (gekko_bridge::is_session_started()) {
+            gekko_bridge::tick();
+            window_update_frame();
+            frames_this_sec += window_render();
+        } else {
+            if (gekko_bridge::is_active()) {
+                gekko_bridge::tick();   // background UDP poll + handshake
+            }
+            run_update_list(*input_update_list);
+            window_update_frame();
+            // NOTE: Not handling "SkipRender" because that doesn't seem to be used in AoCF
+            frames_this_sec += window_render();
+        }
 
 #if PROFILING
         perf_api.EndEvent();

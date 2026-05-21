@@ -23,6 +23,15 @@
 extern bool resyncing;
 extern int32_t local_buffered_frames;
 
+// Forward decl; full layout in netcode.cpp.
+struct ManbowNetworkInputSession;
+
+// Set by SyncInput_hook each frame the engine pumps the network input
+// session. gekko_bridge reads these to feed gekko_add_local_input + to
+// find the InputRecorder for forced-input injection during AdvanceEvent.
+extern ManbowNetworkInputSession* g_active_input_session;
+extern uint16_t                   g_last_local_input_bits;
+
 void patch_sockets();
 void patch_netplay();
 

@@ -28,6 +28,7 @@ namespace fs = std::filesystem;
 #include "alloc_man.h"
 #include "lobby.h"
 #include "sq_debug.h"
+#include "gekko_bridge.h"
 #include "discord.h"
 #include "overlay.h"
 #include "frame_data_display.h"
@@ -144,6 +145,13 @@ static inline void set_network_constants(HSQUIRRELVM v) {
     sq_setbool(v, _SC("hide_profile_pictures"), get_hide_profile_pictures_enabled());
     // sq_setbool(v, _SC("auto_lobby_state_switch"), get_auto_switch());
     sq_setstring(v, _SC("blacklist"), get_network_blacklist());
+    // Auto-connect (test-rig): if "host"/"client", boot.nut auto-pairs
+    // two clients without going through the menu.
+    sq_setstring(v, _SC("auto_connect"), get_auto_connect());
+    sq_setstring(v, _SC("peer_ip"), get_peer_ip());
+    sq_setinteger(v, _SC("peer_port"), get_peer_port());
+    sq_setinteger(v, _SC("device_id"), get_device_id());
+    sq_setbool(v, _SC("gekko_enabled"), get_gekko_enabled());
     //only add to config file if needed
     //sq_setbool(v, _SC("hide_lobby"), false);//more useful once we get custom lobbies
 }
@@ -512,6 +520,47 @@ extern "C" {
                 sq_createtable(v, _SC("network"),[](HSQUIRRELVM v){
                     sq_setfunc(v, _SC("update_consts"), update_network_constants);
                     set_network_constants(v);
+                    // gekko_init(local_port, remote_port, local_idx, remote_ip)
+                    // Starts the GekkoNet rollback session. Call from
+                    // boot.nut once auto_connect's CSS override has fired
+                    // vs.Initialize on both sides.
+                    sq_setfunc(v, _SC("gekko_init"), [](HSQUIRRELVM v) -> SQInteger {
+                        SQInteger local_port, remote_port, local_idx;
+                        const SQChar* remote_ip;
+                        if (sq_gettop(v) != 5 ||
+                            SQ_FAILED(sq_getinteger(v, 2, &local_port)) ||
+                            SQ_FAILED(sq_getinteger(v, 3, &remote_port)) ||
+                            SQ_FAILED(sq_getinteger(v, 4, &local_idx)) ||
+                            SQ_FAILED(sq_getstring(v, 5, &remote_ip))
+                        ) {
+                            return sq_throwerror(v,
+                                "Invalid arguments, expected: "
+                                "<local_port:int> <remote_port:int> "
+                                "<local_idx:int> <remote_ip:string>");
+                        }
+                        bool ok = gekko_bridge::init(
+                            (uint16_t)local_port, (uint16_t)remote_port,
+                            (uint8_t)local_idx, remote_ip);
+                        sq_pushbool(v, ok ? SQTrue : SQFalse);
+                        return 1;
+                    });
+                    sq_setfunc(v, _SC("gekko_shutdown"), [](HSQUIRRELVM v) -> SQInteger {
+                        gekko_bridge::shutdown();
+                        return 0;
+                    });
+                    sq_setfunc(v, _SC("gekko_is_active"), [](HSQUIRRELVM v) -> SQInteger {
+                        sq_pushbool(v, gekko_bridge::is_active() ? SQTrue : SQFalse);
+                        return 1;
+                    });
+                    // GekkoSessionStarted fires when both peers have
+                    // completed the sync handshake. Boot.nut polls this
+                    // before calling vs.Initialize so the engine's first
+                    // battle frame happens under gekko ownership on both
+                    // peers at the same wall-clock moment.
+                    sq_setfunc(v, _SC("gekko_session_started"), [](HSQUIRRELVM v) -> SQInteger {
+                        sq_pushbool(v, gekko_bridge::is_session_started() ? SQTrue : SQFalse);
+                        return 1;
+                    });
                 });
                 sq_createtable(v, _SC("binds"), [](HSQUIRRELVM v) {
                     sq_setfunc(v, _SC("update_consts"), update_binds_constants);

@@ -152,6 +152,13 @@ static constexpr uint8_t misc_inputs_nut[] = {
 #embed "embed/plugin/misc_inputs.nut"
 };
 
+// Squirrel-side state serializer used by gekko_bridge save/load (task #22).
+// CompileFile'd from boot.nut at startup so ::__gekko_state is wired before
+// the first GekkoSaveEvent fires.
+static constexpr uint8_t gekko_state_nut[] = {
+#embed "embed/gekko_state.nut"
+};
+
 // UI
 static constexpr uint8_t UICore_nut[] = {
 #embed "embed/UI/core.nut"
@@ -208,6 +215,7 @@ static const std::unordered_map<std::string_view, const EmbedData> embeds = {
     {"squiroll/plugin/ping_display.nut"sv, ping_display_nut},
     {"squiroll/plugin/misc_inputs.nut"sv, misc_inputs_nut},
     {"squiroll/plugin/rollback.nut"sv, rollback_nut},
+    {"squiroll/gekko_state.nut"sv, gekko_state_nut},
     {"squiroll/plugin/core/cfg.nut"sv, pluginCFG_nut},
     {"squiroll/plugin/core/manager.nut"sv, plugin_nut},
     {"squiroll/UI/core.nut",UICore_nut},

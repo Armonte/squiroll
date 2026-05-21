@@ -32,7 +32,23 @@ constexpr size_t LIVE_CAP = 2048;
 static ManbowActor2D* g_live[LIVE_CAP];
 static size_t         g_live_count = 0;
 
+// Deferred-release queue. While g_defer_release is true (set by
+// gekko_bridge during the rollback-active part of a round), hook_release
+// pushes actors here instead of calling the original wrapper. flush
+// runs the original on every entry, in order, at disarm time.
+constexpr size_t DEFER_CAP = 2048;
+static ManbowActor2D* g_deferred[DEFER_CAP];
+static size_t         g_deferred_count = 0;
+static bool           g_defer_release  = false;
+
 static inline void g_live_add(ManbowActor2D* a) {
+    // Dedupe: with defer-release ON the pool can recycle a slot whose
+    // pointer we still hold in g_live. Without this check, every
+    // Create-after-Release adds another copy of the same pointer and
+    // by-id lookup at load time finds the LATEST actor in N slots.
+    for (size_t i = 0; i < g_live_count; ++i) {
+        if (g_live[i] == a) return;
+    }
     if (g_live_count < LIVE_CAP) g_live[g_live_count++] = a;
 }
 
@@ -81,9 +97,19 @@ MAKE_CREATE_HOOK(hook_create_dyn,     g_create_dyn_hook)
 MAKE_CREATE_HOOK(hook_create_3d,      g_create_3d_hook)
 
 int thiscall hook_release(ManbowActor2D* self) {
-    // Drop from set BEFORE the original runs — once Release returns the
-    // actor's memory is recycled into the SharedPoolAllocator pool.
-    if (self) g_live_remove(self);
+    if (!self) return g_release_hook.unsafe_thiscall<int>(self);
+    if (g_defer_release) {
+        // Park the actor on the deferred queue. We do NOT call the
+        // original wrapper — so active_flags stays whatever it was
+        // (alive), the task vector keeps its SqratFunction refs, and
+        // the engine keeps treating the actor as live. Save/load
+        // memcpy can then resurrect it without dealing with freed
+        // Squirrel state. flush_deferred() runs the real Release on
+        // every queued actor at disarm time.
+        if (g_deferred_count < DEFER_CAP) g_deferred[g_deferred_count++] = self;
+        return 0;
+    }
+    g_live_remove(self);
     return g_release_hook.unsafe_thiscall<int>(self);
 }
 
@@ -126,5 +152,24 @@ size_t snapshot(ManbowActor2D** out_buf, size_t max_count) {
 }
 
 size_t count() { return g_live_count; }
+
+void set_defer_release(bool on) {
+    if (on == g_defer_release) return;
+    g_defer_release = on;
+    log_printf("live_actors::set_defer_release %s\n", on ? "ON" : "OFF");
+}
+
+void flush_deferred() {
+    if (g_deferred_count == 0) return;
+    log_printf("live_actors::flush_deferred running original Release on %zu actors\n",
+               g_deferred_count);
+    for (size_t i = 0; i < g_deferred_count; ++i) {
+        ManbowActor2D* a = g_deferred[i];
+        if (!a) continue;
+        g_live_remove(a);
+        g_release_hook.unsafe_thiscall<int>(a);
+    }
+    g_deferred_count = 0;
+}
 
 } // namespace live_actors

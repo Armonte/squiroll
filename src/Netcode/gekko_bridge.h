@@ -3,11 +3,7 @@
 #ifndef GEKKO_BRIDGE_H
 #define GEKKO_BRIDGE_H 1
 
-// GekkoNet ↔ AoCF integration scaffold.
-//
-// Not wired into the build yet — this is a sketch of the API surface so the
-// rollback work has a target shape. To enable, add the bridge .cpp to
-// build.sh and link against GekkoNet's static lib.
+// GekkoNet ↔ AoCF integration.
 //
 // Public flow per real-time frame (called from better_game_loop instead of
 // the unconditional update_logic/window_render pair):
@@ -51,12 +47,14 @@ namespace gekko_bridge {
 bool init(uint16_t local_port, uint16_t remote_port,
           uint8_t local_player_idx, const char* remote_ip);
 void shutdown();
-bool is_active();
+bool is_active();          // session exists; UDP poll runs in background
+bool is_session_started(); // GekkoSessionStarted fired; tick() owns the frame
 
 // Per-frame entry. Returns true if the visible frame was advanced.
-// Replace the body of better_game_loop's update_logic + window_render
-// calls with `if (gekko_bridge::is_active()) gekko_bridge::tick();
-// else { update_logic(); window_render(); }`.
+// Pre-SessionStarted: drains network/session events only — engine runs
+// vanilla update_logic via better_game_loop. Post-SessionStarted: takes
+// ownership of the frame counter; every Save/Load/Advance event is
+// processed (gekko's rollback model assumes events are never skipped).
 bool tick();
 
 // Inputs pulled by Gekko (set during AdvanceEvent handling, read by
