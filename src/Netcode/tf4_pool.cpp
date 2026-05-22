@@ -17,15 +17,27 @@ namespace {
 // past the E8 opcode at 0x45D99.
 #define POOL_ALLOC_REL32  (0x45D9A_R)
 
-// __fastcall: arg1 in ecx (the mspace pointer — ignored), arg2 in edx (the
-// slab size in bytes). Returns the slab. cpp_arena::raw_alloc gives a block
-// that the rollback snapshot captures; on overflow it returns nullptr and
-// SQVM__Call_0's own fallback path takes over.
-static void* __fastcall pool_alloc_redirect(void* /*mspace*/, uint32_t size) {
-    // Pass our return address — the th155 pool-grow call site (inside
-    // tf4_objpool_grow) — so the arena tags the slab with real th155 code
-    // rather than this shim, keeping cpp_arena::attribute() meaningful.
-    return cpp_arena::raw_alloc(size, (uint32_t)(uintptr_t)_ReturnAddress());
+// The original TF4 mspace allocator we replaced. Used as the fallback for
+// non-simulation-thread grows: the SAME generic tf4_objpool_grow services
+// audio (Ogg memory-stream reader) pools too — sending those slabs into
+// cpp_arena leaks the audio thread's non-deterministic position updates
+// into the rollback snapshot (proven by the DR0 multi-thread watchpoint).
+typedef void* (__fastcall *tf4_mspace_pool_alloc_t)(void* mspace, uint32_t size);
+#define TF4_MESHVERTEX_POOLALLOC \
+    ((tf4_mspace_pool_alloc_t)(uintptr_t)(0x356A0_R))
+
+// __fastcall: arg1 in ecx (mspace), arg2 in edx (slab size in bytes).
+// Simulation thread -> cpp_arena (slab is rollback-snapshotted, needed for
+// battle pools). Any other thread -> fall through to the original mspace
+// allocator so audio / loader / etc. slabs stay outside the snapshot.
+static void* __fastcall pool_alloc_redirect(void* mspace, uint32_t size) {
+    if (cpp_arena::is_sim_thread()) {
+        // Pass our return address — the th155 pool-grow call site (inside
+        // tf4_objpool_grow) — so the arena tags the slab with real th155
+        // code rather than this shim (keeps cpp_arena::attribute meaningful).
+        return cpp_arena::raw_alloc(size, (uint32_t)(uintptr_t)_ReturnAddress());
+    }
+    return TF4_MESHVERTEX_POOLALLOC(mspace, size);
 }
 
 } // namespace

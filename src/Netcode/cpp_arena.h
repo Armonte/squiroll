@@ -55,6 +55,11 @@ void set_armed(bool on);
 // their non-deterministic allocation never churns the snapshot).
 void set_sim_thread(uint32_t tid);
 
+// True iff the current thread is the simulation thread (and one has been
+// registered). Used by tf4_pool's redirect to keep non-sim-thread pool
+// slabs (Ogg/FMOD stream readers, etc.) out of the snapshot.
+bool is_sim_thread();
+
 // Mark a rollback re-simulation advance in progress. While set, a free of a
 // real-heap (non-arena) block is suppressed — the real Win32 heap is not
 // snapshotted, so the forward run already freed it and re-freeing would

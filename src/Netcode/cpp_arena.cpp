@@ -446,6 +446,10 @@ void set_sim_thread(uint32_t tid) {
     }
 }
 
+bool is_sim_thread() {
+    return g_sim_tid != 0 && GetCurrentThreadId() == g_sim_tid;
+}
+
 // Public raw allocation — hand a block straight out of the arena, bypassing
 // the operator-new routing. Used to re-home th155's TF4 Squirrel-instance
 // object pool (which would otherwise carve its slabs from the TF4-engine
