@@ -24,6 +24,7 @@
 #include "focus_input.h"
 #include "crash_handler.h"
 #include "sq_arena.h"
+#include "cpp_arena.h"
 
 #include <shared.h>
 
@@ -316,6 +317,15 @@ bool common_init(
     // common_init is well before that. (Supersedes the old alloc_man
     // patch_allocman() tracking approach.)
     sq_arena::install(0x17FDB0_R, 0x1A6000_R);
+
+    // Route the engine's C++ battle allocations into a second fixed arena
+    // (cpp_arena) — the C++ half of the rollback snapshot. Interposes
+    // operator new + __free_base; allocations made while the per-thread
+    // sim-active gate is set (only around advance_one_frame's engine
+    // calls) land in the arena, everything else stays on the CRT heap.
+    // Together with sq_arena this makes the coupled C++<->Squirrel battle
+    // object graph one address-stable, snapshottable unit.
+    cpp_arena::install();
 
     // Allow launching multiple instances of the game
     mem_write(createmutex_patch_addr, PATCH_BYTES<0x68, 0x00, 0x00, 0x00, 0x00>); //mutex patch

@@ -21,6 +21,7 @@
 #include "live_actors.h"
 #include "alloc_man.h"  // sq_heap — giuroll-style Squirrel VM heap snapshot
 #include "sq_arena.h"   // Squirrel VM heap arena
+#include "cpp_arena.h"  // engine C++ battle-state arena
 #include "battle_pools.h" // C++ battle object pools
 #include <squirrel.h>
 // squiroll routes every sq_* call through a runtime-filled KITE table —
@@ -936,8 +937,16 @@ void advance_one_frame() {
     // per Advance — so we call RunOneFrame exactly once. We also skip
     // the PrtScn polling (GetAsyncKeyState — non-deterministic real-time
     // input) and the QPC bookkeeping (real-time pacing only).
+    // Route the engine C++ allocations made by this logical frame into
+    // the cpp_arena (the C++ half of the rollback snapshot). The gate is
+    // set ONLY across the deterministic battle-sim engine calls — actor
+    // task nodes, scheduler list/vector nodes and the like land in the
+    // arena; nothing outside this span does. Per-thread, so the audio /
+    // D3D threads are unaffected.
+    cpp_arena::set_sim_active(true);
     update_related(*MAIN_SCRIPTAPI_PTR);                    // RunOneFrame(g_main), once
     Act_ScriptAPI_ptr->vftable->Update(Act_ScriptAPI_ptr);  // Act::ScriptAPI::Update
+    cpp_arena::set_sim_active(false);
     ++*(uint32_t*)(0x4DACE0_R);                             // g_frame_counter
     if (log_quota > 0) {
         log_printf("[gekko_bridge] advance_one_frame: exit\n");
