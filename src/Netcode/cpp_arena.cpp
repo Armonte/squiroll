@@ -74,6 +74,9 @@ static bool     g_armed     = false;   // route operator new -> arena only while
 static bool     g_resim     = false;   // a rollback re-simulation advance is in progress
 static uint32_t g_warn      = 8;
 static uint32_t g_resim_skips = 0;     // real-heap frees suppressed during re-sim
+static DWORD    g_sim_tid   = 0;       // simulation thread; once set, ONLY this
+                                       // thread's operator new -> arena (keeps
+                                       // the audio thread out of the snapshot)
 
 // DIAGNOSTIC: caller of the in-flight operator new, + a quota for logging
 // size-class-13 (8 KB) bump-allocations — the rollback re-sim does one extra,
@@ -222,7 +225,13 @@ static void* cdecl hook_op_new(size_t size) {
     if (g_armed && g_meta) {
         uint32_t caller = (uint32_t)(uintptr_t)_ReturnAddress();
         g_opnew_caller = caller;
-        if (!caller_excluded(caller)) {
+        // Thread gate: once the simulation thread is known, only IT may draw
+        // from the arena. Background threads — the audio thread above all —
+        // go to the real heap; their non-deterministic alloc/free would
+        // otherwise churn the arena free-lists and shift where battle objects
+        // land, diverging the rollback snapshot.
+        bool sim = (g_sim_tid == 0) || (GetCurrentThreadId() == g_sim_tid);
+        if (sim && !caller_excluded(caller)) {
             void* p = arena_alloc(size);
             if (p) return p;
         }
@@ -331,6 +340,16 @@ void trace_alloc(uint32_t addr) {
 
 void     set_armed(bool on) { g_armed = on; }
 void     set_resim(bool on) { g_resim = on; }
+
+// Designate the simulation thread — call from the battle/game thread once,
+// before snapshot_ring::arm() takes the baseline. From here on only this
+// thread's operator new is routed into the arena.
+void set_sim_thread(uint32_t tid) {
+    if (g_sim_tid == 0 && tid != 0) {
+        g_sim_tid = (DWORD)tid;
+        log_printf("[cpp_arena] sim thread = %u — arena now thread-gated\n", tid);
+    }
+}
 
 // Public raw allocation — hand a block straight out of the arena, bypassing
 // the operator-new routing. Used to re-home th155's TF4 Squirrel-instance

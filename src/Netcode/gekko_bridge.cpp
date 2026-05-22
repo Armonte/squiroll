@@ -1588,6 +1588,10 @@ bool init(uint16_t local_port, uint16_t remote_port,
     input_hist::pregrow();
     // Arm dirty-page snapshotting: arenas installed, pools pre-grown — take
     // the write-watch baseline before the first advance/save.
+    // This runs on the battle/game thread — designate it the simulation
+    // thread before the baseline is taken, so only its allocations enter
+    // cpp_arena (the audio thread is kept out of the snapshot).
+    cpp_arena::set_sim_thread(GetCurrentThreadId());
     snapshot_ring::arm();
     apply_test_round_frames();
 
@@ -1636,6 +1640,9 @@ bool init_solo() {
     input_hist::pregrow();
     // Arm dirty-page snapshotting: arenas installed, pools pre-grown — take
     // the write-watch baseline before the first advance/save.
+    // Designate this (the battle/game thread) the simulation thread before
+    // the baseline — see init().
+    cpp_arena::set_sim_thread(GetCurrentThreadId());
     snapshot_ring::arm();
 
     // The battle is already created — vs.Initialize ran under the

@@ -49,6 +49,12 @@ void load(const uint8_t* blob, uint32_t len);
 // a match it goes to the real allocator (keeps the snapshot battle-scoped).
 void set_armed(bool on);
 
+// Designate the simulation thread. Call once from the battle/game thread
+// before snapshot_ring::arm(); afterwards only that thread's operator new is
+// routed into the arena (background threads — audio — use the real heap, so
+// their non-deterministic allocation never churns the snapshot).
+void set_sim_thread(uint32_t tid);
+
 // Mark a rollback re-simulation advance in progress. While set, a free of a
 // real-heap (non-arena) block is suppressed — the real Win32 heap is not
 // snapshotted, so the forward run already freed it and re-freeing would
