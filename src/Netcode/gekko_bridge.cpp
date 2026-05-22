@@ -1489,7 +1489,7 @@ bool tick() {
                     // offset) the sim mutated that save/load did NOT
                     // restore — i.e. the missing piece of the snapshot.
                     // Set to the frame run_solo.sh reports the DESYNC at.
-                    static const int DUMP_LO = 230, DUMP_HI = 235;
+                    static const int DUMP_LO = 2, DUMP_HI = 9;
                     int fr = e->data.save.frame;
                     if (fr >= DUMP_LO && fr <= DUMP_HI) {
                         static int dump_cnt[DUMP_HI - DUMP_LO + 1] = {0};
