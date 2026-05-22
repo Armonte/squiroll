@@ -72,6 +72,12 @@ void* raw_alloc(uint32_t n, uint32_t caller_abs);
 // to a subsystem. See cpp_arena.cpp.
 void attribute(uint32_t off);
 
+// DIAGNOSTIC: per-frame arena alloc/free sequence trace. trace_reset()
+// starts a fresh recording; trace_check(frame) saves the forward run's
+// sequence and diffs a re-sim of the same frame against it. See cpp_arena.cpp.
+void trace_reset();
+void trace_check(uint32_t frame);
+
 uint8_t* base();        // arena base — the MEM_WRITE_WATCH region
 uint32_t used();        // high-water bytes (what save() writes)
 uint32_t capacity();    // arena reservation

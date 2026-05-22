@@ -692,6 +692,12 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                            uint32_t frame) {
     if (cap < sizeof(SaveHeader)) return 0;
 
+    // DIAGNOSTIC: the events recorded since the last reset are this frame's
+    // advance. Diff the forward vs re-sim trace of the traced frame, then
+    // start a fresh recording for the next frame.
+    cpp_arena::trace_check(frame);
+    cpp_arena::trace_reset();
+
     uint8_t* p = static_cast<uint8_t*>(buf);
     SaveHeader* hdr = reinterpret_cast<SaveHeader*>(p);
     hdr->magic      = SAVE_MAGIC;
@@ -924,6 +930,9 @@ void load_state_from_buf(const void* buf, uint32_t len) {
             sect(&input_rec_load);
             sect(&input_hist::load);
         }
+        // DIAGNOSTIC: the re-sim's first advance after this restore records
+        // a fresh arena trace.
+        cpp_arena::trace_reset();
         return;
     }
 

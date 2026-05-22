@@ -105,6 +105,27 @@ static constexpr int MW_RING = 16384;
 static MallocRec  g_mw[MW_RING];
 static uint32_t   g_mw_idx = 0;
 
+// DIAGNOSTIC: per-frame arena alloc/free sequence trace. Records every
+// arena event of a chosen frame so the forward run and a rollback re-sim
+// of that SAME frame can be diffed event-by-event — the first mismatch is
+// the exact point the re-sim deviates. See trace_reset / trace_check.
+struct TraceEv { uint8_t op; uint32_t size, caller, off; };  // op 1=alloc 2=free
+static constexpr uint32_t TRACE_CAP   = 65536;
+static const     uint32_t TRACE_FRAME = 2;       // the frame to diff
+static TraceEv  g_tr[TRACE_CAP];
+static uint32_t g_tr_n        = 0;
+static TraceEv  g_tr_saved[TRACE_CAP];
+static uint32_t g_tr_saved_n  = 0;
+static bool     g_tr_have     = false;
+static bool     g_tr_done     = false;
+
+static void trace_rec(uint8_t op, uint32_t size, uint32_t caller, uint32_t off) {
+    if (g_tr_n < TRACE_CAP) {
+        TraceEv& e = g_tr[g_tr_n++];
+        e.op = op; e.size = size; e.caller = caller; e.off = off;
+    }
+}
+
 // Smallest class shift whose block (1<<sh) holds sizeof(Hdr)+n.
 static int class_for(size_t n) {
     size_t need = n + sizeof(Hdr);
@@ -161,6 +182,7 @@ static void* arena_alloc(size_t n) {
                  ? (uint32_t)(g_opnew_caller - (uint32_t)base_address) : 0;
     h->magic     = HDR_MAGIC;
     g_meta->live_bytes += (uint32_t)n;
+    trace_rec(1, (uint32_t)n, h->link, off);
     LeaveCriticalSection(&g_lock);
     return g_base + off + sizeof(Hdr);
 }
@@ -185,9 +207,11 @@ static void arena_free(void* p) {
         return;
     }
     g_meta->live_bytes -= h->reqsize;
+    uint32_t foff = (uint32_t)((uint8_t*)h - g_base);
+    trace_rec(2, h->reqsize, 0, foff);
     h->magic     = 0;
     h->link      = g_meta->free_off[ci];
-    g_meta->free_off[ci] = (uint32_t)((uint8_t*)h - g_base);
+    g_meta->free_off[ci] = foff;
     LeaveCriticalSection(&g_lock);
 }
 
@@ -410,6 +434,46 @@ void attribute(uint32_t off) {
         p += blk;
     }
     log_printf("[cpp_attr] off=0x%X: not in any block (bump=0x%X)\n", off, bump);
+}
+
+// DIAGNOSTIC: clear the per-frame arena event trace (call when a frame's
+// advance is about to begin recording).
+void trace_reset() { g_tr_n = 0; }
+
+// DIAGNOSTIC: at frame `frame`'s capture, if it is the traced frame, save
+// the forward run's event sequence the first time and diff a later (re-sim)
+// pass against it — the first differing event is where the re-sim deviates.
+void trace_check(uint32_t frame) {
+    if (frame != TRACE_FRAME || g_tr_done) return;
+    if (!g_tr_have) {
+        uint32_t n = g_tr_n < TRACE_CAP ? g_tr_n : TRACE_CAP;
+        memcpy(g_tr_saved, g_tr, sizeof(TraceEv) * n);
+        g_tr_saved_n = n;
+        g_tr_have = true;
+        log_printf("[cpptrace] f=%u forward trace saved: %u arena events\n",
+                   frame, n);
+        return;
+    }
+    log_printf("[cpptrace] f=%u re-sim trace: %u events (forward had %u)\n",
+               frame, g_tr_n, g_tr_saved_n);
+    uint32_t lim = g_tr_n < g_tr_saved_n ? g_tr_n : g_tr_saved_n;
+    int hits = 0;
+    for (uint32_t i = 0; i < lim && hits < 8; ++i) {
+        const TraceEv& a = g_tr_saved[i];
+        const TraceEv& b = g_tr[i];
+        if (a.op != b.op || a.size != b.size || a.caller != b.caller ||
+            a.off != b.off) {
+            log_printf("[cpptrace]  #%u  FWD %s sz=%u caller=%08X off=%X  vs  "
+                       "RESIM %s sz=%u caller=%08X off=%X\n", i,
+                       a.op == 1 ? "alloc" : "free ", a.size, a.caller, a.off,
+                       b.op == 1 ? "alloc" : "free ", b.size, b.caller, b.off);
+            ++hits;
+        }
+    }
+    if (hits == 0)
+        log_printf("[cpptrace]  first %u events IDENTICAL%s\n", lim,
+                   g_tr_n == g_tr_saved_n ? "" : " — but event COUNT differs");
+    g_tr_done = true;
 }
 uint8_t* base()      { return g_base; }
 uint32_t used()      { return g_meta ? g_meta->bump : 0; }
