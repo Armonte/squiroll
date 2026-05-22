@@ -28,6 +28,11 @@
 // new, operator new[] and direct malloc all funnel here. Hooked only to
 // record call sites (DIAGNOSTIC) — not routed.
 #define MALLOC_FN    (0x306FBC_R)
+// _beginthreadex — th155.exe 0x3105AC. Every th155 worker thread (audio,
+// loaders, ...) is spawned here. Hooked so each thread can be tagged by its
+// start routine at creation: the audio thread is then excluded from the
+// arena from boot, before it allocates anything.
+#define BEGINTHREADEX (0x3105AC_R)
 
 namespace cpp_arena {
 namespace {
@@ -88,6 +93,23 @@ static int      g_cls13_log    = 96;
 static SafetyHookInline g_h_opnew{};
 static SafetyHookInline g_h_free{};
 static SafetyHookInline g_h_malloc{};
+static SafetyHookInline g_h_bthreadex{};
+
+// Threads whose operator new must NEVER reach the arena — the audio thread
+// above all. Populated by the _beginthreadex hook from each thread's start
+// routine, so the exclusion is live from the thread's first instruction.
+static DWORD    g_excl_tid[16] = {0};
+static int      g_n_excl_tid   = 0;
+// Start-routine RVA window that marks a thread as audio/non-sim. Filled in
+// from the [thread] log; 0,0 = match nothing (log-only first pass).
+static uint32_t g_audio_lo = 0;
+static uint32_t g_audio_hi = 0;
+
+static bool thread_excluded(DWORD tid) {
+    for (int i = 0; i < g_n_excl_tid; ++i)
+        if (g_excl_tid[i] == tid) return true;
+    return false;
+}
 
 // The arena is armed for the whole process lifetime and th155 hits operator
 // new / _free_base from MULTIPLE THREADS (background resource loading). The
@@ -254,9 +276,16 @@ static void* cdecl hook_op_new(size_t size) {
         // from the arena. Background threads — the audio thread above all —
         // go to the real heap; their non-deterministic alloc/free would
         // otherwise churn the arena free-lists and shift where battle objects
-        // land, diverging the rollback snapshot.
-        bool sim = (g_sim_tid == 0) || (GetCurrentThreadId() == g_sim_tid);
-        if (sim && !caller_excluded(caller)) {
+        // land, diverging the rollback snapshot. A thread tagged at creation
+        // (the _beginthreadex hook) is excluded even before the sim thread is
+        // known, so audio objects never enter the baseline.
+        // STRICT: only the simulation thread, and only once it is known.
+        // Before that (boot / engine init) operator new goes to the real
+        // heap — those objects are not battle state. better_game_loop sets
+        // the sim thread very early, before menus / vs.Initialize.
+        DWORD tid = GetCurrentThreadId();
+        bool sim = (g_sim_tid != 0) && (tid == g_sim_tid);
+        if (sim && !thread_excluded(tid) && !caller_excluded(caller)) {
             void* p = arena_alloc(size);
             if (p) return p;
         }
@@ -316,6 +345,28 @@ static void* cdecl hook_malloc(size_t size) {
     return p;
 }
 
+// _beginthreadex: tag every th155 worker thread by its start routine at
+// creation. A thread whose start routine falls in the audio window is
+// excluded from the arena before it runs a single instruction, so no audio
+// object ever enters the rollback snapshot — not even in the baseline.
+static uintptr_t cdecl hook_beginthreadex(void* sec, unsigned stk, void* start,
+                                          void* arg, unsigned flag,
+                                          unsigned* tidp) {
+    uintptr_t h = g_h_bthreadex.unsafe_ccall<uintptr_t>(sec, stk, start, arg,
+                                                        flag, tidp);
+    if (h) {
+        DWORD tid = (tidp && *tidp) ? (DWORD)*tidp
+                                    : GetThreadId((HANDLE)h);
+        uint32_t srva = (uint32_t)((uintptr_t)start - base_address);
+        bool audio = (g_audio_hi > g_audio_lo) &&
+                     (srva >= g_audio_lo && srva < g_audio_hi);
+        if (audio && g_n_excl_tid < 16) g_excl_tid[g_n_excl_tid++] = tid;
+        log_printf("[cpp_arena] thread spawned tid=%u start_rva=%08X%s\n",
+                   tid, srva, audio ? "  [excluded from arena]" : "");
+    }
+    return h;
+}
+
 } // namespace
 
 void install() {
@@ -350,6 +401,8 @@ void install() {
     g_h_free   = safetyhook::create_inline((void*)FREE_BASE,    (void*)hook_free);
     g_h_opnew  = safetyhook::create_inline((void*)OPERATOR_NEW, (void*)hook_op_new);
     g_h_malloc = safetyhook::create_inline((void*)MALLOC_FN,    (void*)hook_malloc);
+    g_h_bthreadex = safetyhook::create_inline((void*)BEGINTHREADEX,
+                                              (void*)hook_beginthreadex);
 
     int ok = g_h_free.enabled() + g_h_opnew.enabled();
     g_installed = (ok == 2);

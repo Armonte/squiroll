@@ -12,6 +12,7 @@
 #include "util.h"
 #include "config.h"
 #include "gekko_bridge.h"
+#include "cpp_arena.h"
 
 // Superluminal markers for debugging frametime spikes
 #define PROFILING 0
@@ -77,6 +78,12 @@ static bool exit_requested = false;
 static uint32_t current_fps = 0;
 
 void stdcall better_game_loop() {
+    // This is th155's game/simulation thread. Designate it to cpp_arena now
+    // — far earlier than gekko_bridge::init — so the arena is thread-gated
+    // before menus, vs.Initialize or audio do any allocating. From here on
+    // ONLY this thread's operator new enters the rollback snapshot.
+    cpp_arena::set_sim_thread(GetCurrentThreadId());
+
     // Disable DXGI's Alt+Enter handler because it's unreliable sometimes (handled in custom WndProc instead)
     size_t enter_held_frames = 0;
     IDXGIFactory* dxgi_factory = nullptr;
