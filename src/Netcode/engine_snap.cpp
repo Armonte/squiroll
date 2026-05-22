@@ -144,9 +144,12 @@ static int collect(Region* r) {
     // btDbvtBroadphase_createProxy firing only on forward, never re-sims).
     {
         // TIB layout (32-bit): offset 0x2C = ThreadLocalStoragePointer.
-        // __readfsdword reads it directly without needing _TEB defined.
+        // Capture a generous chunk of TLS slot 0 to cover thread-local state
+        // (C++ static-init epoch, std::execution thread data, ...) regardless
+        // of exact field offsets in this MSVC build. region_ok in add()
+        // bounds-checks; an over-large add is safely truncated.
         void** tlsa = (void**)__readfsdword(0x2C);
-        if (tlsa && tlsa[0]) add((char*)tlsa[0] + 4, 4);
+        if (tlsa && tlsa[0]) add(tlsa[0], 256);
     }
 
     // DirectInput keyboard state table (see KBD_STATE_ADDR above).

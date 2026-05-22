@@ -93,6 +93,19 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
                 log_printf("[wp] %p <- %08X  eip=%08X tid=%u %s\n",
                            g_wp_addr, v, (unsigned)ep->ContextRecord->Eip,
                            GetCurrentThreadId(), loc);
+                // Walk a few stack frames so the caller chain is visible.
+                uintptr_t ebp = ep->ContextRecord->Ebp;
+                for (int i = 0; i < 6 && ebp; ++i) {
+                    if (IsBadReadPtr((void*)ebp, 8)) break;
+                    uintptr_t ret  = *(uintptr_t*)(ebp + 4);
+                    uintptr_t next = *(uintptr_t*)ebp;
+                    if (ret) {
+                        describe_addr(ret, loc);
+                        log_printf("[wp]   stk[%d] ret=%08X %s\n", i, (unsigned)ret, loc);
+                    }
+                    if (next <= ebp) break;
+                    ebp = next;
+                }
             }
             ep->ContextRecord->Dr6 = 0;
         }
