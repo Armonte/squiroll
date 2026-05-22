@@ -5,8 +5,8 @@
 
 #include <stdint.h>
 
-// snapshot_ring — dirty-page rollback snapshot for the two big arenas
-// (sq_arena, bullet_arena).
+// snapshot_ring — dirty-page rollback snapshot for the three big arenas
+// (sq_arena, bullet_arena, cpp_arena).
 //
 // Dumping the whole arena every frame copied ~21 MB per save, ~10x per
 // displayed frame in the stress rig — memory-bandwidth bound, ~3 fps. Almost
@@ -20,9 +20,10 @@
 // syncs the mirror. A rollback walks that reverse-delta chain backwards —
 // cost proportional to what CHANGED (KB), not heap size.
 //
-// The sblob non-arena sections (battle_pools, cpp_arena, engine_snap, input)
-// are ~1 MB combined; the caller hands them in as one opaque blob per frame
-// and snapshot_ring rings them in full — not worth page-tracking.
+// The sblob non-arena sections (battle_pools, engine_snap, input) are
+// ~1 MB combined; the caller hands them in as one opaque blob per frame
+// and snapshot_ring rings them in full — not worth page-tracking. cpp_arena
+// is now page-tracked alongside sq_arena and bullet_arena.
 //
 // The GekkoNet save blob shrinks to just the frame number (the ring handle);
 // the real state lives here.
@@ -35,7 +36,7 @@ namespace snapshot_ring {
 void arm();
 bool armed();
 
-// Capture frame `frame`: store the two arenas' dirty-page deltas and a copy
+// Capture frame `frame`: store the three arenas' dirty-page deltas and a copy
 // of `sblob` (the serialized non-arena sections). Returns the full-state
 // desync checksum.
 uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len);

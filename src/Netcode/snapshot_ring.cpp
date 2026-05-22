@@ -5,6 +5,7 @@
 #include "snapshot_ring.h"
 #include "sq_arena.h"
 #include "bullet_arena.h"
+#include "cpp_arena.h"
 #include "log.h"
 
 namespace snapshot_ring {
@@ -12,11 +13,12 @@ namespace {
 
 static constexpr uint32_t PAGE   = 4096;
 static constexpr int      RING   = 16;   // > GekkoConfig::check_distance (8)
-static constexpr int      NARENA = 2;    // 0 = sq_arena, 1 = bullet_arena
+static constexpr int      NARENA = 3;    // 0 = sq_arena, 1 = bullet_arena, 2 = cpp_arena
 
 // Per-slot dirty-page delta capacity. A 2D-fighter frame writes far less; the
 // cap only guards a pathological frame, which is logged loudly if hit.
-static const uint32_t DELTA_CAP[NARENA] = { 8u * 1024 * 1024, 4u * 1024 * 1024 };
+static const uint32_t DELTA_CAP[NARENA] = { 8u * 1024 * 1024, 4u * 1024 * 1024,
+                                            8u * 1024 * 1024 };
 static constexpr uint32_t SMALL_CAP = 4u * 1024 * 1024;
 
 // One dirty-page record in a delta buffer: [page-offset u32][PAGE bytes].
@@ -67,6 +69,7 @@ void arm() {
     Src src[NARENA] = {
         { sq_arena::base(),     sq_arena::capacity()     },
         { bullet_arena::base(), bullet_arena::capacity() },
+        { cpp_arena::base(),    cpp_arena::capacity()    },
     };
 
     uint32_t maxpages = 0;
@@ -76,6 +79,13 @@ void arm() {
         A.size   = src[a].size;
         A.npages = src[a].size / PAGE;
         if (A.npages > maxpages) maxpages = A.npages;
+        // restore()'s `seen` bitmap is sized for a 128 MB arena. A larger
+        // arena would overflow it — fail to arm rather than corrupt memory.
+        if (src[a].size > 128u * 1024 * 1024) {
+            log_printf("[snapshot_ring] !! arm: arena %d too large (%u MB) — "
+                       "raise `seen` bitmap size\n", a, src[a].size / (1024*1024));
+            return;
+        }
         if (!A.base) {
             log_printf("[snapshot_ring] !! arm: arena %d not installed\n", a);
             return;
@@ -107,10 +117,13 @@ void arm() {
         S.frame = -1;
         S.sblob = (uint8_t*)VirtualAlloc(nullptr, SMALL_CAP,
                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        for (int a = 0; a < NARENA; ++a)
+        bool delta_ok = true;
+        for (int a = 0; a < NARENA; ++a) {
             S.delta[a] = (uint8_t*)VirtualAlloc(nullptr, DELTA_CAP[a],
                              MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!S.sblob || !S.delta[0] || !S.delta[1]) {
+            if (!S.delta[a]) delta_ok = false;
+        }
+        if (!S.sblob || !delta_ok) {
             log_printf("[snapshot_ring] !! arm: ring slot %d alloc failed\n", s);
             return;
         }
@@ -118,19 +131,21 @@ void arm() {
 
     g_cur   = -1;
     g_armed = true;
-    log_printf("[snapshot_ring] armed: sq=%uMB bullet=%uMB ring=%d\n",
-               g_ar[0].size / (1024 * 1024), g_ar[1].size / (1024 * 1024), RING);
+    log_printf("[snapshot_ring] armed: sq=%uMB bullet=%uMB cpp=%uMB ring=%d\n",
+               g_ar[0].size / (1024 * 1024), g_ar[1].size / (1024 * 1024),
+               g_ar[2].size / (1024 * 1024), RING);
 }
 
 bool armed() { return g_armed; }
 
 namespace {
 // Offset of the size-classed arena's `bump` (high-water) field within its
-// Meta header — sq_arena Meta.bump@0, bullet_arena Meta.bump@4. fold_checksum
-// hashes only [base, base+bump): the dead space beyond the high-water is not
-// part of the game state and including it makes the checksum disagree with a
+// Meta header — sq_arena Meta.bump@0, bullet_arena Meta.bump@4,
+// cpp_arena Meta.bump@4 (Meta = {magic, bump, ...}). fold_checksum hashes
+// only [base, base+bump): the dead space beyond the high-water is not part
+// of the game state and including it makes the checksum disagree with a
 // fresh full hash of the live arena (a false-positive desync).
-static const uint32_t BUMP_OFF[NARENA] = { 0, 4 };
+static const uint32_t BUMP_OFF[NARENA] = { 0, 4, 4 };
 
 // Full-state desync checksum: fold every in-use page hash (cheap — maintained
 // incrementally) plus the small blob.
@@ -279,7 +294,8 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
     // OLDEST->newest and restore each page exactly once, from the first
     // (oldest) delta that holds it: that pre-image is the page's value at
     // frame target-... = frame `target` (it was not dirtied in between).
-    static uint8_t seen[NARENA][16384 / 8];   // 1 bit/page, sq is the larger
+    // 1 bit/page; sized for the largest arena — cpp_arena, 128 MB / 4 KB.
+    static uint8_t seen[NARENA][(128u * 1024 * 1024 / PAGE) / 8];
     memset(seen, 0, sizeof(seen));
     for (int64_t f = target + 1; f <= g_cur; ++f) {
         Slot& S = g_ring[(uint32_t)(f % RING)];

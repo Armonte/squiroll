@@ -25,7 +25,9 @@
 #include "cpp_arena.h"     // C++ std::list node arena
 #include "bullet_arena.h"  // Bullet physics heap arena
 #include "snapshot_ring.h" // dirty-page rollback snapshot for the big arenas
+#include "tf4_snap.h"      // copy-on-write rollback tracker for the TF4 mspace
 #include "input_hist.h"    // per-player input-history capture
+#include "crash_handler.h" // watch_cxx — log C++ throws in a re-sim
 #include "rollback.h"      // layer-4 sq-diff identifier
 #include <squirrel.h>
 // squiroll routes every sq_* call through a runtime-filled KITE table —
@@ -730,7 +732,7 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         };
         LARGE_INTEGER _c0; QueryPerformanceCounter(&_c0);
         sect(&battle_pools::save);
-        sect(&cpp_arena::save);
+        // cpp_arena is now dirty-page-snapshotted by snapshot_ring, not full-copied in the small blob.
         sect(&engine_snap::save);
         sect(&input_rec_save);
         sect(&input_hist::save);
@@ -743,6 +745,9 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         LARGE_INTEGER _c1; QueryPerformanceCounter(&_c1);
         uint32_t cs = snapshot_ring::capture(frame, smb,
                                              (uint32_t)(sp - smb));
+        // TF4-engine mspace heap — write-watch dirty-page tracked with
+        // byte-run-compressed deltas, separate from the sblob.
+        tf4_snap::capture(frame);
         LARGE_INTEGER _c2; QueryPerformanceCounter(&_c2);
         g_perf_sblob += (uint64_t)(_c1.QuadPart - _c0.QuadPart);
         g_perf_cap   += (uint64_t)(_c2.QuadPart - _c1.QuadPart);
@@ -889,6 +894,8 @@ void load_state_from_buf(const void* buf, uint32_t len) {
     if (g_arena_rollback && snapshot_ring::armed()) {
         uint32_t sl = 0;
         const uint8_t* sblob = snapshot_ring::restore(hdr->frame, &sl);
+        // Roll the TF4-engine mspace heap back too (see save_state_to_buf).
+        tf4_snap::restore(hdr->frame);
         if (sblob) {
             const uint8_t* sp   = sblob;
             const uint8_t* send = sblob + sl;
@@ -901,7 +908,7 @@ void load_state_from_buf(const void* buf, uint32_t len) {
                 sp += w;
             };
             sect(&battle_pools::load);
-            sect(&cpp_arena::load);
+            // cpp_arena is now dirty-page-snapshotted by snapshot_ring, not full-copied in the small blob.
             sect(&engine_snap::load);
             sect(&input_rec_load);
             sect(&input_hist::load);
@@ -1465,21 +1472,29 @@ void advance_one_frame() {
         *(uint32_t*)(0x4DAD1C_R) = fa_base;   // reset the bump pointer
     }
     if (trace) log_printf("[gekko_bridge] advance: -> update_related\n");
-    // Route th155 operator-new into cpp_arena ONLY for the logical advance.
-    // cpp_arena hooks operator new broadly; left armed across the whole match
-    // it also captured th155's RENDERING allocations (drawing_related runs
-    // once per real frame, between gekko ticks) — non-advance allocs perturb
-    // the arena's bump/free-lists outside any logical frame, so a re-sim's
-    // cpp_arena diverged (bump off by one 8 KB block). Arming per-advance
-    // makes cpp_arena a pure function of the logical frames. (Frees stay
-    // range-routed, so an arena pointer always frees correctly.)
-    cpp_arena::set_armed(true);
+    // cpp_arena stays armed for the whole match (armed once at session arm).
+    // It MUST capture every th155 operator-new — including the animation
+    // system's CompositeSprite std::vector buffers, which the renderer also
+    // reallocates. Arming only per-advance let a render-time realloc escape
+    // to the real Win32 heap; a later advance then freed that buffer, and a
+    // rollback re-sim freed it AGAIN (the real heap is not snapshotted) —
+    // STATUS_HEAP_CORRUPTION. With cpp_arena always armed the buffer lives in
+    // the captured arena, so its alloc/free is rolled back like everything
+    // else. (The cpp_arena divergence this gating was meant to fix was
+    // actually the InputHistory vector — fixed by input_hist.)
+    // On a re-sim advance, log any C++ exception thrown inside the game
+    // update — an uncaught throw here terminates with no crash report.
+    if (g_trace_rb) crash_handler::watch_cxx(true);
+    // Mark the re-sim so cpp_arena suppresses real-heap frees (the real heap
+    // is not snapshotted — a re-sim re-free would double-free).
+    cpp_arena::set_resim(g_trace_rb != 0);
     update_related(*MAIN_SCRIPTAPI_PTR);                    // RunOneFrame(g_main), once
     log_state_fingerprint(g_trace_frame, g_trace_rb, "post-run");
     if (rb_diag_enabled()) battle_pools::log_fingerprint("post-run");
     if (trace) log_printf("[gekko_bridge] advance: -> ScriptAPI::Update\n");
     Act_ScriptAPI_ptr->vftable->Update(Act_ScriptAPI_ptr);  // Act::ScriptAPI::Update
-    cpp_arena::set_armed(false);
+    if (g_trace_rb) crash_handler::watch_cxx(false);
+    cpp_arena::set_resim(false);
     log_state_fingerprint(g_trace_frame, g_trace_rb, "post-upd");
     ++*(uint32_t*)(0x4DACE0_R);                             // g_frame_counter
     if (trace) log_printf("[gekko_bridge] advance: exit\n");
@@ -1557,16 +1572,15 @@ bool init(uint16_t local_port, uint16_t remote_port,
     // Re-allocating them now — armed — puts them in the snapshot and at a
     // fixed 256-elem capacity so they never realloc/move mid-match.
     battle_pools::reserve_anim_vectors();
-    // reserve_anim_vectors' buffers are now in cpp_arena — disarm it; from
-    // here advance_one_frame arms cpp_arena only for the logical advance, so
-    // rendering's allocations stay out of the rollback snapshot.
-    cpp_arena::set_armed(false);
     // Fix each player's input-history vector capacity so it never reallocs
     // mid-match (its backing buffer then keeps a stable address to snapshot).
     input_hist::pregrow();
     // Arm dirty-page snapshotting: arenas installed, pools pre-grown — take
     // the write-watch baseline before the first advance/save.
     snapshot_ring::arm();
+    // COW-track the TF4-engine mspace heap (resolves the mspace + protects
+    // its segments). After snapshot_ring::arm() — independent of it.
+    tf4_snap::arm();
     apply_test_round_frames();
 
     log_printf("gekko_bridge: session up. local=%u port=%u remote=%s (remote_addr_len=%u)\n",
@@ -1606,18 +1620,17 @@ bool init_solo() {
 
     g_active = true;
     live_actors::set_defer_release(!g_arena_rollback);
-    cpp_arena::set_armed(true);          // capture operator-new (before re-home)
+    cpp_arena::set_armed(true);          // capture operator-new for the whole match
     battle_pools::pregrow();             // freeze the C++ battle pools' block set
     battle_pools::reserve_anim_vectors(); // re-home AnimCtrl CompositeSprite vectors into cpp_arena
-    // Disarm cpp_arena — advance_one_frame arms it only for the logical
-    // advance, keeping rendering's allocations out of the snapshot.
-    cpp_arena::set_armed(false);
     // Fix each player's input-history vector capacity so it never reallocs
     // mid-match (its backing buffer then keeps a stable address to snapshot).
     input_hist::pregrow();
     // Arm dirty-page snapshotting: arenas installed, pools pre-grown — take
     // the write-watch baseline before the first advance/save.
     snapshot_ring::arm();
+    // COW-track the TF4-engine mspace heap (see init()).
+    tf4_snap::arm();
 
     // The battle is already created — vs.Initialize ran under the
     // vanilla loop during the intro. A stress session has no handshake

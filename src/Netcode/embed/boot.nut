@@ -167,11 +167,17 @@ function Initialize() {
             ::print("[squiroll boot] entering SOLO gekko stress session\n");
             local param = ::vs.InitializeParam();
             param.game_mode      = 1;
-            param.difficulty     = 0;
-            param.device_id[0]   = -1;
-            param.device_id[1]   = -1;
-            param.mode[0]        = 0;
-            param.mode[1]        = 0;
+            // CPU-vs-CPU so the stress rig actually FIGHTS — mode 1 = COM,
+            // device_id -2 = AI-controlled (see BeginBattle in the vanilla
+            // character_select_action.nut). The CPU AI is deterministic
+            // Squirrel, captured by the rollback snapshot (sq_arena), so the
+            // re-simulation stays in sync. This gives real actor churn —
+            // attacks, projectiles, hitboxes — for the rollback to exercise.
+            param.difficulty     = 2;
+            param.device_id[0]   = -2;
+            param.device_id[1]   = -2;
+            param.mode[0]        = 1;
+            param.mode[1]        = 1;
             param.master_name[0] = "reimu";
             param.slave_name[0]  = "marisa";
             param.master_name[1] = "reimu";

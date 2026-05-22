@@ -82,6 +82,22 @@ static int collect(Region* r) {
         }
     };
 
+    // th155.exe .data section in full — RVA 0x498000, virtual size 0x47AA4
+    // (~293 KB), the whole writable static-data segment. This is one region
+    // that captures EVERY engine global at once: the scheduler counters,
+    // the DirectInput keyboard table (byte_4DAF00), every Squirrel/engine
+    // global pointer slot, and — the reason this is a whole-section copy
+    // rather than hand-picked fields — every custom pool / free-list
+    // allocator th155 keeps in static storage. th155 has many: e.g. the
+    // Squirrel-instance object pool whose free-list head lives at 0x4DCD00
+    // (sub_45710 pops it; sub_45D20 grows it). A pool head mutates on every
+    // alloc/free, so missing even one desyncs a rollback re-sim and then
+    // dereferences a stale node -> crash. Chasing pools one at a time is a
+    // losing game; at ~293 KB the full-section copy is trivially cheap and
+    // strictly supersedes the hand-picked engine globals below (those are
+    // kept only as a backstop / for the few that are NOT in .data).
+    add((void*)(0x498000_R), 0x47AA4);
+
     // Act::ScriptAPI object + its four std::list sentinel nodes.
     void* sapi = *G_SCRIPTAPI_PTR;
     if (sapi) {

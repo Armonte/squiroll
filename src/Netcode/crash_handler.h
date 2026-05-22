@@ -15,6 +15,11 @@ namespace crash_handler {
 // Install the VEH. Call once, as early as possible in common_init.
 void install();
 
+// While enabled, the VEH also logs first-chance C++ exceptions (0xE06D7363)
+// — normally ignored. Used to catch an uncaught C++/Sqrat throw inside a
+// rollback re-sim advance (which otherwise terminates with no crash log).
+void watch_cxx(bool on);
+
 } // namespace crash_handler
 
 #endif // CRASH_HANDLER_H

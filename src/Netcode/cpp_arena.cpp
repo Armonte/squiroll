@@ -32,9 +32,11 @@
 namespace cpp_arena {
 namespace {
 
-// 64 MB. Holds th155's live C++ heap; the per-frame snapshot copies only
+// 128 MB. Holds th155's live C++ heap; the per-frame snapshot copies only
 // [base, base+bump). Overflow falls back to the real allocator gracefully.
-static constexpr uint32_t ARENA_SIZE = 64u * 1024 * 1024;
+// Sized for the WHOLE process's C++ heap (arena armed for the process
+// lifetime), not just the battle.
+static constexpr uint32_t ARENA_SIZE = 128u * 1024 * 1024;
 static constexpr int      CLS_MIN_SH = 4;    // 16-byte smallest block
 static constexpr int      CLS_MAX_SH = 24;   // 16 MB largest block
 static constexpr int      NCLS       = CLS_MAX_SH - CLS_MIN_SH + 1;
@@ -65,7 +67,9 @@ static uint8_t* g_base      = nullptr;
 static Meta*    g_meta      = nullptr;
 static bool     g_installed = false;
 static bool     g_armed     = false;   // route operator new -> arena only while a match is armed
+static bool     g_resim     = false;   // a rollback re-simulation advance is in progress
 static uint32_t g_warn      = 8;
+static uint32_t g_resim_skips = 0;     // real-heap frees suppressed during re-sim
 
 // DIAGNOSTIC: caller of the in-flight operator new, + a quota for logging
 // size-class-13 (8 KB) bump-allocations — the rollback re-sim does one extra,
@@ -76,6 +80,14 @@ static int      g_cls13_log    = 96;
 static SafetyHookInline g_h_opnew{};
 static SafetyHookInline g_h_free{};
 static SafetyHookInline g_h_malloc{};
+
+// The arena is armed for the whole process lifetime and th155 hits operator
+// new / _free_base from MULTIPLE THREADS (background resource loading). The
+// bump pointer and per-class free lists are not atomic, so arena_alloc and
+// arena_free serialise on this lock. A Win32 CRITICAL_SECTION is recursive,
+// so nested entry (any future arena_realloc -> arena_alloc) is safe.
+// Initialised by install() before the hooks go live.
+static CRITICAL_SECTION g_lock;
 
 // DIAGNOSTIC: ring of recent th155 malloc() calls (caller RVA + size + ptr),
 // recorded only while armed. trace_alloc() walks it to attribute a divergent
@@ -102,6 +114,8 @@ static void* arena_alloc(size_t n) {
     int      ci  = sh - CLS_MIN_SH;
     uint32_t blk = 1u << sh;
     uint32_t off;
+    // Lock spans every read/write of g_meta->bump and g_meta->free_off[].
+    EnterCriticalSection(&g_lock);
     if (g_meta->free_off[ci]) {
         off = g_meta->free_off[ci];
         g_meta->free_off[ci] = ((Hdr*)(g_base + off))->next_free;
@@ -112,6 +126,7 @@ static void* arena_alloc(size_t n) {
                 log_printf("[cpp_arena] !! ARENA FULL bump=%u +%u\n",
                            g_meta->bump, blk);
             }
+            LeaveCriticalSection(&g_lock);
             return nullptr;
         }
         off = g_meta->bump;
@@ -137,25 +152,34 @@ static void* arena_alloc(size_t n) {
     h->next_free = 0;
     h->magic     = HDR_MAGIC;
     g_meta->live_bytes += (uint32_t)n;
+    LeaveCriticalSection(&g_lock);
     return g_base + off + sizeof(Hdr);
 }
 
 static void arena_free(void* p) {
     Hdr* h = (Hdr*)((uint8_t*)p - sizeof(Hdr));
+    // Lock spans every read/write of g_meta->free_off[] (and the header
+    // mutation that links the block onto a free list).
+    EnterCriticalSection(&g_lock);
     if (h->magic != HDR_MAGIC) {
         if (g_warn) {
             --g_warn;
             log_printf("[cpp_arena] !! free of bad/double block magic=%08x\n",
                        h->magic);
         }
+        LeaveCriticalSection(&g_lock);
         return;
     }
     int ci = (int)h->cls - CLS_MIN_SH;
-    if (ci < 0 || ci >= NCLS) return;
+    if (ci < 0 || ci >= NCLS) {
+        LeaveCriticalSection(&g_lock);
+        return;
+    }
     g_meta->live_bytes -= h->reqsize;
     h->magic     = 0;
     h->next_free = g_meta->free_off[ci];
     g_meta->free_off[ci] = (uint32_t)((uint8_t*)h - g_base);
+    LeaveCriticalSection(&g_lock);
 }
 
 static inline bool in_arena(const void* p) {
@@ -180,9 +204,25 @@ static void* cdecl hook_op_new(size_t size) {
 }
 
 // _free_base: an arena pointer is detected by address range — exact, no
-// caller check. Everything else goes to the real CRT free.
+// caller check, and arena_free IS rolled back with the snapshot.
+//
+// A NON-arena (real Win32 heap) pointer is the problem: the real heap is not
+// part of the rollback snapshot. During a rollback re-simulation the forward
+// run has ALREADY freed that block — re-freeing it is a double-free, which
+// RtlFreeHeap turns into a STATUS_HEAP_CORRUPTION fastfail. So a real-heap
+// free issued from inside a re-sim advance is suppressed (the block stays
+// freed from the forward pass; the bounded leak is the transient buffers a
+// growing std::vector sheds — they stop once capacity settles).
 static void cdecl hook_free(void* block) {
     if (in_arena(block)) { arena_free(block); return; }
+    if (g_resim) {
+        if (g_warn && (g_resim_skips & 0x3FF) == 0) {
+            log_printf("[cpp_arena] re-sim: suppressed real-heap free %p "
+                       "(#%u)\n", block, g_resim_skips);
+        }
+        ++g_resim_skips;
+        return;
+    }
     g_h_free.unsafe_ccall<void>(block);
 }
 
@@ -205,8 +245,17 @@ static void* cdecl hook_malloc(size_t size) {
 void install() {
     if (g_installed) return;
 
+    // Serialises arena_alloc/arena_free across th155's threads. Created
+    // before the hooks go live so the very first hooked call is already
+    // protected.
+    InitializeCriticalSection(&g_lock);
+
+    // MEM_WRITE_WATCH: a snapshot module tracks which pages each frame
+    // dirties (GetWriteWatch), so a rollback snapshot copies only what
+    // changed, not the whole arena.
     g_base = (uint8_t*)VirtualAlloc(nullptr, ARENA_SIZE,
-                                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                                    MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH,
+                                    PAGE_READWRITE);
     if (!g_base) {
         log_printf("[cpp_arena] !! VirtualAlloc(%u) failed — C++ heap stays "
                    "on the CRT heap\n", ARENA_SIZE);
@@ -254,6 +303,8 @@ void trace_alloc(uint32_t addr) {
 }
 
 void     set_armed(bool on) { g_armed = on; }
+void     set_resim(bool on) { g_resim = on; }
+uint8_t* base()      { return g_base; }
 uint32_t used()      { return g_meta ? g_meta->bump : 0; }
 uint32_t capacity()  { return ARENA_SIZE; }
 size_t   live_bytes(){ return g_meta ? g_meta->live_bytes : 0; }

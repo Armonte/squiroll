@@ -1,3 +1,5 @@
+#include <safetyhook.hpp>
+
 #include <windows.h>
 #include <stdint.h>
 
@@ -13,6 +15,8 @@ namespace {
 
 static volatile LONG g_in_handler = 0;
 static PVOID         g_veh        = nullptr;
+static volatile LONG g_watch_cxx  = 0;   // log first-chance C++ exceptions
+static volatile LONG g_cxx_quota  = 12;  // ...but only this many, no spam
 
 // Append a chunk to the crash log fully synchronously.
 static void crash_write(const char* data, int len) {
@@ -59,9 +63,12 @@ static void describe_addr(uintptr_t addr, char* out) {
 static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
 
-    // Only genuine fatal faults. Ignore C++ EH (0xE06D7363), debug
-    // breakpoints, guard-page hits and the anti-tamper's own exceptions
-    // so the log isn't spammed by exceptions the game handles itself.
+    // Genuine fatal faults are always logged. Any OTHER exception code — C++
+    // EH (0xE06D7363), heap corruption (0xC0000374), ... — is normally
+    // ignored (the game raises/handles its own), but while watch_cxx is on (a
+    // rollback re-sim advance) a bounded number are logged. This catches a
+    // re-sim crash whose code is outside the always-fatal set.
+    bool watched = false;
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
     case EXCEPTION_ILLEGAL_INSTRUCTION:
@@ -71,7 +78,11 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
     case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
         break;
     default:
-        return EXCEPTION_CONTINUE_SEARCH;
+        if (!g_watch_cxx || g_cxx_quota <= 0)
+            return EXCEPTION_CONTINUE_SEARCH;
+        InterlockedDecrement(&g_cxx_quota);
+        watched = true;
+        break;
     }
 
     // Re-entrancy guard: if the handler itself faulted, bail.
@@ -79,17 +90,18 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Flush the async log queue synchronously — the logger's worker
-    // thread will not run again, so without this the lines leading up to
-    // the crash are lost.
-    log_crash_drain();
+    // Flush the async log queue synchronously — for a fatal fault the
+    // logger's worker thread will not run again. A watched first-chance
+    // exception may be non-fatal (the program continues), so don't drain it.
+    if (!watched) log_crash_drain();
 
     const CONTEXT*          c = ep->ContextRecord;
     const EXCEPTION_RECORD* r = ep->ExceptionRecord;
     char loc[MAX_PATH + 32];
 
     describe_addr((uintptr_t)r->ExceptionAddress, loc);
-    crash_logf("\r\n==== CRASH (squiroll VEH) ====\r\n");
+    crash_logf(watched ? "\r\n==== FIRST-CHANCE EXCEPTION (re-sim) ====\r\n"
+                       : "\r\n==== CRASH (squiroll VEH) ====\r\n");
     crash_logf("code=0x%08X  at %s  eip=0x%08X\r\n", code, loc, c->Eip);
     if (code == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2) {
         const ULONG_PTR kind = r->ExceptionInformation[0];
@@ -123,9 +135,72 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// --- fast-fail interception -------------------------------------------------
+// __fastfail (int 29h) bypasses VEH/UEF entirely — a /GS stack-cookie smash or
+// a CRT invalid-parameter kills the process with no crash report. We hook the
+// th155 CRT functions that issue it; each runs with the stack still intact, so
+// the hook logs an EBP-chain walk pinpointing the faulting function, then ends
+// the process cleanly.
+static SafetyHookInline g_ff[5];
+
+static void log_fastfail_stack(const char* via) {
+    log_crash_drain();
+    crash_logf("\r\n==== FASTFAIL via %s ====\r\n", via);
+    uintptr_t ebp = (uintptr_t)__builtin_frame_address(0);
+    char loc[MAX_PATH + 32];
+    for (int i = 0; i < 48 && ebp; ++i) {
+        if (IsBadReadPtr((void*)ebp, 8)) break;
+        const uintptr_t ret  = *(uintptr_t*)(ebp + 4);
+        const uintptr_t next = *(uintptr_t*)ebp;
+        if (ret) {
+            describe_addr(ret, loc);
+            crash_logf("  [%2d] ret=0x%08X  %s\r\n", i, (unsigned)ret, loc);
+        }
+        if (next <= ebp) break;
+        ebp = next;
+    }
+    crash_logf("==== END FASTFAIL ====\r\n");
+}
+
+#define FF_HOOK(idx, nm)                              \
+    static void __cdecl ff_hook_##idx() {             \
+        log_fastfail_stack(nm);                       \
+        TerminateProcess(GetCurrentProcess(), 0xC0000409u); \
+    }
+FF_HOOK(0, "__report_gsfailure")
+FF_HOOK(1, "__report_securityfailure")
+FF_HOOK(2, "__scrt_fastfail")
+FF_HOOK(3, "__invoke_watson")
+FF_HOOK(4, "abort")
+
+// --- process-exit interception ----------------------------------------------
+// If the crash is not an exception at all — a clean ExitProcess / Terminate-
+// Process / RaiseFailFastException from some th155 error path — these catch it
+// with the call stack intact.
+static SafetyHookInline g_h_exit{}, g_h_term{}, g_h_raiseff{};
+
+static void __stdcall hook_exitprocess(UINT code) {
+    log_fastfail_stack("ExitProcess");
+    crash_logf("  exit code = 0x%08X\r\n", code);
+    g_h_exit.unsafe_stdcall<void>(code);
+}
+static BOOL __stdcall hook_terminateprocess(HANDLE h, UINT code) {
+    if (h == GetCurrentProcess() || h == (HANDLE)(LONG_PTR)-1) {
+        log_fastfail_stack("TerminateProcess");
+        crash_logf("  exit code = 0x%08X\r\n", code);
+    }
+    return g_h_term.unsafe_stdcall<BOOL>(h, code);
+}
+static void __stdcall hook_raiseff(void* rec, void* ctx, DWORD flags) {
+    log_fastfail_stack("RaiseFailFastException");
+    g_h_raiseff.unsafe_stdcall<void>(rec, ctx, flags);
+}
+
 } // namespace
 
 namespace crash_handler {
+
+void watch_cxx(bool on) { g_watch_cxx = on ? 1 : 0; }
 
 void install() {
     if (g_veh) return;
@@ -133,6 +208,32 @@ void install() {
     // gets a chance to swallow the exception.
     g_veh = AddVectoredExceptionHandler(1, veh);
     log_printf("crash_handler: VEH %s\n", g_veh ? "installed" : "FAILED");
+
+    // Hook th155's __fastfail issuers (RVAs from the IDB; th155.exe base 0).
+    static const uint32_t ff_rva[5] = {
+        0x2e1c27, 0x2e1d2e, 0x2e2788, 0x306f89, 0x30c5d7 };
+    void* ff_repl[5] = { (void*)ff_hook_0, (void*)ff_hook_1, (void*)ff_hook_2,
+                         (void*)ff_hook_3, (void*)ff_hook_4 };
+    uint8_t* base = (uint8_t*)GetModuleHandleA(nullptr);
+    int ffok = 0;
+    for (int i = 0; i < 5; ++i) {
+        g_ff[i] = safetyhook::create_inline(base + ff_rva[i], ff_repl[i]);
+        ffok += g_ff[i].enabled() ? 1 : 0;
+    }
+    log_printf("crash_handler: fastfail hooks %d/5\n", ffok);
+
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (k32) {
+        void* pe = (void*)GetProcAddress(k32, "ExitProcess");
+        void* pt = (void*)GetProcAddress(k32, "TerminateProcess");
+        void* pr = (void*)GetProcAddress(k32, "RaiseFailFastException");
+        if (pe) g_h_exit    = safetyhook::create_inline(pe, (void*)hook_exitprocess);
+        if (pt) g_h_term    = safetyhook::create_inline(pt, (void*)hook_terminateprocess);
+        if (pr) g_h_raiseff = safetyhook::create_inline(pr, (void*)hook_raiseff);
+        log_printf("crash_handler: exit hooks exit=%d term=%d raiseff=%d\n",
+                   (int)g_h_exit.enabled(), (int)g_h_term.enabled(),
+                   (int)g_h_raiseff.enabled());
+    }
 }
 
 } // namespace crash_handler

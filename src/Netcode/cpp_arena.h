@@ -49,6 +49,13 @@ void load(const uint8_t* blob, uint32_t len);
 // a match it goes to the real allocator (keeps the snapshot battle-scoped).
 void set_armed(bool on);
 
+// Mark a rollback re-simulation advance in progress. While set, a free of a
+// real-heap (non-arena) block is suppressed — the real Win32 heap is not
+// snapshotted, so the forward run already freed it and re-freeing would
+// double-free (STATUS_HEAP_CORRUPTION).
+void set_resim(bool on);
+
+uint8_t* base();        // arena base — the MEM_WRITE_WATCH region
 uint32_t used();        // high-water bytes (what save() writes)
 uint32_t capacity();    // arena reservation
 size_t   live_bytes();  // currently-handed-out payload bytes

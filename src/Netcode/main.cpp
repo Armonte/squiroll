@@ -27,6 +27,7 @@
 #include "cpp_arena.h"
 #include "bullet_arena.h"
 #include "input_hist.h"
+#include "tf4_snap.h"
 #include "sq_trace.h"
 
 #include <shared.h>
@@ -299,6 +300,14 @@ bool common_init(
     // fault anywhere lands a module+RVA report in aocf_crash.log.
     crash_handler::install();
 
+    // Patch th155's TF4-engine mspace heap (the dlmalloc at .data:0x4DC0C0)
+    // so its VirtualAlloc segments are MEM_WRITE_WATCH — tf4_snap rollback-
+    // tracks that heap (battle objects allocate through it, e.g. the
+    // Squirrel-instance pool at 0x4DCD00, so it must be snapshotted or a
+    // re-sim diverges). Done first thing so the patch lands before the
+    // engine creates any segment; arm() (at session arm) does the rest.
+    tf4_snap::install();
+
     hotpatch_rel32(0x1DC5A_R, parse_command_line);
 
     // Turn off scroll lock to simplify static management for the toggle func
@@ -320,6 +329,12 @@ bool common_init(
     // (free). Must run before the battle's lists are populated — common_init
     // is well before vs.Initialize.
     cpp_arena::install();
+    // Arm cpp_arena for the whole process lifetime so EVERY th155 C++ heap
+    // allocation — including the battle objects (characters, animation
+    // controllers, their std::vector buffers) created during vs.Initialize —
+    // lands in the rollback-captured arena. A battle object left on the
+    // un-captured real Win32 heap double-frees on a rollback re-sim.
+    cpp_arena::set_armed(true);
 
     // Route th155's Bullet physics heap into a captured arena. Bullet's two
     // base allocator fn-pointers (0x498D44 alloc / 0x498D48 free) are
