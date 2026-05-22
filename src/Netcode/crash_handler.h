@@ -20,6 +20,15 @@ void install();
 // rollback re-sim advance (which otherwise terminates with no crash log).
 void watch_cxx(bool on);
 
+// DIAGNOSTIC: hardware data-write watchpoint. watchpoint_arm(addr) traps
+// every 4-byte write to `addr` and logs the writing instruction's EIP +
+// the new value; watchpoint_disarm() clears it. MUST be called on the
+// thread to be watched (debug registers are per-thread) — i.e. the
+// simulation thread. Used to find which code writes a rollback-divergent
+// field.
+void watchpoint_arm(void* addr);
+void watchpoint_disarm();
+
 } // namespace crash_handler
 
 #endif // CRASH_HANDLER_H

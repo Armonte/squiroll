@@ -18,6 +18,15 @@ static PVOID         g_veh        = nullptr;
 static volatile LONG g_watch_cxx  = 0;   // log first-chance C++ exceptions
 static volatile LONG g_cxx_quota  = 12;  // ...but only this many, no spam
 
+// Hardware data-write watchpoint (DR0): when armed, every write to g_wp_addr
+// raises a single-step exception the VEH logs (the writing instruction's
+// EIP + the new value). Used to find which code writes a rollback-divergent
+// field. Armed/disarmed on the simulation thread (debug registers are
+// per-thread), scoped to the frame under investigation.
+static void*         g_wp_addr  = nullptr;
+static volatile LONG g_wp_quota = 0;
+static uint32_t      g_wp_last  = 0;     // last logged value (log on change)
+
 // Append a chunk to the crash log fully synchronously.
 static void crash_write(const char* data, int len) {
     if (len <= 0) return;
@@ -62,6 +71,25 @@ static void describe_addr(uintptr_t addr, char* out) {
 
 static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
+
+    // Hardware data-write watchpoint hit: a DR register fired a single-step.
+    // Log the writing instruction (EIP is the instruction AFTER the write)
+    // and the value now at the address, then continue.
+    if (code == (DWORD)EXCEPTION_SINGLE_STEP) {
+        if (g_wp_addr && (ep->ContextRecord->Dr6 & 0xFu)) {
+            uint32_t v = *(volatile uint32_t*)g_wp_addr;
+            if (v != g_wp_last && g_wp_quota > 0) {
+                InterlockedDecrement(&g_wp_quota);
+                g_wp_last = v;
+                char loc[MAX_PATH + 32];
+                describe_addr(ep->ContextRecord->Eip, loc);
+                log_printf("[wp] %p <- %08X  eip=%08X %s\n", g_wp_addr, v,
+                           (unsigned)ep->ContextRecord->Eip, loc);
+            }
+            ep->ContextRecord->Dr6 = 0;
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
 
     // Genuine fatal faults are always logged. Any OTHER exception code — C++
     // EH (0xE06D7363), heap corruption (0xC0000374), ... — is normally
@@ -208,6 +236,39 @@ static void __stdcall hook_raiseff(void* rec, void* ctx, DWORD flags) {
 namespace crash_handler {
 
 void watch_cxx(bool on) { g_watch_cxx = on ? 1 : 0; }
+
+// Arm a hardware data-write watchpoint on `addr` (4 bytes) for the CURRENT
+// thread — call this on the simulation thread. Every write to those bytes
+// then traps into veh(), which logs the writing instruction.
+void watchpoint_arm(void* addr) {
+    g_wp_addr  = addr;
+    g_wp_quota = 256;
+    g_wp_last  = *(volatile uint32_t*)addr;
+    CONTEXT ctx;
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    HANDLE self = GetCurrentThread();
+    if (!GetThreadContext(self, &ctx)) return;
+    ctx.Dr0 = (DWORD)(uintptr_t)addr;
+    ctx.Dr6 = 0;
+    // DR7: L0 (bit 0) enables DR0; R/W0 (bits 16-17)=01 write; LEN0
+    // (bits 18-19)=11 four bytes -> bits 16-19 = 0xD.
+    ctx.Dr7 = (ctx.Dr7 & ~0x000F0003u) | 0x000D0001u;
+    SetThreadContext(self, &ctx);
+    log_printf("[wp] armed on %p (thread %u)\n", addr, GetCurrentThreadId());
+}
+
+// Disarm the watchpoint on the current thread.
+void watchpoint_disarm() {
+    CONTEXT ctx;
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    HANDLE self = GetCurrentThread();
+    if (GetThreadContext(self, &ctx)) {
+        ctx.Dr0 = 0;
+        ctx.Dr7 &= ~0x000F0003u;
+        SetThreadContext(self, &ctx);
+    }
+    g_wp_addr = nullptr;
+}
 
 void install() {
     if (g_veh) return;
