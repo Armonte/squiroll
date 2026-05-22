@@ -274,10 +274,9 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                 if (!shadow)
                     shadow = (uint8_t*)VirtualAlloc(nullptr, C.size,
                                  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-                // Shadow the earliest re-simmable frame so the diff catches
-                // the divergence at its ORIGIN, not several frames of cascade
-                // later.
-                if (shadow && frame >= 2) {
+                // Shadow the frame the divergence first appears at (see the
+                // [comp] log) so the diff pins the exact bytes.
+                if (shadow && frame >= 4) {
                     memcpy(shadow, C.base, C.size);
                     shadow_frame = (int32_t)frame;
                     log_printf("[cppdiff] shadow of cpp_arena taken at f=%u\n",

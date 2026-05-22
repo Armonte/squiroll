@@ -133,7 +133,7 @@ static uint32_t   g_mw_idx = 0;
 // the exact point the re-sim deviates. See trace_reset / trace_check.
 struct TraceEv { uint8_t op; uint32_t size, caller, off; };  // op 1=alloc 2=free
 static constexpr uint32_t TRACE_CAP   = 65536;
-static const     uint32_t TRACE_FRAME = 2;       // the frame to diff
+static const     uint32_t TRACE_FRAME = 4;       // the frame to diff
 static TraceEv  g_tr[TRACE_CAP];
 static uint32_t g_tr_n        = 0;
 static TraceEv  g_tr_saved[TRACE_CAP];
