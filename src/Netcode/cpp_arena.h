@@ -59,6 +59,11 @@ void set_resim(bool on);
 // overflow. See tf4_pool — re-homes th155's Squirrel-instance object pool.
 void* raw_alloc(uint32_t n);
 
+// DIAGNOSTIC: log which allocated block owns arena byte-offset `off`, and
+// the RVA of the code that allocated it — attributes a rollback divergence
+// to a subsystem. See cpp_arena.cpp.
+void attribute(uint32_t off);
+
 uint8_t* base();        // arena base — the MEM_WRITE_WATCH region
 uint32_t used();        // high-water bytes (what save() writes)
 uint32_t capacity();    // arena reservation

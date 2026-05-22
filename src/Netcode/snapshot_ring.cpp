@@ -290,6 +290,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                     if (a[i] != b[i]) {
                         log_printf("[cppdiff] f=%u off=0x%X fwd=%08x now=%08x\n",
                                    frame, o, a[i], b[i]);
+                        cpp_arena::attribute(o);   // -> owning block + caller RVA
                         ++hits;
                     }
                 }

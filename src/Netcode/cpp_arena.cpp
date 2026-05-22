@@ -47,7 +47,11 @@ static constexpr uint32_t META_MAGIC = 0x4D504143;  // 'CAPM'
 struct Hdr {
     uint32_t cls;        // size-class shift, CLS_MIN_SH..CLS_MAX_SH
     uint32_t reqsize;    // requested payload size
-    uint32_t next_free;  // free-list link: arena offset of next free block
+    uint32_t link;       // free block: free-list link (arena offset of next).
+                         // allocated block: caller RVA of the operator-new /
+                         // raw_alloc site — DIAGNOSTIC, lets a rollback-
+                         // divergent block be attributed to the code (battle
+                         // vs audio vs ...) that allocated it.
     uint32_t magic;      // HDR_MAGIC while allocated, 0 while free
 };
 static_assert(sizeof(Hdr) == 16, "Hdr must be 16 bytes");
@@ -118,7 +122,7 @@ static void* arena_alloc(size_t n) {
     EnterCriticalSection(&g_lock);
     if (g_meta->free_off[ci]) {
         off = g_meta->free_off[ci];
-        g_meta->free_off[ci] = ((Hdr*)(g_base + off))->next_free;
+        g_meta->free_off[ci] = ((Hdr*)(g_base + off))->link;
     } else {
         if ((uint64_t)g_meta->bump + blk > ARENA_SIZE) {
             if (g_warn) {
@@ -149,7 +153,8 @@ static void* arena_alloc(size_t n) {
     Hdr* h = (Hdr*)(g_base + off);
     h->cls       = (uint32_t)sh;
     h->reqsize   = (uint32_t)n;
-    h->next_free = 0;
+    h->link      = g_opnew_caller
+                 ? (uint32_t)(g_opnew_caller - (uint32_t)base_address) : 0;
     h->magic     = HDR_MAGIC;
     g_meta->live_bytes += (uint32_t)n;
     LeaveCriticalSection(&g_lock);
@@ -177,7 +182,7 @@ static void arena_free(void* p) {
     }
     g_meta->live_bytes -= h->reqsize;
     h->magic     = 0;
-    h->next_free = g_meta->free_off[ci];
+    h->link      = g_meta->free_off[ci];
     g_meta->free_off[ci] = (uint32_t)((uint8_t*)h - g_base);
     LeaveCriticalSection(&g_lock);
 }
@@ -312,7 +317,40 @@ void     set_resim(bool on) { g_resim = on; }
 // thread keeps live decoder state there). Returns nullptr on overflow, so
 // the caller can fall back. The block is range-routed back to arena_free
 // like any other arena pointer, so a later free is handled.
-void* raw_alloc(uint32_t n) { return g_meta ? arena_alloc(n) : nullptr; }
+void* raw_alloc(uint32_t n) {
+    if (!g_meta) return nullptr;
+    // Tag the block with this call site (see Hdr::link / attribute()).
+    g_opnew_caller = (uint32_t)(uintptr_t)_ReturnAddress();
+    return arena_alloc(n);
+}
+
+// DIAGNOSTIC: attribute an arena byte offset to the block that owns it and
+// log the allocating caller's RVA. Lets a rollback-divergent arena region
+// be traced to the exact code — and subsystem (battle / audio / ...) — that
+// allocated the object, instead of guessing. Walks the bump arena block by
+// block (each block is 1<<cls bytes, contiguous, no gaps).
+void attribute(uint32_t off) {
+    if (!g_meta) return;
+    uint32_t p    = (sizeof(Meta) + 15u) & ~15u;   // first block — see install()
+    uint32_t bump = g_meta->bump;
+    while (p < bump) {
+        Hdr* h = (Hdr*)(g_base + p);
+        if (h->cls < (uint32_t)CLS_MIN_SH || h->cls > (uint32_t)CLS_MAX_SH) {
+            log_printf("[cpp_attr] off=0x%X: block walk lost at 0x%X\n", off, p);
+            return;
+        }
+        uint32_t blk = 1u << h->cls;
+        if (off >= p && off < p + blk) {
+            bool live = (h->magic == HDR_MAGIC);
+            log_printf("[cpp_attr] off=0x%X -> block@0x%X blk=%u reqsize=%u %s "
+                       "caller_rva=%08X\n", off, p, blk, h->reqsize,
+                       live ? "LIVE" : "free", live ? h->link : 0u);
+            return;
+        }
+        p += blk;
+    }
+    log_printf("[cpp_attr] off=0x%X: not in any block (bump=0x%X)\n", off, bump);
+}
 uint8_t* base()      { return g_base; }
 uint32_t used()      { return g_meta ? g_meta->bump : 0; }
 uint32_t capacity()  { return ARENA_SIZE; }
