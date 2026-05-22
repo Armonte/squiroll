@@ -1108,11 +1108,15 @@ bool init(uint16_t local_port, uint16_t remote_port,
     }
 
     g_active = true;
-    // Hold every Actor2D::Release from this point on. We start saving
-    // state immediately (gekko emits Save events while sync is still in
-    // flight); if Release was still un-deferred during that window the
-    // saved actors would be gone by the time the matching Load fires.
-    live_actors::set_defer_release(true);
+    // Deferred release is OFF for the arena-rollback path. It no-ops
+    // Actor2D::Release entirely, which keeps the C++ actor "alive" while
+    // the Squirrel side of a dying actor tears down normally — the two
+    // halves desync, and a diverging dual re-sim turns that into a
+    // dangling Squirrel reference. battle_pools snapshots the actor pool
+    // raw, so a normally-released actor is captured/restored correctly
+    // without deferral. (Deferral remains for the legacy actor-record
+    // path, g_arena_rollback off.)
+    live_actors::set_defer_release(!g_arena_rollback);
     // Defer Squirrel VM frees too, so every object keeps a stable address
     // for the raw heap snapshot (giuroll model).
     sq_heap::set_armed(true);
@@ -1157,7 +1161,7 @@ bool init_solo() {
     }
 
     g_active = true;
-    live_actors::set_defer_release(true);
+    live_actors::set_defer_release(!g_arena_rollback);
     sq_heap::set_armed(true);  // defer Squirrel frees for the heap snapshot
     battle_pools::pregrow();   // freeze the C++ battle pools' block set
 
@@ -1476,8 +1480,14 @@ bool tick() {
                     static int save_trace = 240;
                     if (save_trace > 0) {
                         --save_trace;
-                        log_printf("[save] f=%d cs=0x%08x len=%u\n",
-                                   (int)e->data.save.frame, cs, n);
+                        // blobcs = checksum of the WHOLE blob as handed to
+                        // gekko. The matching [load] logs the same for the
+                        // blob gekko hands back — if they differ for a
+                        // frame, gekko's state buffer was clobbered.
+                        uint32_t blobcs =
+                            fletcher32((const uint8_t*)e->data.save.state, n);
+                        log_printf("[save] f=%d cs=0x%08x len=%u blobcs=0x%08x\n",
+                                   (int)e->data.save.frame, cs, n, blobcs);
                     }
                 }
                 // Dump the Squirrel blob for two specific frames to
@@ -1544,8 +1554,12 @@ bool tick() {
                     static int load_trace = 120;
                     if (load_trace > 0) {
                         --load_trace;
-                        log_printf("[load] f=%d len=%u\n",
-                                   (int)e->data.load.frame, e->data.load.state_len);
+                        uint32_t blobcs = fletcher32(
+                            (const uint8_t*)e->data.load.state,
+                            e->data.load.state_len);
+                        log_printf("[load] f=%d len=%u blobcs=0x%08x\n",
+                                   (int)e->data.load.frame,
+                                   e->data.load.state_len, blobcs);
                     }
                 }
                 load_state_from_buf(e->data.load.state,
