@@ -102,6 +102,24 @@ void open_log_file(const char* path) {
 void log_flush() {
 }
 
+// Crash-path synchronous drain. The worker thread owns all file I/O; on a
+// fatal fault it will not get another chance to run, so flush whatever is
+// still queued from the faulting thread. Safe to take g_log_mtx here: a
+// fault in game code is not holding it. Called from the VEH crash handler.
+void log_crash_drain() {
+    std::deque<std::string> pending;
+    {
+        std::lock_guard<std::mutex> lk(g_log_mtx);
+        pending.swap(g_log_queue);
+    }
+    for (const std::string& s : pending) {
+        if (g_log_file) fwrite(s.data(), 1, s.size(), g_log_file);
+        fwrite(s.data(), 1, s.size(), stdout);
+    }
+    if (g_log_file) fflush(g_log_file);
+    fflush(stdout);
+}
+
 // Format on the calling thread, hand the finished line to the worker.
 static void emit_va(const char* format, va_list va) {
     char stackbuf[2048];

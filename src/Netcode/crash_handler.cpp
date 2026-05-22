@@ -79,6 +79,11 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    // Flush the async log queue synchronously — the logger's worker
+    // thread will not run again, so without this the lines leading up to
+    // the crash are lost.
+    log_crash_drain();
+
     const CONTEXT*          c = ep->ContextRecord;
     const EXCEPTION_RECORD* r = ep->ExceptionRecord;
     char loc[MAX_PATH + 32];

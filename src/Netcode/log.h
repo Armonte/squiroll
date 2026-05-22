@@ -87,6 +87,10 @@ void open_log_file(const char* path);
 // Drain the buffered log + console sinks. Call once per frame, never
 // per log line — per-line flushing is what stalled the game.
 void log_flush();
+// Synchronously flush the async log queue from the faulting thread —
+// called by the VEH crash handler so a crash does not lose the last
+// (un-drained) batch of log lines.
+void log_crash_drain();
 extern "C" void cdecl tee_printf(const char* format, ...);
 extern "C" void cdecl tee_fprintf(FILE* stream, const char* format, ...);
 // Squirrel sq_setprintfunc handlers (signature: SQPRINTFUNCTION).
