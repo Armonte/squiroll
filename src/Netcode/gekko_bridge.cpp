@@ -21,7 +21,6 @@
 #include "live_actors.h"
 #include "alloc_man.h"  // sq_heap — giuroll-style Squirrel VM heap snapshot
 #include "sq_arena.h"   // Squirrel VM heap arena
-#include "cpp_arena.h"  // engine C++ battle-state arena
 #include "battle_pools.h" // C++ battle object pools
 #include "engine_snap.h"  // scheduler fixed-region snapshot
 #include <squirrel.h>
@@ -59,12 +58,19 @@ typedef char cdecl drawing_related_t();
 #define INPUT_UPDATE_LIST_PTR  ((void**)0x49AF8C_R)
 
 // Act::ScriptAPI dispatcher pointer — drives the Squirrel root frame.
+// Slot 0 is Act::ScriptAPI::Update (th155.exe 0x124870), the per-frame
+// ::loop pump. Verified against update_logic, which calls it as
+// (**(vtbl***)obj)(obj) — i.e. vtable[0]. The earlier struct placed
+// Update at slot 4, which is actually a 3-arg InterfaceObject-lookup
+// method (0x124670); calling it through a 1-arg signature left strcmp
+// reading an uninitialised-stack name pointer → intermittent crash at
+// th155.exe+0x1246C0 (READ of a garbage address).
 struct ScriptAPI_vtbl {
-    void* field_0;
-    void* field_4;   // render preprocess
-    void* field_8;   // render
-    void* field_C;
-    void (thiscall* Update)(void* self);  // ::loop pump that drives the Squirrel side
+    void (thiscall* Update)(void* self);  // slot 0 — the ::loop pump
+    void* slot_4;
+    void* slot_8;
+    void* slot_C;
+    void* slot_10;
 };
 struct ScriptAPI { ScriptAPI_vtbl* vftable; };
 // Verified via IDA list_globals: g_Act_ScriptAPI_ptr is at IDA 0x8DACFC
@@ -660,12 +666,11 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
     }
 
     // Trailer 2: arena rollback snapshot — the real restorable state.
-    // Four length-prefixed sections: sq_arena (Squirrel VM heap),
-    // cpp_arena (engine C++ allocations), battle_pools (battle object
-    // pools) and engine_snap (the scheduler's fixed-address objects,
-    // sentinels and counters). The text blob above is kept only for the
-    // value-based desync checksum; this trailer is what load() restores
-    // from when g_arena_rollback is on.
+    // Three length-prefixed sections: sq_arena (Squirrel VM heap),
+    // battle_pools (battle object pools) and engine_snap (the scheduler's
+    // fixed-address objects, sentinels and counters). The text blob above
+    // is kept only for the value-based desync checksum; this trailer is
+    // what load() restores from when g_arena_rollback is on.
     if (g_arena_rollback) {
         auto put_section = [&](const char* name, auto save_fn) -> bool {
             uint32_t off = (uint32_t)(p - static_cast<uint8_t*>(buf));
@@ -681,10 +686,9 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
             p += wrote;
             return true;
         };
-        bool ok = put_section("sq_arena",   &sq_arena::save)
-               && put_section("cpp_arena",  &cpp_arena::save)
-               && put_section("pools",      &battle_pools::save)
-               && put_section("engine",     &engine_snap::save);
+        bool ok = put_section("sq_arena", &sq_arena::save)
+               && put_section("pools",    &battle_pools::save)
+               && put_section("engine",   &engine_snap::save);
         if (!ok) {
             log_printf("[gekko_bridge] !! arena save overflow frame=%u — "
                        "bump GekkoConfig::state_size\n", frame);
@@ -692,10 +696,9 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         static uint32_t arena_log = 4;
         if (arena_log > 0) {
             --arena_log;
-            log_printf("[gekko_bridge] arena save f=%u total=%u "
-                       "(sq_used=%u cpp_used=%u)\n", frame,
-                       (uint32_t)(p - static_cast<uint8_t*>(buf)),
-                       sq_arena::used(), cpp_arena::used());
+            log_printf("[gekko_bridge] arena save f=%u total=%u sq_used=%u\n",
+                       frame, (uint32_t)(p - static_cast<uint8_t*>(buf)),
+                       sq_arena::used());
         }
     }
 
@@ -844,10 +847,10 @@ void load_state_from_buf(const void* buf, uint32_t len) {
     const uint8_t* text_blob = p + 4;
 
     // Arena rollback path — the real restore. Trailer 2 follows the text
-    // blob: four length-prefixed sections (sq_arena, cpp_arena,
-    // battle_pools, engine_snap) restored as one consistent unit. Each
-    // section is range-checked before use; a truncated section aborts
-    // the rest rather than reading past the blob.
+    // blob: three length-prefixed sections (sq_arena, battle_pools,
+    // engine_snap) restored as one consistent unit. Each section is
+    // range-checked before use; a truncated section aborts the rest
+    // rather than reading past the blob.
     if (g_arena_rollback) {
         const uint8_t* ap   = text_blob + text_len;
         const uint8_t* aend = static_cast<const uint8_t*>(buf) + len;
@@ -868,9 +871,8 @@ void load_state_from_buf(const void* buf, uint32_t len) {
             ap += slen;
             return true;
         };
-        if (get_section("sq_arena",  &sq_arena::load)  &&
-            get_section("cpp_arena", &cpp_arena::load) &&
-            get_section("pools",     &battle_pools::load)) {
+        if (get_section("sq_arena", &sq_arena::load) &&
+            get_section("pools",    &battle_pools::load)) {
             get_section("engine", &engine_snap::load);
         }
         return;
@@ -941,10 +943,11 @@ void advance_one_frame() {
     // the background half; update_logic() is the main half. Earlier this
     // function called ONLY the background half — which is why the battle
     // never advanced (demoCount frozen at 0).
-    static int log_quota = 4;
-    if (log_quota > 0) {
+    static int log_quota = 40;
+    bool trace = log_quota > 0;
+    if (trace) {
         --log_quota;
-        log_printf("[gekko_bridge] advance_one_frame: enter "
+        log_printf("[gekko_bridge] advance: enter "
                    "forced_active=%d p0=0x%04x p1=0x%04x\n",
                    (int)forced_inputs_active,
                    forced_inputs[0], forced_inputs[1]);
@@ -971,20 +974,12 @@ void advance_one_frame() {
     // per Advance — so we call RunOneFrame exactly once. We also skip
     // the PrtScn polling (GetAsyncKeyState — non-deterministic real-time
     // input) and the QPC bookkeeping (real-time pacing only).
-    // Route the engine C++ allocations made by this logical frame into
-    // the cpp_arena (the C++ half of the rollback snapshot). The gate is
-    // set ONLY across the deterministic battle-sim engine calls — actor
-    // task nodes, scheduler list/vector nodes and the like land in the
-    // arena; nothing outside this span does. Per-thread, so the audio /
-    // D3D threads are unaffected.
-    cpp_arena::set_sim_active(true);
+    if (trace) log_printf("[gekko_bridge] advance: -> update_related\n");
     update_related(*MAIN_SCRIPTAPI_PTR);                    // RunOneFrame(g_main), once
+    if (trace) log_printf("[gekko_bridge] advance: -> ScriptAPI::Update\n");
     Act_ScriptAPI_ptr->vftable->Update(Act_ScriptAPI_ptr);  // Act::ScriptAPI::Update
-    cpp_arena::set_sim_active(false);
     ++*(uint32_t*)(0x4DACE0_R);                             // g_frame_counter
-    if (log_quota > 0) {
-        log_printf("[gekko_bridge] advance_one_frame: exit\n");
-    }
+    if (trace) log_printf("[gekko_bridge] advance: exit\n");
 }
 
 void render_one_frame() {
@@ -1450,7 +1445,16 @@ bool tick() {
                 forced_inputs[0] = inputs[0];
                 forced_inputs[1] = inputs[1];
                 forced_inputs_active = true;
+                static int adv_trace = 60;
+                bool at = adv_trace > 0;
+                if (at) {
+                    --adv_trace;
+                    log_printf("[adv] >>> frame=%d rb=%d p0=0x%04x p1=0x%04x\n",
+                               e->data.adv.frame, (int)e->data.adv.rolling_back,
+                               inputs[0], inputs[1]);
+                }
                 advance_one_frame();
+                if (at) log_printf("[adv] <<< frame=%d done\n", e->data.adv.frame);
                 forced_inputs_active = false;
                 advanced = true;
                 if (g_evt_trace > 0) {
