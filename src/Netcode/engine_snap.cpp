@@ -133,6 +133,22 @@ static int collect(Region* r) {
     uintptr_t ptd = TH155_ACRT_GETPTD();
     if (ptd) add((void*)(ptd + CRT_HOLDRAND_OFF), 4);
 
+    // MSVC C++ per-thread static-init epoch. Magic-static guards in th155
+    // do `if (guard > *(*TLSP + 4))` to decide whether to run their init.
+    // The epoch lives in TLS slot 0 (NOT the CRT ptd; that's a different
+    // block holding rand etc.). Without this captured, a magic static that
+    // runs during the forward pass advances the thread epoch; rollback
+    // restores the guard but NOT the per-thread epoch, so the re-sim of
+    // the same frame sees `guard <= epoch` and SKIPS the init — a
+    // different code path that diverges the simulation (proven by
+    // btDbvtBroadphase_createProxy firing only on forward, never re-sims).
+    {
+        // TIB layout (32-bit): offset 0x2C = ThreadLocalStoragePointer.
+        // __readfsdword reads it directly without needing _TEB defined.
+        void** tlsa = (void**)__readfsdword(0x2C);
+        if (tlsa && tlsa[0]) add((char*)tlsa[0] + 4, 4);
+    }
+
     // DirectInput keyboard state table (see KBD_STATE_ADDR above).
     add(KBD_STATE_ADDR, KBD_STATE_BYTES);
     return n;

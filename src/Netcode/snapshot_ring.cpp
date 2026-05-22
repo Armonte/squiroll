@@ -46,7 +46,26 @@ struct Slot {
     // to pin the FRAME and PAGES where the re-sim's output diverges from
     // the forward run's — no arbitrary threshold, every frame is checked.
     uint32_t* phash_snap[NARENA];
+    // DIAGNOSTIC: full 4 KB byte shadow of specific known-divergent pages,
+    // populated at first capture so a re-capture byte-diffs to show the
+    // exact dwords that diverged. Hardcoded list — see TARGET_PAGES.
+    uint8_t*  page_snap[8];      // up to 8 targeted pages
 };
+
+// Hardcoded list of divergent (arena, byte-offset) pages identified by the
+// per-frame phash-snap diagnostic. Targeted byte-level shadow runs only on
+// these — tiny (≈ 8 × 4 KB × RING ≈ 384 KB) but produces forward-vs-re-sim
+// bytes at the bytes that matter, no big shadow buffer needed.
+static const struct { int arena; uint32_t off; } TARGET_PAGES[] = {
+    { 0 /*sq*/, 0x9EE000 },
+    { 0,        0xBF5000 },
+    { 1 /*bt*/, 0x480000 },
+    { 1,        0x680000 },
+    { 1,        0x740000 },
+    { 1,        0x741000 },
+    { 1,        0x742000 },
+};
+static constexpr int N_TARGETS = (int)(sizeof(TARGET_PAGES) / sizeof(TARGET_PAGES[0]));
 static Slot    g_ring[RING];
 static bool    g_armed = false;
 static int64_t g_cur   = -1;       // frame the live arenas currently hold
@@ -133,6 +152,12 @@ void arm() {
                                   g_ar[a].npages * 4u,
                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!S.phash_snap[a]) delta_ok = false;
+        }
+        // DIAGNOSTIC: per-target-page byte shadows (4 KB each).
+        for (int i = 0; i < N_TARGETS; ++i) {
+            S.page_snap[i] = (uint8_t*)VirtualAlloc(nullptr, PAGE,
+                                  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (!S.page_snap[i]) delta_ok = false;
         }
         if (!S.sblob || !delta_ok) {
             log_printf("[snapshot_ring] !! arm: ring slot %d alloc failed\n", s);
@@ -322,15 +347,45 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                            frame, totalp);
                 first_dump_done = true;
             }
-            // Refresh the snapshot to the new (re-sim) value — so any
+            // Targeted byte-diff on the hardcoded TARGET_PAGES — produces
+            // FORWARD vs RE-SIM dwords for the pages we already know diverge.
+            for (int i = 0; i < N_TARGETS; ++i) {
+                int       a   = TARGET_PAGES[i].arena;
+                uint32_t  off = TARGET_PAGES[i].off;
+                if (off + PAGE > g_ar[a].size) continue;
+                const uint8_t* shadow = S.page_snap[i];
+                const uint8_t* live   = g_ar[a].base + off;
+                int dh = 0;
+                for (uint32_t k = 0; k + 4 <= PAGE && dh < 5; k += 4) {
+                    uint32_t sv = *(const uint32_t*)(shadow + k);
+                    uint32_t lv = *(const uint32_t*)(live   + k);
+                    if (sv != lv) {
+                        log_printf("[divbyte] %s f=%u off=0x%X+0x%X fwd=%08x now=%08x\n",
+                                   names[a], frame, off, k, sv, lv);
+                        ++dh;
+                    }
+                }
+            }
+            // Refresh ALL snapshots to the new (re-sim) value — so any
             // subsequent re-capture detects only NEW divergences.
             for (int a = 0; a < NARENA; ++a)
                 memcpy(S.phash_snap[a], g_ar[a].phash, g_ar[a].npages * 4);
+            for (int i = 0; i < N_TARGETS; ++i) {
+                int a = TARGET_PAGES[i].arena; uint32_t off = TARGET_PAGES[i].off;
+                if (off + PAGE <= g_ar[a].size)
+                    memcpy(S.page_snap[i], g_ar[a].base + off, PAGE);
+            }
         } else {
             // First capture (forward) of this frame in the current ring
-            // window — snapshot the per-page hashes for later comparison.
+            // window — snapshot the per-page hashes AND the target page bytes
+            // for later comparison.
             for (int a = 0; a < NARENA; ++a)
                 memcpy(S.phash_snap[a], g_ar[a].phash, g_ar[a].npages * 4);
+            for (int i = 0; i < N_TARGETS; ++i) {
+                int a = TARGET_PAGES[i].arena; uint32_t off = TARGET_PAGES[i].off;
+                if (off + PAGE <= g_ar[a].size)
+                    memcpy(S.page_snap[i], g_ar[a].base + off, PAGE);
+            }
         }
     }
 
