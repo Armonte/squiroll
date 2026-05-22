@@ -16,6 +16,29 @@ namespace {
 #define G_FRAME_COUNTER  ((void*)(0x4DACE0_R))   // ++ per logical frame
 #define G_ACTOR_TASK_ID  ((void*)(0x4DB068_R))   // Actor2D SetTask* id ctr
 
+// th155 CRT __acrt_getptd() — returns the calling thread's per-thread data
+// block. The CRT rand() seed (_holdrand) lives at offset 0x18 within it.
+// Squirrel's global rand()/srand() (the battle PRNG) wrap this CRT rand;
+// ~150 actor scripts pick animation takes via rand()%N, so the seed MUST be
+// part of the rollback snapshot or a re-sim desyncs (wrong takes, wrong AI
+// branches). save/load run on the battle thread — the same thread the
+// scripts' rand() runs on — so getptd() resolves the same ptd here.
+typedef uintptr_t (*acrt_getptd_t)();
+#define TH155_ACRT_GETPTD ((acrt_getptd_t)(0x319663_R))
+static constexpr uint32_t CRT_HOLDRAND_OFF = 0x18;
+
+// byte_4DAF00 — th155's DirectInput keyboard state table, 256 key bytes
+// (high bit = key down; sub_3B850 fills it via IDirectInputDevice8::
+// GetDeviceState). The battle's input decode (sub_1687D0) reads it every
+// frame to build per-button held-frame counters in the InputSingle pool
+// objects. It is polled from the LIVE keyboard once per real frame, so a
+// rollback re-sims a logical frame across several real frames — without
+// capture, the re-sim reads whatever the keyboard is NOW, and a physical
+// keypress landing between a forward frame and its re-sim desyncs the
+// input decode (verified: held-counter divergence at InputSingle obj+0x10).
+#define KBD_STATE_ADDR  ((void*)(0x4DAF00_R))
+static constexpr uint32_t KBD_STATE_BYTES = 256;
+
 // Act::ScriptAPI object size — operator new(0x108) at init.
 static constexpr uint32_t SCRIPTAPI_BYTES = 0x108;
 // Its four std::list members: _Myhead (sentinel ptr) lives at these
@@ -89,6 +112,13 @@ static int collect(Region* r) {
     // Determinism scalars.
     add(G_FRAME_COUNTER, 4);
     add(G_ACTOR_TASK_ID, 4);
+
+    // CRT rand() seed — the global battle PRNG (see TH155_ACRT_GETPTD above).
+    uintptr_t ptd = TH155_ACRT_GETPTD();
+    if (ptd) add((void*)(ptd + CRT_HOLDRAND_OFF), 4);
+
+    // DirectInput keyboard state table (see KBD_STATE_ADDR above).
+    add(KBD_STATE_ADDR, KBD_STATE_BYTES);
     return n;
 }
 

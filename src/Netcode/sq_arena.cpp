@@ -187,8 +187,11 @@ static void cdecl hook_free(void* block) {
 void install(uintptr_t sq_code_lo, uintptr_t sq_code_hi) {
     if (g_installed) return;
 
+    // MEM_WRITE_WATCH: snapshot_ring tracks which pages each frame dirties,
+    // so a rollback snapshot copies only what changed, not the whole arena.
     g_base = (uint8_t*)VirtualAlloc(nullptr, ARENA_SIZE,
-                                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                                    MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH,
+                                    PAGE_READWRITE);
     if (!g_base) {
         log_printf("[sq_arena] !! VirtualAlloc(%u) failed — VM stays on CRT heap\n",
                    ARENA_SIZE);

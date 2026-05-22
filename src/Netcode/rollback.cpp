@@ -9,6 +9,7 @@
 #include "util.h"
 #include "kite_api.h"
 #include "log.h"
+#include "sq_arena.h"
 
 using namespace std::string_view_literals;
 
@@ -431,6 +432,124 @@ static void dump_test() {
 
     size_t roll_idx = rollback_cur_frame & ROLLBACK_FRAME_MASK;
     FrameUndo& delta = rollback_deltas[roll_idx];
+}
+
+// ----------------------------------------------------------------------------
+// LAYER-4 DIAGNOSTIC — identify the diverging Squirrel object.
+//
+// sq_page_diff (gekko_bridge.cpp) byte-diffs the forward vs re-sim sq_arena
+// blob and hands us the first diverging offset. The diff lands inside a
+// Squirrel class INSTANCE whose integer members are populated forward but
+// stay 0 on re-sim. This walks the arena block at that offset as an
+// SQInstance, resolves its SQClass -> _members table, and prints every
+// member NAME with its forward/re-sim value so the script class can be
+// identified and the populating code traced.
+//
+// The sq_arena blob is a raw memcpy of [arena_base, arena_base+bump): so a
+// blob offset IS an arena offset, and a runtime pointer stored in any object
+// equals arena_base + offset.
+void rollback_identify_sqdiff(const void* fwd_blob, const void* resim_blob,
+                              uint32_t blob_len, uint32_t diff_off) {
+    const uint8_t* fwd   = (const uint8_t*)fwd_blob;
+    const uint8_t* resim = (const uint8_t*)resim_blob;
+    const uint8_t* abase = sq_arena::base();
+    if (!abase || !fwd || !resim) { log_printf("[sqid] missing arena/blob\n"); return; }
+
+    const uintptr_t ABASE = (uintptr_t)abase;
+    const uint32_t  ASIZE = 64u * 1024 * 1024;
+    auto to_off = [&](const void* p) -> uint32_t {
+        uintptr_t u = (uintptr_t)p;
+        if (u < ABASE || u >= ABASE + ASIZE) return 0xFFFFFFFFu;
+        uint32_t o = (uint32_t)(u - ABASE);
+        return (o + 4 <= blob_len) ? o : 0xFFFFFFFFu;
+    };
+
+    // 1. Find the arena block whose payload contains diff_off.
+    //    Block = [Hdr(16)][payload]; Hdr.magic('SQAB') sits at payload-4.
+    const uint32_t MAGIC = 0x53514142;
+    uint32_t P = diff_off & ~0xFu;
+    bool found = false;
+    while (P >= 16) {
+        if (*(const uint32_t*)(resim + P - 4) == MAGIC) {
+            uint32_t cls = *(const uint32_t*)(resim + P - 16);
+            uint32_t req = *(const uint32_t*)(resim + P - 12);
+            if (cls >= 4 && cls <= 24 && diff_off >= P && diff_off < P + req) {
+                found = true;
+                break;
+            }
+        }
+        P -= 16;
+    }
+    if (!found) {
+        log_printf("[sqid] no arena block header found for diff @0x%X\n", diff_off);
+        return;
+    }
+    uint32_t reqsize = *(const uint32_t*)(resim + P - 12);
+    log_printf("[sqid] block payload @0x%X reqsize=%u  diff @0x%X (+0x%X into payload)\n",
+               P, reqsize, diff_off, diff_off - P);
+
+    // 2. Interpret the payload as an SQInstance.
+    const SQInstance* fi = (const SQInstance*)(fwd   + P);
+    const SQInstance* ri = (const SQInstance*)(resim + P);
+    uint32_t clsoff = to_off(ri->_class);
+    log_printf("[sqid] SQInstance _memsize=%d _class=%p (arena off 0x%X)  objsz=%u\n",
+               ri->_memsize, ri->_class, clsoff, (unsigned)sizeof(SQObject));
+    if (clsoff == 0xFFFFFFFFu) {
+        log_printf("[sqid] _class ptr not in arena — block is not an SQInstance\n");
+        return;
+    }
+    const SQClass* cls = (const SQClass*)(resim + clsoff);
+    uint32_t memoff = to_off(cls->_members);
+    if (memoff == 0xFFFFFFFFu) { log_printf("[sqid] _members not in arena\n"); return; }
+    const SQTable* mt = (const SQTable*)(resim + memoff);
+    uint32_t nodesoff = to_off(mt->_nodes);
+    log_printf("[sqid] SQClass _members: numnodes=%d usednodes=%d\n",
+               mt->_numofnodes, mt->_usednodes);
+    if (nodesoff == 0xFFFFFFFFu) { log_printf("[sqid] _nodes not in arena\n"); return; }
+
+    // 3. Walk every member; for each FIELD print name + forward/re-sim value.
+    const SQTable::_HashNode* nodes = (const SQTable::_HashNode*)(resim + nodesoff);
+    int nn = mt->_numofnodes;
+    if (nn < 0 || nn > 1024) { log_printf("[sqid] bad numofnodes\n"); return; }
+    log_printf("[sqid] ======== member dump ========\n");
+    int ndiff = 0;
+    for (int i = 0; i < nn; ++i) {
+        const SQObject& key = nodes[i].key;
+        const SQObject& val = nodes[i].val;
+        if (key._type != OT_STRING) continue;
+        uint32_t soff = to_off(key._unVal.pString);
+        const char* name = "<?>";
+        if (soff != 0xFFFFFFFFu)
+            name = ((const SQString*)(resim + soff))->_val;
+        SQInteger packed = val._unVal.nInteger;
+        if (packed & MEMBER_TYPE_METHOD) {
+            log_printf("[sqid]   method   %s\n", name);
+            continue;
+        }
+        uint32_t idx = (uint32_t)(packed & 0x00FFFFFF);
+        const SQObject& fv = fi->_values[idx];
+        const SQObject& rv = ri->_values[idx];
+        bool d = (fv._type != rv._type) ||
+                 (fv._unVal.nInteger != rv._unVal.nInteger);
+        if (d) ++ndiff;
+        log_printf("[sqid]   field[%2u] %-26s fwd={t=%08X v=%d} "
+                   "resim={t=%08X v=%d}%s\n",
+                   idx, name, fv._type, (int)fv._unVal.nInteger,
+                   rv._type, (int)rv._unVal.nInteger, d ? "   <<< DIFF" : "");
+        // For an OT_INSTANCE field, follow it and print the C++ object it
+        // wraps (_userpointer) — identifies Sqrat-bound engine objects.
+        if (rv._type == OT_INSTANCE) {
+            uint32_t io = to_off(rv._unVal.pInstance);
+            if (io != 0xFFFFFFFFu) {
+                const SQInstance* in2 = (const SQInstance*)(resim + io);
+                log_printf("[sqid]       -> SQInstance@%p _class=%p "
+                           "_userpointer(C++)=%p\n",
+                           rv._unVal.pInstance, in2->_class,
+                           in2->_userpointer);
+            }
+        }
+    }
+    log_printf("[sqid] ======== %d field(s) diverge ========\n", ndiff);
 }
 
 void rollback_rewind(size_t frames) {

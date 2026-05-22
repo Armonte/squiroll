@@ -24,6 +24,9 @@
 #include "focus_input.h"
 #include "crash_handler.h"
 #include "sq_arena.h"
+#include "cpp_arena.h"
+#include "bullet_arena.h"
+#include "input_hist.h"
 #include "sq_trace.h"
 
 #include <shared.h>
@@ -141,18 +144,11 @@ plugin_load_end:
 static void patch_se_libact(void* base_address) {
     libact_base_address = (uintptr_t)base_address;
 
-#if ALLOCATION_PATCH_TYPE == PATCH_SQUIRREL_ALLOCS
-    hotpatch_rel32(based_pointer(base_address, 0xC4BE5), my_malloc);
-    hotpatch_rel32(based_pointer(base_address, 0xC4C89), my_realloc);
-    hotpatch_rel32(based_pointer(base_address, 0xC4C75), my_free);
-#elif ALLOCATION_PATCH_TYPE == PATCH_ALL_ALLOCS
-    hotpatch_jump(based_pointer(base_address, 0x134632), my_malloc);
-    hotpatch_jump(based_pointer(base_address, 0x12C67B), my_calloc);
-    hotpatch_jump(based_pointer(base_address, 0x13BD53), my_realloc);
-    hotpatch_jump(based_pointer(base_address, 0x12C6D8), my_free);
-    hotpatch_jump(based_pointer(base_address, 0x138F44), my_recalloc);
-    hotpatch_jump(based_pointer(base_address, 0x141C26), my_msize);
-#endif
+    // (The old alloc_man my_malloc/my_free hotpatches lived here. Removed:
+    // the rollback heap snapshot is sq_arena — which hooks the Squirrel
+    // allocator wrappers and captures the whole Squirrel subsystem — plus
+    // cpp_arena for std::list nodes. alloc_man/sq_heap was the superseded
+    // tracking approach and is no longer part of the rollback path.)
 
     hotpatch_rel32(based_pointer(base_address, 0x15F7C), patch_act_script_plugin);
 };
@@ -317,6 +313,26 @@ bool common_init(
     // common_init is well before that. (Supersedes the old alloc_man
     // patch_allocman() tracking approach.)
     sq_arena::install(0x17FDB0_R, 0x1A6000_R);
+
+    // Route every std::list node (Act::ScriptAPI task lists, Actor2DProcGroup,
+    // ...) into a fixed arena (cpp_arena) so the per-frame list churn is part
+    // of the rollback snapshot. Hooks _Buynode0 (node alloc) + _free_base
+    // (free). Must run before the battle's lists are populated — common_init
+    // is well before vs.Initialize.
+    cpp_arena::install();
+
+    // Route th155's Bullet physics heap into a captured arena. Bullet's two
+    // base allocator fn-pointers (0x498D44 alloc / 0x498D48 free) are
+    // overwritten; the aligned wrappers delegate to them, so the whole
+    // physics heap — collision world, broadphase, shapes, and the per-sprite
+    // ActorCollisionData hitbox shapes — lands in the snapshot. Must run
+    // before th155 creates any Bullet object; common_init is well before.
+    bullet_arena::install();
+
+    // Hook input_history_u16__append so input_hist can discover the per-player
+    // input-history objects (uncaptured th155-heap state — the cpp_arena
+    // rollback divergence). Must be live before the battle starts appending.
+    input_hist::install();
 
     // Diagnostic: catch the dual-rollback crash (SQInstance member-get on
     // a class whose _members table is NULL) at its source, logging the

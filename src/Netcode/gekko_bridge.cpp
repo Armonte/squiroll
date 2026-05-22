@@ -19,10 +19,14 @@
 #include "log.h"
 #include "Actor2D.h"
 #include "live_actors.h"
-#include "alloc_man.h"  // sq_heap — giuroll-style Squirrel VM heap snapshot
-#include "sq_arena.h"   // Squirrel VM heap arena
-#include "battle_pools.h" // C++ battle object pools
-#include "engine_snap.h"  // scheduler fixed-region snapshot
+#include "sq_arena.h"      // Squirrel subsystem arena (objects + VM + stacks)
+#include "battle_pools.h"  // TF4 TPoolAllocator battle objects
+#include "engine_snap.h"   // scheduler fixed-region snapshot
+#include "cpp_arena.h"     // C++ std::list node arena
+#include "bullet_arena.h"  // Bullet physics heap arena
+#include "snapshot_ring.h" // dirty-page rollback snapshot for the big arenas
+#include "input_hist.h"    // per-player input-history capture
+#include "rollback.h"      // layer-4 sq-diff identifier
 #include <squirrel.h>
 // squiroll routes every sq_* call through a runtime-filled KITE table —
 // without this header the bare sq_pushroottable etc. show up as undefined
@@ -604,7 +608,7 @@ static int blob_extract_count(const uint8_t* blob, uint32_t len) {
 
 // Header magic + version: bump version whenever the layout changes.
 static constexpr uint32_t SAVE_MAGIC   = 0x46414B47; // 'GKAF'
-static constexpr uint32_t SAVE_VERSION = 4;          // v4: + anim controller snapshot
+static constexpr uint32_t SAVE_VERSION = 5;          // v5: snapshot_ring (blob = header only)
 
 // ManbowActor2D::anim_controller is a std::shared_ptr at +0x3C; its first
 // 4 bytes are the ManbowAnimationController2D*.
@@ -671,6 +675,18 @@ static bool g_sq_save_enabled = true;
 // walker for restore (non-crashing, but lossy — only used for bring-up).
 static bool g_arena_rollback = true;
 
+// input-recorder snapshot section (defined after inject_forced_inputs).
+static uint32_t input_rec_save(uint8_t* out, uint32_t cap);
+static void     input_rec_load(const uint8_t* blob, uint32_t len);
+
+// perf probe — accumulate QPC ticks spent in save / load / advance, logged
+// as average microseconds per call. Shows whether the stress-rig frame time
+// is the snapshot or the 9x game simulation.
+static uint64_t g_perf_save = 0, g_perf_load = 0, g_perf_adv = 0;
+static uint32_t g_perf_nsave = 0, g_perf_nload = 0, g_perf_nadv = 0;
+// save split: small-section serialization vs snapshot_ring::capture.
+static uint64_t g_perf_sblob = 0, g_perf_cap = 0;
+
 uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                            uint32_t frame) {
     if (cap < sizeof(SaveHeader)) return 0;
@@ -690,6 +706,49 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
     ManbowActor2D* actors[MAX_ACTORS];
     size_t n = g_arena_rollback ? 0 : live_actors::snapshot(actors, MAX_ACTORS);
     hdr->actor_count = (uint32_t)n;
+
+    // Arena rollback: the two big arenas (sq_arena, bullet_arena) are
+    // dirty-page snapshotted by snapshot_ring; the small sections (battle
+    // pools, cpp_arena, engine, input) go in as one ~1 MB blob. The GekkoNet
+    // blob is then just the SaveHeader — hdr->frame is the ring handle, so
+    // GekkoNet never copies the 22 MB of state. See snapshot_ring.h.
+    if (g_arena_rollback && snapshot_ring::armed()) {
+        static uint8_t* smb = nullptr;
+        static constexpr uint32_t SMB_CAP = 4u * 1024 * 1024;
+        if (!smb) smb = (uint8_t*)VirtualAlloc(nullptr, SMB_CAP,
+                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        uint8_t* sp = smb;
+        bool ok = smb != nullptr;
+        auto sect = [&](auto save_fn) {
+            if (!ok || sp + 4 > smb + SMB_CAP) { ok = false; return; }
+            uint32_t* lf = (uint32_t*)sp;
+            sp += 4;
+            uint32_t w = save_fn(sp, (uint32_t)(smb + SMB_CAP - sp));
+            if (w == 0) { ok = false; return; }
+            *lf = w;
+            sp += w;
+        };
+        LARGE_INTEGER _c0; QueryPerformanceCounter(&_c0);
+        sect(&battle_pools::save);
+        sect(&cpp_arena::save);
+        sect(&engine_snap::save);
+        sect(&input_rec_save);
+        sect(&input_hist::save);
+        if (!ok) {
+            log_printf("[gekko_bridge] !! small-section save overflow f=%u\n",
+                       frame);
+            if (out_checksum) *out_checksum = 0;
+            return sizeof(SaveHeader);
+        }
+        LARGE_INTEGER _c1; QueryPerformanceCounter(&_c1);
+        uint32_t cs = snapshot_ring::capture(frame, smb,
+                                             (uint32_t)(sp - smb));
+        LARGE_INTEGER _c2; QueryPerformanceCounter(&_c2);
+        g_perf_sblob += (uint64_t)(_c1.QuadPart - _c0.QuadPart);
+        g_perf_cap   += (uint64_t)(_c2.QuadPart - _c1.QuadPart);
+        if (out_checksum) *out_checksum = cs;
+        return sizeof(SaveHeader);
+    }
 
     p += sizeof(SaveHeader);
     uint32_t remaining = cap - sizeof(SaveHeader);
@@ -720,26 +779,25 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
     }
 
     // Trailer 1: [uint32 text_len][text blob]. The value-based Squirrel
-    // walker. Kept ONLY to compute the desync checksum — it encodes
-    // value-by-value (no raw addresses) so it is identical cross-peer when
-    // state matches. It is NOT used to restore state anymore (the raw
-    // sq_heap snapshot below does that, losslessly).
+    // walker — LEGACY. It is the restore mechanism ONLY when arena rollback
+    // is off (bring-up fallback). With arena rollback ON it MUST NOT run:
+    // `save_battle` mutates Squirrel VM state (it parks closures + clones
+    // into `__gekko_state._keep`, allocating arena objects and shifting
+    // refcounts). Those mutations land inside the sq_arena snapshot, so a
+    // re-sim — which re-saves each rolled-back frame — runs `save_battle`
+    // extra times vs the forward pass and the arena diverges (an SQClosure
+    // refcount drifts +1). The save callback must be a pure read; the raw
+    // arena snapshots in Trailer 2 are the real, lossless restorable state.
     uint32_t actors_end = (uint32_t)(p - static_cast<uint8_t*>(buf));
     if (actors_end + 4 > cap) return actors_end;
     uint32_t* sq_len_field = (uint32_t*)p;
     p += 4;
     uint32_t sq_cap = (cap - actors_end - 4);
     uint8_t* text_blob = p;
-    uint32_t sq_n = g_sq_save_enabled ? call_squirrel_save(p, sq_cap, frame) : 0;
+    uint32_t sq_n = (g_sq_save_enabled && !g_arena_rollback)
+                        ? call_squirrel_save(p, sq_cap, frame) : 0;
     *sq_len_field = sq_n;
     p += sq_n;
-
-    if (out_checksum) {
-        // Checksum the value-based text blob — address-independent, so two
-        // peers (or a speculative save vs a rollback re-sim) produce the
-        // same checksum whenever the logical state matches.
-        *out_checksum = sq_n > 0 ? fletcher32(text_blob, sq_n) : 0;
-    }
 
     // Trailer 2: arena rollback snapshot — the real restorable state.
     // Three length-prefixed sections: sq_arena (Squirrel VM heap),
@@ -747,6 +805,7 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
     // fixed-address objects, sentinels and counters). The text blob above
     // is kept only for the value-based desync checksum; this trailer is
     // what load() restores from when g_arena_rollback is on.
+    uint8_t* trailer2_start = p;
     if (g_arena_rollback) {
         auto put_section = [&](const char* name, auto save_fn) -> bool {
             uint32_t off = (uint32_t)(p - static_cast<uint8_t*>(buf));
@@ -758,13 +817,26 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
             uint32_t* len_field = (uint32_t*)p;
             p += 4;
             uint32_t wrote = save_fn(p, cap - off - 4);
+            // Every section's save() returns 0 only on overflow — a valid
+            // section is never empty. Treat 0 as a hard failure instead of
+            // silently writing a 0-length (skipped-on-load) section.
+            if (wrote == 0) {
+                log_printf("[gekko_bridge] !! section '%s' save overflowed "
+                           "(avail=%u) — bump state_size\n",
+                           name, cap - off - 4);
+                *len_field = 0;
+                return false;
+            }
             *len_field = wrote;
             p += wrote;
             return true;
         };
-        bool ok = put_section("sq_arena", &sq_arena::save)
-               && put_section("pools",    &battle_pools::save)
-               && put_section("engine",   &engine_snap::save);
+        bool ok = put_section("sq_arena",  &sq_arena::save)
+               && put_section("pools",     &battle_pools::save)
+               && put_section("engine",    &engine_snap::save)
+               && put_section("cpp_arena", &cpp_arena::save)
+               && put_section("bullet",    &bullet_arena::save)
+               && put_section("input",     &input_rec_save);
         if (!ok) {
             log_printf("[gekko_bridge] !! arena save overflow frame=%u — "
                        "bump GekkoConfig::state_size\n", frame);
@@ -779,6 +851,21 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
     }
 
     uint32_t written = (uint32_t)(p - static_cast<uint8_t*>(buf));
+
+    if (out_checksum) {
+        // Desync checksum. With arena rollback on, checksum the Trailer-2
+        // sections — that is the exact, deterministic state load() restores
+        // from (the arena allocators make addresses reproducible, so a
+        // forward save and its rollback re-sim of the same frame produce
+        // identical bytes when the logical state matches). With arena
+        // rollback off, fall back to the legacy value-based text blob.
+        if (g_arena_rollback) {
+            *out_checksum = fletcher32(trailer2_start,
+                                       (size_t)(p - trailer2_start));
+        } else {
+            *out_checksum = sq_n > 0 ? fletcher32(text_blob, sq_n) : 0;
+        }
+    }
     return written;
 }
 
@@ -796,6 +883,31 @@ void load_state_from_buf(const void* buf, uint32_t len) {
 
     acrt_getptd()->rand_state = hdr->rand_state;
     // TODO: restore frame counter if/where it lives
+
+    // Arena rollback: roll the big arenas back via snapshot_ring and restore
+    // the small sections from that frame's blob. See save_state_to_buf.
+    if (g_arena_rollback && snapshot_ring::armed()) {
+        uint32_t sl = 0;
+        const uint8_t* sblob = snapshot_ring::restore(hdr->frame, &sl);
+        if (sblob) {
+            const uint8_t* sp   = sblob;
+            const uint8_t* send = sblob + sl;
+            auto sect = [&](auto load_fn) {
+                if (sp + 4 > send) return;
+                uint32_t w = *(const uint32_t*)sp;
+                sp += 4;
+                if (sp + w > send) return;
+                load_fn(sp, w);
+                sp += w;
+            };
+            sect(&battle_pools::load);
+            sect(&cpp_arena::load);
+            sect(&engine_snap::load);
+            sect(&input_rec_load);
+            sect(&input_hist::load);
+        }
+        return;
+    }
 
     const uint8_t* p = static_cast<const uint8_t*>(buf) + sizeof(SaveHeader);
     uint32_t need = hdr->actor_count * (uint32_t)sizeof(ActorRecord);
@@ -949,7 +1061,10 @@ void load_state_from_buf(const void* buf, uint32_t len) {
         };
         if (get_section("sq_arena", &sq_arena::load) &&
             get_section("pools",    &battle_pools::load)) {
-            get_section("engine", &engine_snap::load);
+            if (get_section("engine", &engine_snap::load) &&
+                get_section("cpp_arena", &cpp_arena::load) &&
+                get_section("bullet", &bullet_arena::load))
+                get_section("input", &input_rec_load);
         }
         return;
     }
@@ -960,6 +1075,202 @@ void load_state_from_buf(const void* buf, uint32_t len) {
         (size_t)(text_blob - static_cast<const uint8_t*>(buf)) + text_len <= len) {
         call_squirrel_load(text_blob, text_len, hdr->frame);
     }
+}
+
+// DIAGNOSTIC — fingerprint the whole rollback state at the top of an
+// advance. Re-serialises each snapshot section from live memory and logs
+// --- sq_arena divergence locator -----------------------------------------
+// Layer 4: with the C++ side deterministic, the ONLY section that diverges
+// on re-sim is sq_arena (the Squirrel VM heap), inside RunOneFrame. This
+// keeps each forward frame's full sq_arena blob and, on a re-sim of the same
+// frame, byte-diffs them — reporting the first diverging offset and dumping
+// the surrounding DWORDs (fwd vs resim) so the Squirrel object that went
+// non-deterministic can be identified.
+namespace {
+static constexpr int      SQ_DIFF_RING = 8;       // covers the first rollback
+static constexpr uint32_t SQ_BLOB_CAP  = 20u * 1024 * 1024;
+struct SqBlobEntry { int frame; uint32_t len; uint8_t* buf; };
+static SqBlobEntry g_sqpd[SQ_DIFF_RING];
+static bool        g_sqpd_init = false;
+static bool        g_sqpd_done = false;
+
+static void sq_page_diff(const uint8_t* blob, uint32_t len, int frame, int rb) {
+    if (g_sqpd_done || frame < 0 || !blob || !len) return;
+    if (!g_sqpd_init) {
+        for (int i = 0; i < SQ_DIFF_RING; ++i) {
+            g_sqpd[i].frame = -1;
+            g_sqpd[i].buf   = (uint8_t*)VirtualAlloc(
+                nullptr, SQ_BLOB_CAP, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        }
+        g_sqpd_init = true;
+    }
+    SqBlobEntry& e = g_sqpd[((frame % SQ_DIFF_RING) + SQ_DIFF_RING) % SQ_DIFF_RING];
+    if (!e.buf || len > SQ_BLOB_CAP) return;
+
+    if (rb == 0) {                       // forward — store
+        memcpy(e.buf, blob, len);
+        e.frame = frame;
+        e.len   = len;
+        return;
+    }
+    if (e.frame != frame || e.len == 0) return;   // re-sim — compare
+    uint32_t d = 0, m = len < e.len ? len : e.len;
+    while (d < m && e.buf[d] == blob[d]) ++d;
+    if (d >= m && len == e.len) return;           // identical
+    g_sqpd_done = true;
+    log_printf("[sqdiff] *** sq_arena DIVERGES frame=%d  first-diff @0x%X  "
+               "(fwd-len=%u resim-len=%u)\n", frame, d, e.len, len);
+    uint32_t base = d > 0x40 ? (d - 0x40) & ~0xFu : 0;
+    for (uint32_t o = base; o < base + 0xC0 && o + 4 <= m; o += 4) {
+        uint32_t fv = *(const uint32_t*)(e.buf + o);
+        uint32_t rv = *(const uint32_t*)(blob + o);
+        log_printf("[sqdiff]   @0x%X  fwd=%08X  resim=%08X %s\n",
+                   o, fv, rv, fv != rv ? "<-- DIFF" : "");
+    }
+    // Layer-4: resolve the diverging arena block to a named Squirrel class.
+    rollback_identify_sqdiff(e.buf, blob, m, d);
+    // Dump the engine input devices so the diverging InputCommand.device
+    // can be matched against what input_rec_save captures.
+    if (g_active_input_session) {
+        log_printf("[sqid] session local_input=%p device_vec.size=%u\n",
+                   g_active_input_session->local_input,
+                   (unsigned)g_active_input_session->device_vec.size());
+        for (size_t i = 0; i < g_active_input_session->device_vec.size(); ++i)
+            log_printf("[sqid]   device_vec[%zu]=%p\n",
+                       i, g_active_input_session->device_vec[i].get());
+        auto* rec = g_active_input_session->input_recorder.get();
+        if (rec) {
+            for (size_t i = 0; i < rec->devices.size(); ++i) {
+                auto* dd = rec->devices[i].get();
+                log_printf("[sqid]   recorder dev[%zu]=%p tf4_device=%p\n",
+                           i, dd, dd ? dd->tf4_device : nullptr);
+            }
+        }
+    }
+}
+// --- cpp_arena divergence locator (mirrors sq_page_diff) -----------------
+// cpp_arena toggles between two fingerprints on re-sim — a tiny operator-new
+// / free divergence. This keeps each forward frame's cpp_arena blob and, on a
+// re-sim, byte-diffs it, decoding the first diff to a Meta field or an arena
+// block (its Hdr: size-class, reqsize, allocated/free).
+static constexpr int      CPP_DIFF_RING = 8;
+static constexpr uint32_t CPP_BLOB_CAP  = 4u * 1024 * 1024;
+struct CppBlobEntry { int frame; uint32_t len; uint8_t* buf; };
+static CppBlobEntry g_cppd[CPP_DIFF_RING];
+static bool         g_cppd_init = false;
+static bool         g_cppd_done = false;
+
+static void cpp_page_diff(const uint8_t* blob, uint32_t len, int frame, int rb) {
+    if (g_cppd_done || frame < 0 || !blob || !len) return;
+    if (!g_cppd_init) {
+        for (int i = 0; i < CPP_DIFF_RING; ++i) {
+            g_cppd[i].frame = -1;
+            g_cppd[i].buf = (uint8_t*)VirtualAlloc(nullptr, CPP_BLOB_CAP,
+                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        }
+        g_cppd_init = true;
+    }
+    CppBlobEntry& e = g_cppd[((frame % CPP_DIFF_RING) + CPP_DIFF_RING) % CPP_DIFF_RING];
+    if (!e.buf || len > CPP_BLOB_CAP) return;
+    if (rb == 0) { memcpy(e.buf, blob, len); e.frame = frame; e.len = len; return; }
+    if (e.frame != frame || e.len == 0) return;
+    uint32_t d = 0, m = len < e.len ? len : e.len;
+    while (d < m && e.buf[d] == blob[d]) ++d;
+    if (d >= m && len == e.len) return;                       // identical
+    g_cppd_done = true;
+    log_printf("[cppdiff] *** cpp_arena DIVERGES frame=%d first-diff@0x%X "
+               "(fwd-len=%u resim-len=%u)\n", frame, d, e.len, len);
+    // cpp_arena Meta = {magic, bump, live_bytes, free_off[21], reserved[8]}
+    // = 0x80 bytes; the first block follows at 0x80.
+    if (d < 0x80) {
+        const char* fld = "reserved";
+        uint32_t fo = d;
+        if      (fo < 4)   fld = "magic";
+        else if (fo < 8)   fld = "bump";
+        else if (fo < 12)  fld = "live_bytes";
+        else if (fo < 12 + 21 * 4) fld = "free_off[]";
+        log_printf("[cppdiff]   diff in Meta field '%s' off=0x%X  fwd=%08X "
+                   "resim=%08X\n", fld, fo,
+                   *(const uint32_t*)(e.buf + (d & ~3u)),
+                   *(const uint32_t*)(blob + (d & ~3u)));
+        if (fo >= 12 && fo < 12 + 21 * 4)
+            log_printf("[cppdiff]   -> free-list head for size-class %u\n",
+                       (fo - 12) / 4 + 4);
+        return;
+    }
+    uint32_t off = 0x80;
+    while (off + 16 <= m) {
+        uint32_t cls = *(const uint32_t*)(e.buf + off);
+        uint32_t req = *(const uint32_t*)(e.buf + off + 4);
+        uint32_t mag = *(const uint32_t*)(e.buf + off + 12);
+        if (cls < 4 || cls > 24) { log_printf("[cppdiff]   walk lost @0x%X\n", off); return; }
+        uint32_t bsz = 1u << cls;
+        if (d >= off && d < off + bsz) {
+            log_printf("[cppdiff]   diff in block @0x%X cls=%u (%uB) reqsize=%u "
+                       "magic=%08X %s  field-off=0x%X\n", off, cls, bsz, req, mag,
+                       mag == 0x42504143 ? "ALLOCATED" : (mag ? "?" : "FREE"),
+                       d - off);
+            for (uint32_t o = off; o < off + bsz && o + 4 <= m && o < off + 0x60; o += 4) {
+                uint32_t fv = *(const uint32_t*)(e.buf + o);
+                uint32_t rv = *(const uint32_t*)(blob + o);
+                log_printf("[cppdiff]   +0x%02X fwd=%08X resim=%08X %s\n",
+                           o - off, fv, rv, fv != rv ? "<--" : "");
+            }
+            return;
+        }
+        off += bsz;
+    }
+    log_printf("[cppdiff]   offset 0x%X unresolved\n", d);
+}
+} // namespace
+
+// Rollback determinism diagnostics — per-section state fingerprints, the
+// per-pool checksum dump (battle_pools::log_fingerprint), and the divergence
+// locator (diff_locate) — are HEAVY: each advance hashes/serializes ~50 MB,
+// and a GekkoStressSession pays that 9x per displayed frame (1 forward + 8
+// re-sim). That alone drags the solo rig to ~1 fps. Off by default; set
+// SQUIROLL_RB_DIAG=1 to turn them back on when chasing a desync.
+static bool rb_diag_enabled() {
+    static int v = -1;
+    if (v < 0) { char b[8]; v = GetEnvironmentVariableA("SQUIROLL_RB_DIAG", b, sizeof(b)) ? 1 : 0; }
+    return v != 0;
+}
+
+// a per-section fletcher checksum. Comparing the forward advance(N) line
+// against the re-sim advance(N) line shows whether re-sim resumes from the
+// exact state the forward run did — and if not, which section diverged.
+static void log_state_fingerprint(int frame, int rb, const char* tag) {
+    if (!rb_diag_enabled()) return;
+    static int quota = 240;
+    if (quota <= 0) return;
+    --quota;
+    static uint8_t* scratch = nullptr;
+    static constexpr uint32_t SCRATCH = 24u * 1024 * 1024;
+    if (!scratch) {
+        scratch = (uint8_t*)VirtualAlloc(nullptr, SCRATCH,
+                                         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!scratch) return;
+    }
+    auto cs = [&](uint32_t n) -> uint32_t {
+        return n ? fletcher32(scratch, n) : 0u;
+    };
+    uint32_t sq_len = sq_arena::save(scratch, SCRATCH);
+    uint32_t a = cs(sq_len);
+    // Layer-4 locator: the divergence appears in RunOneFrame, so diff
+    // sq_arena at "post-run" (logged right after update_related).
+    if (tag[5] == 'r' /* "post-run" */)
+        sq_page_diff(scratch, sq_len, frame, rb);
+    uint32_t p = cs(battle_pools::save(scratch, SCRATCH));
+    uint32_t e = cs(engine_snap::save(scratch, SCRATCH));
+    uint32_t cpp_len = cpp_arena::save(scratch, SCRATCH);
+    uint32_t c = cs(cpp_len);
+    if (tag[5] == 'r' /* "post-run" */)
+        cpp_page_diff(scratch, cpp_len, frame, rb);
+    uint32_t bt = cs(bullet_arena::save(scratch, SCRATCH));
+    uint32_t in = cs(input_rec_save(scratch, SCRATCH));
+    log_printf("[diag] %-9s f=%d rb=%d  arena=%08x pools=%08x eng=%08x "
+               "cpp=%08x bullet=%08x input=%08x\n",
+               tag, frame, rb, a, p, e, c, bt, in);
 }
 
 // ----------------------------------------------------------- frame drivers --
@@ -1000,6 +1311,83 @@ static void inject_forced_inputs_into_recorder() {
         }
         dev->input_vec[ri] = forced_inputs[i];
         dev->input_write_idx = ri + 1;
+    }
+}
+
+// --- input-recorder snapshot ------------------------------------------------
+// th155's input recorder is per-frame-mutable state the battle reads but no
+// arena captures: each TF4InputRecorderDevice has a read/write cursor + an
+// input_vec history ring, and each TF4InputDevice (0x140) carries cumulative
+// button hold-counters. Fighting-game motion/command detection reads the
+// input HISTORY, so if the recorder is not rewound with the rest of the
+// state a re-sim reads a shifted history window and diverges. This section
+// snapshots both, per device.
+static uint32_t input_rec_save(uint8_t* out, uint32_t cap) {
+    uint8_t* p = out;
+    uint8_t* end = out + cap;
+    auto put = [&](const void* s, uint32_t n) -> bool {
+        if (p + n > end) return false;
+        memcpy(p, s, n); p += n; return true;
+    };
+    uint32_t magic = 0x52504E49;  // 'INPR'
+    uint32_t ndev = 0;
+    ManbowInputRecorder* rec = g_active_input_session
+        ? g_active_input_session->input_recorder.get() : nullptr;
+    if (rec) ndev = (uint32_t)rec->devices.size();
+    if (ndev > 2) ndev = 2;
+    if (!put(&magic, 4) || !put(&ndev, 4)) return 0;
+    for (uint32_t i = 0; i < ndev; ++i) {
+        TF4InputRecorderDevice* d = rec->devices[i].get();
+        uint32_t wi = 0, ri = 0, b8 = 0, vs = 0, hasdev = 0;
+        if (d) {
+            wi = (uint32_t)d->input_write_idx;
+            ri = (uint32_t)d->input_read_idx;
+            b8 = d->__bool_8;
+            vs = (uint32_t)d->input_vec.size();
+            hasdev = d->tf4_device ? 1u : 0u;
+        }
+        if (!put(&wi, 4) || !put(&ri, 4) || !put(&b8, 4) ||
+            !put(&vs, 4) || !put(&hasdev, 4))
+            return 0;
+        if (d && vs && !put(d->input_vec.data(), vs * 2)) return 0;
+        if (hasdev && !put(d->tf4_device, sizeof(TF4InputDevice))) return 0;
+    }
+    return (uint32_t)(p - out);
+}
+
+static void input_rec_load(const uint8_t* blob, uint32_t len) {
+    const uint8_t* p = blob;
+    const uint8_t* e = blob + len;
+    auto get = [&](void* d, uint32_t n) -> bool {
+        if (p + n > e) return false;
+        memcpy(d, p, n); p += n; return true;
+    };
+    uint32_t magic = 0, ndev = 0;
+    if (!get(&magic, 4) || !get(&ndev, 4) || magic != 0x52504E49) return;
+    ManbowInputRecorder* rec = g_active_input_session
+        ? g_active_input_session->input_recorder.get() : nullptr;
+    for (uint32_t i = 0; i < ndev; ++i) {
+        uint32_t wi = 0, ri = 0, b8 = 0, vs = 0, hasdev = 0;
+        if (!get(&wi, 4) || !get(&ri, 4) || !get(&b8, 4) ||
+            !get(&vs, 4) || !get(&hasdev, 4))
+            return;
+        TF4InputRecorderDevice* d =
+            (rec && i < rec->devices.size()) ? rec->devices[i].get() : nullptr;
+        if (d) {
+            d->input_write_idx = wi;
+            d->input_read_idx  = ri;
+            d->__bool_8        = (bool)b8;
+            d->input_vec.resize(vs);
+            if (vs && p + vs * 2 <= e)
+                memcpy(d->input_vec.data(), p, vs * 2);
+        }
+        p += vs * 2;
+        if (hasdev) {
+            if (p + sizeof(TF4InputDevice) > e) return;
+            if (d && d->tf4_device)
+                memcpy(d->tf4_device, p, sizeof(TF4InputDevice));
+            p += sizeof(TF4InputDevice);
+        }
     }
 }
 
@@ -1050,10 +1438,49 @@ void advance_one_frame() {
     // per Advance — so we call RunOneFrame exactly once. We also skip
     // the PrtScn polling (GetAsyncKeyState — non-deterministic real-time
     // input) and the QPC bookkeeping (real-time pacing only).
+    // Reset th155's per-frame BUMP ALLOCATOR. g_frame_alloc_ptr (0x4DAD1C)
+    // is a linear allocator into a fixed block (base = g_frame_alloc_base
+    // 0x4DAD20, allocated once at init); the engine bump-allocates per-frame
+    // scratch from it (collision lists, ContactResultActor, ...) and resets
+    // the pointer to the base every logical frame. That reset lives at the
+    // top of update_logic (0xE1A0) — which this custom advance deliberately
+    // does NOT call. Without it the pointer climbs unbounded: it overruns
+    // the block (corrupting the MeshVertex pool) AND, because it is never
+    // rewound, a rollback re-sim allocates from a different offset, so
+    // pointers the engine caches into persistent objects (e.g.
+    // Actor2DGroup+0x7C) diverge → false-positive desync.
+    //
+    // The pointer reset alone is NOT enough: the allocator's BLOCK CONTENT
+    // is not part of the rollback snapshot. After a rollback, re-sim frame N
+    // sees whatever the latest forward frame left in that scratch block, not
+    // what forward frame N saw — so any uninitialised read from this frame's
+    // scratch allocations diverges. Zeroing the region the previous frame
+    // used (before resetting the pointer) makes the scratch block a
+    // deterministic function of the frame: every advance starts it clean.
+    {
+        uint32_t fa_base = *(uint32_t*)(0x4DAD20_R);
+        uint32_t fa_ptr  = *(uint32_t*)(0x4DAD1C_R);
+        if (fa_ptr > fa_base && fa_ptr - fa_base < 0x8000000u)
+            memset((void*)(uintptr_t)fa_base, 0, fa_ptr - fa_base);
+        *(uint32_t*)(0x4DAD1C_R) = fa_base;   // reset the bump pointer
+    }
     if (trace) log_printf("[gekko_bridge] advance: -> update_related\n");
+    // Route th155 operator-new into cpp_arena ONLY for the logical advance.
+    // cpp_arena hooks operator new broadly; left armed across the whole match
+    // it also captured th155's RENDERING allocations (drawing_related runs
+    // once per real frame, between gekko ticks) — non-advance allocs perturb
+    // the arena's bump/free-lists outside any logical frame, so a re-sim's
+    // cpp_arena diverged (bump off by one 8 KB block). Arming per-advance
+    // makes cpp_arena a pure function of the logical frames. (Frees stay
+    // range-routed, so an arena pointer always frees correctly.)
+    cpp_arena::set_armed(true);
     update_related(*MAIN_SCRIPTAPI_PTR);                    // RunOneFrame(g_main), once
+    log_state_fingerprint(g_trace_frame, g_trace_rb, "post-run");
+    if (rb_diag_enabled()) battle_pools::log_fingerprint("post-run");
     if (trace) log_printf("[gekko_bridge] advance: -> ScriptAPI::Update\n");
     Act_ScriptAPI_ptr->vftable->Update(Act_ScriptAPI_ptr);  // Act::ScriptAPI::Update
+    cpp_arena::set_armed(false);
+    log_state_fingerprint(g_trace_frame, g_trace_rb, "post-upd");
     ++*(uint32_t*)(0x4DACE0_R);                             // g_frame_counter
     if (trace) log_printf("[gekko_bridge] advance: exit\n");
 }
@@ -1078,11 +1505,11 @@ bool init(uint16_t local_port, uint16_t remote_port,
     GekkoConfig config = {};
     config.desync_detection = true;
     config.input_size = sizeof(uint16_t);
-    // 16 MB: the sq_heap snapshot is the full live Squirrel VM heap (every
-    // tracked allocation), plus the text checksum blob + actor records.
-    // Gekko keeps ~10-20 saves in flight. Logged per save ([sq_heap] save)
-    // so the real size can be measured and this dialed in.
-    config.state_size = 16 * 1024 * 1024;
+    // The GekkoNet save blob is just the SaveHeader now — snapshot_ring owns
+    // the real state (dirty-page ring for the arenas, its own small-section
+    // ring). 1 MB is generous headroom for the header / the legacy bring-up
+    // path; it must match the cap passed to save_state_to_buf below.
+    config.state_size = 1 * 1024 * 1024;
     config.max_spectators = 0;
     config.input_prediction_window = 10;
     config.num_players = 2;
@@ -1117,12 +1544,29 @@ bool init(uint16_t local_port, uint16_t remote_port,
     // without deferral. (Deferral remains for the legacy actor-record
     // path, g_arena_rollback off.)
     live_actors::set_defer_release(!g_arena_rollback);
-    // Defer Squirrel VM frees too, so every object keeps a stable address
-    // for the raw heap snapshot (giuroll model).
-    sq_heap::set_armed(true);
+    // Route th155's operator-new allocations into the snapshot-able arena
+    // FIRST — must precede the vector re-homing below so the fresh buffers
+    // land in cpp_arena.
+    cpp_arena::set_armed(true);
     // Pre-grow the C++ battle object pools so their block set is frozen
     // for the match — the rollback snapshot copies those blocks raw.
     battle_pools::pregrow();
+    // Re-home each animation controller's CompositeSprite std::vector
+    // buffers into cpp_arena (they were operator-new'd during vs.Initialize,
+    // before cpp_arena was armed, so they sit uncaptured on the CRT heap).
+    // Re-allocating them now — armed — puts them in the snapshot and at a
+    // fixed 256-elem capacity so they never realloc/move mid-match.
+    battle_pools::reserve_anim_vectors();
+    // reserve_anim_vectors' buffers are now in cpp_arena — disarm it; from
+    // here advance_one_frame arms cpp_arena only for the logical advance, so
+    // rendering's allocations stay out of the rollback snapshot.
+    cpp_arena::set_armed(false);
+    // Fix each player's input-history vector capacity so it never reallocs
+    // mid-match (its backing buffer then keeps a stable address to snapshot).
+    input_hist::pregrow();
+    // Arm dirty-page snapshotting: arenas installed, pools pre-grown — take
+    // the write-watch baseline before the first advance/save.
+    snapshot_ring::arm();
     apply_test_round_frames();
 
     log_printf("gekko_bridge: session up. local=%u port=%u remote=%s (remote_addr_len=%u)\n",
@@ -1142,7 +1586,7 @@ bool init_solo() {
     GekkoConfig config = {};
     config.desync_detection = true;
     config.input_size = sizeof(uint16_t);
-    config.state_size = 16 * 1024 * 1024;  // full Squirrel VM heap snapshot
+    config.state_size = 1 * 1024 * 1024;   // see init() — snapshot_ring owns the state
     config.max_spectators = 0;
     config.num_players = 2;
     // Roll back 8 frames every frame: the stress session re-simulates
@@ -1162,8 +1606,18 @@ bool init_solo() {
 
     g_active = true;
     live_actors::set_defer_release(!g_arena_rollback);
-    sq_heap::set_armed(true);  // defer Squirrel frees for the heap snapshot
-    battle_pools::pregrow();   // freeze the C++ battle pools' block set
+    cpp_arena::set_armed(true);          // capture operator-new (before re-home)
+    battle_pools::pregrow();             // freeze the C++ battle pools' block set
+    battle_pools::reserve_anim_vectors(); // re-home AnimCtrl CompositeSprite vectors into cpp_arena
+    // Disarm cpp_arena — advance_one_frame arms it only for the logical
+    // advance, keeping rendering's allocations out of the snapshot.
+    cpp_arena::set_armed(false);
+    // Fix each player's input-history vector capacity so it never reallocs
+    // mid-match (its backing buffer then keeps a stable address to snapshot).
+    input_hist::pregrow();
+    // Arm dirty-page snapshotting: arenas installed, pools pre-grown — take
+    // the write-watch baseline before the first advance/save.
+    snapshot_ring::arm();
 
     // The battle is already created — vs.Initialize ran under the
     // vanilla loop during the intro. A stress session has no handshake
@@ -1291,9 +1745,7 @@ void shutdown() {
     // reclaim their slots once we're done with the session.
     live_actors::set_defer_release(false);
     live_actors::flush_deferred();
-    // Stop deferring Squirrel frees and hard-free every block we held back.
-    sq_heap::set_armed(false);
-    sq_heap::flush();
+    cpp_arena::set_armed(false);
 }
 
 bool is_active()         { return g_active; }
@@ -1354,6 +1806,21 @@ bool tick() {
                        sq_arena::used() / 1024,
                        (uint32_t)(sq_arena::live_bytes() / 1024),
                        sq_arena::capacity() / (1024 * 1024));
+            log_printf("[cpp_arena] used=%u KB live=%u KB cap=%u MB\n",
+                       cpp_arena::used() / 1024,
+                       (uint32_t)(cpp_arena::live_bytes() / 1024),
+                       cpp_arena::capacity() / (1024 * 1024));
+        }
+        // DIAGNOSTIC: is the remote peer's traffic actually arriving?
+        // kb_received ~0 on a peer => its socket gets no packets from the
+        // other side (one-directional delivery). Logged every 30 ticks.
+        if (!g_solo && (arena_log % 3) == 1) {
+            GekkoNetworkStats ns = {};
+            uint8_t remote = (uint8_t)(1 - g_local_idx);
+            gekko_network_stats(g_session, remote, &ns);
+            log_printf("[netstat] tick=%u remote=%u ping=%ums sent=%.2f "
+                       "recv=%.2f KB/s\n", arena_log, remote, ns.last_ping,
+                       ns.kb_sent, ns.kb_received);
         }
     }
 
@@ -1462,12 +1929,16 @@ bool tick() {
                     break;
                 }
                 uint32_t cs = 0;
+                LARGE_INTEGER _ts0; QueryPerformanceCounter(&_ts0);
                 uint32_t n = save_state_to_buf(
                     e->data.save.state,
-                    /*cap=*/ 16 * 1024 * 1024,  // must match GekkoConfig::state_size
+                    /*cap=*/ 1 * 1024 * 1024,   // must match GekkoConfig::state_size
                     &cs,
                     (uint32_t)e->data.save.frame
                 );
+                LARGE_INTEGER _ts1; QueryPerformanceCounter(&_ts1);
+                g_perf_save += (uint64_t)(_ts1.QuadPart - _ts0.QuadPart);
+                ++g_perf_nsave;
                 *e->data.save.state_len = n;
                 *e->data.save.checksum = cs;
                 // Determinism probe: the same gekko frame is saved once
@@ -1562,8 +2033,14 @@ bool tick() {
                                    e->data.load.state_len, blobcs);
                     }
                 }
-                load_state_from_buf(e->data.load.state,
-                                    e->data.load.state_len);
+                {
+                    LARGE_INTEGER _tl0; QueryPerformanceCounter(&_tl0);
+                    load_state_from_buf(e->data.load.state,
+                                        e->data.load.state_len);
+                    LARGE_INTEGER _tl1; QueryPerformanceCounter(&_tl1);
+                    g_perf_load += (uint64_t)(_tl1.QuadPart - _tl0.QuadPart);
+                    ++g_perf_nload;
+                }
                 break;
             }
             case GekkoAdvanceEvent: {
@@ -1581,7 +2058,35 @@ bool tick() {
                 }
                 g_trace_frame = (int)e->data.adv.frame;
                 g_trace_rb    = (int)e->data.adv.rolling_back;
+                log_state_fingerprint((int)e->data.adv.frame,
+                                      (int)e->data.adv.rolling_back, "adv-top");
+                if (rb_diag_enabled()) {
+                    battle_pools::log_fingerprint("adv-top");
+                    battle_pools::diff_locate((int)e->data.adv.frame,
+                                              (int)e->data.adv.rolling_back);
+                }
+                LARGE_INTEGER _ta0; QueryPerformanceCounter(&_ta0);
                 advance_one_frame();
+                LARGE_INTEGER _ta1; QueryPerformanceCounter(&_ta1);
+                g_perf_adv += (uint64_t)(_ta1.QuadPart - _ta0.QuadPart);
+                if (++g_perf_nadv >= 240) {
+                    LARGE_INTEGER _fr; QueryPerformanceFrequency(&_fr);
+                    uint64_t hz = (uint64_t)_fr.QuadPart;
+                    auto _us = [&](uint64_t t, uint32_t k) -> uint32_t {
+                        return k ? (uint32_t)(t * 1000000ull / hz / k) : 0;
+                    };
+                    log_printf("[perf] per-call us: advance=%u  save=%u "
+                               "(sblob=%u cap=%u)  load=%u  [nsave=%u nload=%u]\n",
+                               _us(g_perf_adv, g_perf_nadv),
+                               _us(g_perf_save, g_perf_nsave),
+                               _us(g_perf_sblob, g_perf_nsave),
+                               _us(g_perf_cap, g_perf_nsave),
+                               _us(g_perf_load, g_perf_nload),
+                               g_perf_nsave, g_perf_nload);
+                    g_perf_save = g_perf_load = g_perf_adv = 0;
+                    g_perf_sblob = g_perf_cap = 0;
+                    g_perf_nsave = g_perf_nload = g_perf_nadv = 0;
+                }
                 if (at) log_printf("[adv] <<< frame=%d done\n", e->data.adv.frame);
                 forced_inputs_active = false;
                 advanced = true;
