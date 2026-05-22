@@ -1460,6 +1460,20 @@ bool tick() {
                 );
                 *e->data.save.state_len = n;
                 *e->data.save.checksum = cs;
+                // Determinism probe: the same gekko frame is saved once
+                // forward and again on each rollback re-sim. cs is the
+                // value-based (address-independent) checksum — if a frame
+                // logs two different cs values, its re-sim diverged from
+                // the forward sim (the rollback restore is incomplete /
+                // the sim is non-deterministic).
+                {
+                    static int save_trace = 240;
+                    if (save_trace > 0) {
+                        --save_trace;
+                        log_printf("[save] f=%d cs=0x%08x len=%u\n",
+                                   (int)e->data.save.frame, cs, n);
+                    }
+                }
                 // Dump the Squirrel blob for two specific frames to
                 // per-peer text files: frame 0 (pre-divergence baseline)
                 // and frame 90 (well past where DESYNC first fires ~f20).
@@ -1519,6 +1533,14 @@ bool tick() {
                                                   e->data.load.state_len),
                                e->data.load.state_len,
                                (e->data.load.state_len >= sizeof(SaveHeader)) ? sh->rand_state : 0);
+                }
+                {
+                    static int load_trace = 120;
+                    if (load_trace > 0) {
+                        --load_trace;
+                        log_printf("[load] f=%d len=%u\n",
+                                   (int)e->data.load.frame, e->data.load.state_len);
+                    }
                 }
                 load_state_from_buf(e->data.load.state,
                                     e->data.load.state_len);
