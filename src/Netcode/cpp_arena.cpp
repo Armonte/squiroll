@@ -74,6 +74,7 @@ static bool     g_armed     = false;   // route operator new -> arena only while
 static bool     g_resim     = false;   // a rollback re-simulation advance is in progress
 static uint32_t g_warn      = 8;
 static uint32_t g_resim_skips = 0;     // real-heap frees suppressed during re-sim
+static uint32_t g_xthr_skips  = 0;     // arena frees from a non-sim thread, leaked
 static DWORD    g_sim_tid   = 0;       // simulation thread; once set, ONLY this
                                        // thread's operator new -> arena (keeps
                                        // the audio thread out of the snapshot)
@@ -250,7 +251,22 @@ static void* cdecl hook_op_new(size_t size) {
 // freed from the forward pass; the bounded leak is the transient buffers a
 // growing std::vector sheds — they stop once capacity settles).
 static void cdecl hook_free(void* block) {
-    if (in_arena(block)) { arena_free(block); return; }
+    if (in_arena(block)) {
+        // A non-simulation thread (the audio thread) freeing an arena block
+        // — necessarily a pre-gate baseline object — would push it onto a
+        // free-list at a non-deterministic time, shifting where the next
+        // simulation allocation lands and diverging the snapshot. Leak it
+        // instead; the set of such blocks is bounded (pre-gate only).
+        if (g_sim_tid != 0 && GetCurrentThreadId() != g_sim_tid) {
+            if (g_warn && (g_xthr_skips & 0xFF) == 0)
+                log_printf("[cpp_arena] off-thread arena free leaked %p (#%u)\n",
+                           block, g_xthr_skips);
+            ++g_xthr_skips;
+            return;
+        }
+        arena_free(block);
+        return;
+    }
     if (g_resim) {
         if (g_warn && (g_resim_skips & 0x3FF) == 0) {
             log_printf("[cpp_arena] re-sim: suppressed real-heap free %p "
