@@ -24,6 +24,7 @@
 #include "focus_input.h"
 #include "crash_handler.h"
 #include "sq_arena.h"
+#include "sq_trace.h"
 
 #include <shared.h>
 
@@ -316,6 +317,11 @@ bool common_init(
     // common_init is well before that. (Supersedes the old alloc_man
     // patch_allocman() tracking approach.)
     sq_arena::install(0x17FDB0_R, 0x1A6000_R);
+
+    // Diagnostic: catch the dual-rollback crash (SQInstance member-get on
+    // a class whose _members table is NULL) at its source, logging the
+    // class and member name instead of faulting deeper in SQTable__Get.
+    sq_trace::install();
 
     // Allow launching multiple instances of the game
     mem_write(createmutex_patch_addr, PATCH_BYTES<0x68, 0x00, 0x00, 0x00, 0x00>); //mutex patch
