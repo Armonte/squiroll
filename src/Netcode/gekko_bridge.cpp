@@ -135,6 +135,76 @@ static uint16_t read_local_input_bits() {
     return g_last_local_input_bits;
 }
 
+// --- synthetic input (test harness) ----------------------------------------
+// SQUIROLL_FAKE_INPUT=1 drives the players with generated inputs so a
+// stress / rollback run actually fights — movement, attacks, projectiles,
+// hits — instead of sitting AFK (AFK only exercises desync DETECTION, not
+// real rollback of projectiles and actor state).
+//
+// Each player has its own xorshift32 stream, kept entirely separate from
+// the engine's RNG (which is part of the rollback snapshot — this
+// generator must never draw from it). GekkoNet stores every input it is
+// handed and replays it verbatim on a rollback re-sim, so the stream only
+// has to advance once per real frame; it need not be re-sim aware.
+//
+// Packed-input bit layout (TF4InputDevice::PollState, th155 0x169D80):
+//   bit0 left  bit1 right  bit2 up  bit3 down
+//   bits4-15   the 12 buttons (4/5/6/7 = the A/B/C/D attack buttons).
+static bool     g_fake_input   = false;
+static uint32_t g_fake_rng[2]  = {0, 0};
+static uint16_t g_fake_held[2] = {0, 0};   // current held direction bits
+static int      g_fake_hold[2] = {0, 0};   // frames left on that direction
+
+static uint32_t fake_xs32(uint32_t& s) {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    return s;
+}
+
+static void fake_input_init() {
+    char buf[16] = {0};
+    DWORD n = GetEnvironmentVariableA("SQUIROLL_FAKE_INPUT", buf, sizeof(buf));
+    g_fake_input = (n > 0 && n < sizeof(buf) && atoi(buf) != 0);
+    if (!g_fake_input) return;
+
+    uint32_t seed = 0x9E3779B9u;
+    char sb[16] = {0};
+    DWORD sn = GetEnvironmentVariableA("SQUIROLL_INPUT_SEED", sb, sizeof(sb));
+    if (sn > 0 && sn < sizeof(sb)) {
+        int s = atoi(sb);
+        if (s != 0) seed = (uint32_t)s;
+    }
+    // Two distinct, non-zero streams — one per player.
+    g_fake_rng[0] = seed ^ 0xA5A5A5A5u;
+    g_fake_rng[1] = seed ^ 0x5A5A5A5Au;
+    g_fake_held[0] = g_fake_held[1] = 0;
+    g_fake_hold[0] = g_fake_hold[1] = 0;
+    log_printf("[gekko_bridge] FAKE INPUT enabled, seed=0x%08x\n", seed);
+}
+
+// Generate one player's packed input for this frame: a direction held for
+// a random 8-39 frame stretch, plus a ~38%-per-frame press of a random
+// attack button. That keeps both characters moving and attacking, so
+// projectiles, hitboxes and actor churn are continuously on screen for
+// the rollback to capture and restore.
+static uint16_t fake_input_gen(int p) {
+    if (--g_fake_hold[p] <= 0) {
+        uint32_t r = fake_xs32(g_fake_rng[p]);
+        static const uint16_t dirs[9] = {
+            0x0, 0x1, 0x2, 0x4, 0x8, 0x1|0x4, 0x1|0x8, 0x2|0x4, 0x2|0x8
+        };
+        g_fake_held[p] = dirs[r % 9];
+        g_fake_hold[p] = 8 + (int)((r >> 8) % 32);
+    }
+    uint16_t in = g_fake_held[p];
+    uint32_t r = fake_xs32(g_fake_rng[p]);
+    if ((r & 0xFF) < 96) {                       // ~38% of frames
+        in |= (uint16_t)(0x10u << ((r >> 8) & 3));  // one of A/B/C/D
+    }
+    return in;
+}
+
 static uint32_t fletcher32(const uint8_t* data, size_t len) {
     // TODO: use whatever checksum GekkoNet's desync detector prefers.
     uint32_t a = 0xFFFFFFFFu;
@@ -995,6 +1065,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
 {
     if (g_session) return false;
     register_cpp_ser();
+    fake_input_init();
 
     gekko_create(&g_session, GekkoGameSession);
 
@@ -1053,6 +1124,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
 bool init_solo() {
     if (g_session) return false;
     register_cpp_ser();
+    fake_input_init();
 
     g_solo = true;
     gekko_create(&g_session, GekkoStressSession);
@@ -1340,13 +1412,25 @@ bool tick() {
     // both peers at frame 0 until the handshake completes, so their
     // first real frame happens at the same wall-clock moment.
     if (g_session_started) {
-        uint16_t my_input = read_local_input_bits();
-        gekko_add_local_input(g_session, g_local_idx, &my_input);
-        // Solo stress session: both players are local, so drive the
-        // second one too. Same input bits — a stress run exercises the
-        // save/load/rollback path, it is not a real match.
-        if (g_solo) {
-            gekko_add_local_input(g_session, 1, &my_input);
+        if (g_fake_input) {
+            // Test harness: generated inputs. Each player draws from its
+            // own stream — for solo we add both; for dual each peer adds
+            // only its own (the other arrives over the network), and the
+            // per-player seeding keeps the streams identical cross-peer.
+            uint16_t mine = fake_input_gen(g_local_idx);
+            gekko_add_local_input(g_session, g_local_idx, &mine);
+            if (g_solo) {
+                uint16_t other = fake_input_gen(1);
+                gekko_add_local_input(g_session, 1, &other);
+            }
+        } else {
+            uint16_t my_input = read_local_input_bits();
+            gekko_add_local_input(g_session, g_local_idx, &my_input);
+            // Solo stress session: both players are local, so drive the
+            // second one too.
+            if (g_solo) {
+                gekko_add_local_input(g_session, 1, &my_input);
+            }
         }
     }
 
