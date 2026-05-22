@@ -194,16 +194,38 @@ static inline bool in_arena(const void* p) {
 
 // --- hooks --------------------------------------------------------------
 
+// Caller RVA ranges whose operator-new allocations must NOT enter the arena.
+// The arena is the rollback snapshot; an object a non-deterministic subsystem
+// (the audio thread) mutates would make the snapshot diverge on a re-sim.
+// These ranges are found with cpp_arena::attribute() — it names the caller of
+// any block that diverges, so this list grows from evidence, not guesses.
+struct ExclRange { uint32_t lo, hi; };   // RVA half-open [lo, hi)
+static const ExclRange g_excl[] = {
+    // tf4_ogg_alloc_shared — operator new shared_ptr<TF4::Ogg>, the Ogg/Vorbis
+    // audio decoder object; the audio thread mutates it every frame.
+    { 0x16B380u, 0x16B400u },
+};
+static bool caller_excluded(uint32_t abs_caller) {
+    uint32_t rva = abs_caller - (uint32_t)base_address;
+    for (const ExclRange& e : g_excl)
+        if (rva >= e.lo && rva < e.hi) return true;
+    return false;
+}
+
 // operator new: while a rollback session is armed, serve from the arena so
 // the battle's C++ heap is part of the snapshot. Outside a match (boot,
 // menus) pass straight to the real allocator — that keeps the arena, hence
-// the per-frame snapshot, bounded to battle-era allocations. On overflow
-// also fall through (the original handles _callnewh / bad_alloc).
+// the per-frame snapshot, bounded to battle-era allocations. A caller in the
+// excluded set (audio) also passes through: its objects are non-deterministic
+// and must stay out of the snapshot. On overflow likewise fall through.
 static void* cdecl hook_op_new(size_t size) {
     if (g_armed && g_meta) {
-        g_opnew_caller = (uint32_t)(uintptr_t)_ReturnAddress();
-        void* p = arena_alloc(size);
-        if (p) return p;
+        uint32_t caller = (uint32_t)(uintptr_t)_ReturnAddress();
+        g_opnew_caller = caller;
+        if (!caller_excluded(caller)) {
+            void* p = arena_alloc(size);
+            if (p) return p;
+        }
     }
     return g_h_opnew.unsafe_ccall<void*>(size);
 }
