@@ -219,4 +219,21 @@ uint32_t capacity()  { return ARENA_SIZE; }
 bool     installed() { return g_installed; }
 size_t   live_bytes(){ return g_meta ? g_meta->live_bytes : 0; }
 
+uint32_t save(uint8_t* out, uint32_t cap) {
+    if (!g_meta) return 0;
+    uint32_t n = g_meta->bump;
+    if (n > cap) {
+        log_printf("[sq_arena] !! save OVERFLOW: used=%u > cap=%u\n", n, cap);
+        return 0;
+    }
+    memcpy(out, g_base, n);
+    return n;
+}
+
+bool load(const uint8_t* blob, uint32_t len) {
+    if (!g_base || len < sizeof(Meta) || len > ARENA_SIZE) return false;
+    memcpy(g_base, blob, len);
+    return true;
+}
+
 } // namespace sq_arena

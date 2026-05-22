@@ -36,6 +36,13 @@ uint8_t* base();
 uint32_t used();
 uint32_t capacity();
 
+// Serialize [base, base+used) into out[0..cap). Returns bytes written,
+// 0 on overflow. The blob begins with the allocator metadata header, so
+// load() restores the bump cursor + free-lists along with the whole VM
+// heap — re-allocation after a restore is bit-deterministic.
+uint32_t save(uint8_t* out, uint32_t cap);
+bool     load(const uint8_t* blob, uint32_t len);
+
 // Diagnostics.
 bool   installed();
 size_t live_bytes();   // bytes currently handed out (excludes free-listed)
