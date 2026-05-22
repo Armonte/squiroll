@@ -109,6 +109,12 @@ static uint32_t      g_evt_trace = 0;            // diagnostic: # of Save/Load/
                                                  // the count/desync path)
 
 uint16_t forced_inputs[2] = {0, 0};
+
+// Published for sq_trace: the gekko frame currently being advanced and
+// whether it is a rollback re-sim. Lets a fault detected deep in the
+// Squirrel VM be attributed to a specific frame / forward-vs-rollback.
+int g_trace_frame = -1;
+int g_trace_rb    = 0;
 bool     forced_inputs_active = false;
 
 // ----------------------------------------------------------------- helpers --
@@ -1559,6 +1565,8 @@ bool tick() {
                                e->data.adv.frame, (int)e->data.adv.rolling_back,
                                inputs[0], inputs[1]);
                 }
+                g_trace_frame = (int)e->data.adv.frame;
+                g_trace_rb    = (int)e->data.adv.rolling_back;
                 advance_one_frame();
                 if (at) log_printf("[adv] <<< frame=%d done\n", e->data.adv.frame);
                 forced_inputs_active = false;
