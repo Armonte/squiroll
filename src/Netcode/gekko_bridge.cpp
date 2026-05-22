@@ -23,6 +23,7 @@
 #include "sq_arena.h"   // Squirrel VM heap arena
 #include "cpp_arena.h"  // engine C++ battle-state arena
 #include "battle_pools.h" // C++ battle object pools
+#include "engine_snap.h"  // scheduler fixed-region snapshot
 #include <squirrel.h>
 // squiroll routes every sq_* call through a runtime-filled KITE table —
 // without this header the bare sq_pushroottable etc. show up as undefined
@@ -578,17 +579,15 @@ static_assert(sizeof(ActorRecord) ==
 // empty body).
 static bool g_sq_save_enabled = true;
 
-// Use the giuroll-style raw Squirrel-heap snapshot for save/restore. OFF:
-// the build falls back to the text walker for restore (non-crashing, but
-// #58 desync). The raw heap snapshot is implemented and lossless for the
-// Squirrel VM, but a Squirrel-heap-only snapshot is INSUFFICIENT — the
-// C++ engine (Sqrat: actor update_func/sq_obj, global bindings, the
-// battle's C++ side) holds Squirrel object references that contribute to
-// Squirrel refcounts. Rolling back only the Squirrel heap desyncs those
-// refcounts against the un-rolled-back C++ side → use-after-free (crash in
-// sq_release, VEH-confirmed). Turning this ON requires snapshotting the
-// C++ game state in the same consistent unit (the real giuroll model).
-static bool g_sq_heap_rollback = false;
+// Arena-based rollback: the real giuroll-style memory snapshot. ON: save/
+// load capture and restore the whole battle state as one consistent unit
+// — sq_arena (Squirrel VM heap) + cpp_arena (engine C++ allocations) +
+// battle_pools (battle object pools) + engine_snap (the scheduler's
+// fixed-address objects, sentinels and counters). Everything the battle
+// touches lives in one of those, so the restore is lossless and the
+// re-sim is bit-deterministic. OFF: the build falls back to the text
+// walker for restore (non-crashing, but lossy — only used for bring-up).
+static bool g_arena_rollback = true;
 
 uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                            uint32_t frame) {
@@ -601,10 +600,13 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
     hdr->frame      = frame; // Gekko frame — keys __gekko_state._keep
     hdr->rand_state = acrt_getptd()->rand_state;
 
-    // Snapshot live actor pointers under a fixed cap.
+    // Snapshot live actor pointers under a fixed cap. With arena rollback
+    // on, the actors live in battle_pools and are restored wholesale by
+    // the Trailer 2 pool snapshot — the per-actor records are redundant,
+    // so skip them (actor_count = 0).
     static constexpr size_t MAX_ACTORS = 2048;
     ManbowActor2D* actors[MAX_ACTORS];
-    size_t n = live_actors::snapshot(actors, MAX_ACTORS);
+    size_t n = g_arena_rollback ? 0 : live_actors::snapshot(actors, MAX_ACTORS);
     hdr->actor_count = (uint32_t)n;
 
     p += sizeof(SaveHeader);
@@ -657,29 +659,45 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         *out_checksum = sq_n > 0 ? fletcher32(text_blob, sq_n) : 0;
     }
 
-    // Trailer 2: [uint32 sqheap_len][raw sq_heap snapshot]. The lossless
-    // giuroll-style raw capture of the entire live Squirrel VM heap. Only
-    // emitted when g_sq_heap_rollback is on (see its declaration).
-    uint32_t after_text = (uint32_t)(p - static_cast<uint8_t*>(buf));
-    if (after_text + 4 > cap) return after_text;
-    uint32_t* heap_len_field = (uint32_t*)p;
-    p += 4;
-    uint32_t heap_n = 0;
-    if (g_sq_heap_rollback) {
-        heap_n = sq_heap::save(p, cap - after_text - 4);
-        static uint32_t heap_log_quota = 4;
-        if (heap_log_quota > 0) {
-            --heap_log_quota;
-            log_printf("[sq_heap] save frame=%u heap_blob=%u bytes "
-                       "(text=%u)\n", frame, heap_n, sq_n);
+    // Trailer 2: arena rollback snapshot — the real restorable state.
+    // Four length-prefixed sections: sq_arena (Squirrel VM heap),
+    // cpp_arena (engine C++ allocations), battle_pools (battle object
+    // pools) and engine_snap (the scheduler's fixed-address objects,
+    // sentinels and counters). The text blob above is kept only for the
+    // value-based desync checksum; this trailer is what load() restores
+    // from when g_arena_rollback is on.
+    if (g_arena_rollback) {
+        auto put_section = [&](const char* name, auto save_fn) -> bool {
+            uint32_t off = (uint32_t)(p - static_cast<uint8_t*>(buf));
+            if (off + 4 > cap) {
+                log_printf("[gekko_bridge] !! arena save: no room for "
+                           "%s length\n", name);
+                return false;
+            }
+            uint32_t* len_field = (uint32_t*)p;
+            p += 4;
+            uint32_t wrote = save_fn(p, cap - off - 4);
+            *len_field = wrote;
+            p += wrote;
+            return true;
+        };
+        bool ok = put_section("sq_arena",   &sq_arena::save)
+               && put_section("cpp_arena",  &cpp_arena::save)
+               && put_section("pools",      &battle_pools::save)
+               && put_section("engine",     &engine_snap::save);
+        if (!ok) {
+            log_printf("[gekko_bridge] !! arena save overflow frame=%u — "
+                       "bump GekkoConfig::state_size\n", frame);
         }
-        if (heap_n == 0) {
-            log_printf("[sq_heap] !! save OVERFLOW frame=%u — bump "
-                       "state_size\n", frame);
+        static uint32_t arena_log = 4;
+        if (arena_log > 0) {
+            --arena_log;
+            log_printf("[gekko_bridge] arena save f=%u total=%u "
+                       "(sq_used=%u cpp_used=%u)\n", frame,
+                       (uint32_t)(p - static_cast<uint8_t*>(buf)),
+                       sq_arena::used(), cpp_arena::used());
         }
     }
-    *heap_len_field = heap_n;
-    p += heap_n;
 
     uint32_t written = (uint32_t)(p - static_cast<uint8_t*>(buf));
     return written;
@@ -796,10 +814,12 @@ void load_state_from_buf(const void* buf, uint32_t len) {
     // length. The re-sim re-creates whatever the deterministic logic
     // spawns.
     size_t culled = 0;
-    for (size_t j = 0; j < live_n; ++j) {
-        if (saved_ptrs.find((uintptr_t)live[j]) == saved_ptrs.end()) {
-            live[j]->active_flags = 4;
-            ++culled;
+    if (!g_arena_rollback) {
+        for (size_t j = 0; j < live_n; ++j) {
+            if (saved_ptrs.find((uintptr_t)live[j]) == saved_ptrs.end()) {
+                live[j]->active_flags = 4;
+                ++culled;
+            }
         }
     }
 
@@ -823,30 +843,44 @@ void load_state_from_buf(const void* buf, uint32_t len) {
     const uint32_t text_len = *(const uint32_t*)p;
     const uint8_t* text_blob = p + 4;
 
-    if (!g_sq_heap_rollback) {
-        // Text-walker restore path (fallback while the raw heap snapshot
-        // awaits C++-side state capture — see g_sq_heap_rollback).
-        if (text_len > 0 &&
-            (size_t)(text_blob - static_cast<const uint8_t*>(buf)) + text_len <= len) {
-            call_squirrel_load(text_blob, text_len, hdr->frame);
+    // Arena rollback path — the real restore. Trailer 2 follows the text
+    // blob: four length-prefixed sections (sq_arena, cpp_arena,
+    // battle_pools, engine_snap) restored as one consistent unit. Each
+    // section is range-checked before use; a truncated section aborts
+    // the rest rather than reading past the blob.
+    if (g_arena_rollback) {
+        const uint8_t* ap   = text_blob + text_len;
+        const uint8_t* aend = static_cast<const uint8_t*>(buf) + len;
+        auto get_section = [&](const char* name, auto load_fn) -> bool {
+            if (ap + 4 > aend) {
+                log_printf("[gekko_bridge] load: %s section truncated\n",
+                           name);
+                return false;
+            }
+            uint32_t slen = *(const uint32_t*)ap;
+            ap += 4;
+            if (ap + slen > aend) {
+                log_printf("[gekko_bridge] load: %s section overrun "
+                           "(len=%u)\n", name, slen);
+                return false;
+            }
+            load_fn(ap, slen);
+            ap += slen;
+            return true;
+        };
+        if (get_section("sq_arena",  &sq_arena::load)  &&
+            get_section("cpp_arena", &cpp_arena::load) &&
+            get_section("pools",     &battle_pools::load)) {
+            get_section("engine", &engine_snap::load);
         }
         return;
     }
 
-    // Raw sq_heap restore path. Trailer 2: [uint32 sqheap_len][snapshot].
-    p += 4 + text_len;
-    if ((size_t)(p - static_cast<const uint8_t*>(buf)) + 4 > len) return;
-    const uint32_t heap_len = *(const uint32_t*)p;
-    p += 4;
-    if (heap_len > 0 &&
-        (size_t)(p - static_cast<const uint8_t*>(buf)) + heap_len <= len) {
-        static uint32_t heap_load_quota = 4;
-        if (heap_load_quota > 0) {
-            --heap_load_quota;
-            log_printf("[sq_heap] load frame=%u heap_blob=%u\n",
-                       hdr->frame, heap_len);
-        }
-        sq_heap::load(p, heap_len);
+    // Text-walker restore path — lossy fallback, used only when arena
+    // rollback is off (bring-up / diagnostics).
+    if (text_len > 0 &&
+        (size_t)(text_blob - static_cast<const uint8_t*>(buf)) + text_len <= len) {
+        call_squirrel_load(text_blob, text_len, hdr->frame);
     }
 }
 
