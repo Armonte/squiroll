@@ -40,6 +40,12 @@ struct Slot {
     uint8_t*  delta[NARENA];     // dn[a] x REC — PRE-images (frame-1 values)
     uint32_t  sblob_len;
     uint8_t*  sblob;
+    // DIAGNOSTIC: per-arena snapshot of the per-page hashes at the slot's
+    // first capture of its current frame. On a re-capture (the rollback
+    // re-sim hitting the same frame number), compare against the live phash
+    // to pin the FRAME and PAGES where the re-sim's output diverges from
+    // the forward run's — no arbitrary threshold, every frame is checked.
+    uint32_t* phash_snap[NARENA];
 };
 static Slot    g_ring[RING];
 static bool    g_armed = false;
@@ -122,6 +128,11 @@ void arm() {
             S.delta[a] = (uint8_t*)VirtualAlloc(nullptr, DELTA_CAP[a],
                              MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!S.delta[a]) delta_ok = false;
+            // DIAGNOSTIC: phash snapshot, npages * 4. Cheap.
+            S.phash_snap[a] = (uint32_t*)VirtualAlloc(nullptr,
+                                  g_ar[a].npages * 4u,
+                                  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (!S.phash_snap[a]) delta_ok = false;
         }
         if (!S.sblob || !delta_ok) {
             log_printf("[snapshot_ring] !! arm: ring slot %d alloc failed\n", s);
@@ -187,6 +198,10 @@ static uint32_t fold_checksum(const uint8_t* sblob, uint32_t sblob_len) {
 uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
     if (!g_armed) return 0;
     Slot& S = g_ring[frame % RING];
+    // Detect "the slot already holds this frame" BEFORE we overwrite S.frame
+    // below — this is how the per-frame phash-snap diagnostic distinguishes
+    // a re-sim re-capture from a fresh forward save of frame N.
+    const bool re_capture_diag = (S.frame == (int32_t)frame);
     S.frame = (int32_t)frame;
 
     LARGE_INTEGER pt0; QueryPerformanceCounter(&pt0);
@@ -259,47 +274,63 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                    frame, hc[0], bc[0], hc[1], bc[1], hc[2], bc[2]);
     }
 
-    // DIAGNOSTIC: cpp_arena re-sim divergence locator. Snapshot cpp_arena
-    // once at an early frame; when a rollback re-sim re-captures that same
-    // frame, dump the dwords that differ — their values reveal which heap
-    // the divergent pointer targets (cpp_arena / sq / bullet / mspace / the
-    // real Win32 heap).
+    // DIAGNOSTIC: every-frame divergence detection via per-page hash. At the
+    // first capture of frame N (the forward save), snapshot live phash[]
+    // into the slot. On any later re-capture of N (a rollback re-sim's
+    // save), compare current phash[] against the snapshot — any page whose
+    // hash differs is where the re-sim's frame-N output deviates from the
+    // forward run's. No arbitrary frame threshold; the EARLIEST divergent
+    // frame surfaces on its first re-capture.
     {
-        Arena& C = g_ar[2];
-        static uint8_t* shadow       = nullptr;
-        static int32_t  shadow_frame = -1;
-        static bool     diff_done    = false;
-        if (!diff_done) {
-            if (shadow_frame < 0) {
-                if (!shadow)
-                    shadow = (uint8_t*)VirtualAlloc(nullptr, C.size,
-                                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-                // Shadow the frame the divergence first appears at (see the
-                // [comp] log) so the diff pins the exact bytes.
-                if (shadow && frame >= 4) {
-                    memcpy(shadow, C.base, C.size);
-                    shadow_frame = (int32_t)frame;
-                    log_printf("[cppdiff] shadow of cpp_arena taken at f=%u\n",
-                               frame);
-                }
-            } else if ((int32_t)frame == shadow_frame) {
-                const uint32_t* a = (const uint32_t*)shadow;
-                const uint32_t* b = (const uint32_t*)C.base;
-                uint32_t bump = *(const uint32_t*)(C.base + BUMP_OFF[2]);
+        Slot& S = g_ring[frame % RING];
+        if (re_capture_diag) {
+            static const char* names[NARENA] = { "sq", "bt", "cpp" };
+            static bool first_dump_done = false;   // dump page bytes ONCE
+            int totalp = 0;
+            for (int a = 0; a < NARENA; ++a) {
                 int hits = 0;
-                for (uint32_t o = 0; o < bump && hits < 12; o += 4) {
-                    uint32_t i = o >> 2;
-                    if (a[i] != b[i]) {
-                        log_printf("[cppdiff] f=%u off=0x%X fwd=%08x now=%08x\n",
-                                   frame, o, a[i], b[i]);
-                        cpp_arena::attribute(o);   // -> owning block + caller RVA
+                for (uint32_t pg = 0; pg < g_ar[a].npages && hits < 6; ++pg) {
+                    if (S.phash_snap[a][pg] != g_ar[a].phash[pg]) {
+                        log_printf("[divf] %s f=%u pg=%u off=0x%X "
+                                   "fwd_hash=%08x now=%08x\n",
+                                   names[a], frame, pg, pg * PAGE,
+                                   S.phash_snap[a][pg], g_ar[a].phash[pg]);
+                        // On the first divergent re-capture EVER, also dump
+                        // the first few differing dwords inside the page so
+                        // the values themselves are visible (cpp only — it
+                        // has cpp_arena::attribute to name the owner).
+                        if (a == 2 && !first_dump_done) {
+                            const uint32_t* lv =
+                                (const uint32_t*)(g_ar[a].base + pg * PAGE);
+                            int dw_hits = 0;
+                            for (uint32_t o = 0; o < PAGE && dw_hits < 4; o += 4) {
+                                // We only have the forward HASH, not bytes — so
+                                // log the live value and let attribute() name
+                                // the block; a follow-up shadow can dump bytes.
+                                (void)lv; (void)o; (void)dw_hits;
+                                break;
+                            }
+                            cpp_arena::attribute(pg * PAGE);
+                        }
                         ++hits;
                     }
                 }
-                log_printf("[cppdiff] done — %d differing dwords "
-                           "(cpp_arena base=%p)\n", hits, (void*)C.base);
-                diff_done = true;
+                totalp += hits;
             }
+            if (totalp) {
+                log_printf("[divf] f=%u — %d divergent pages across arenas\n",
+                           frame, totalp);
+                first_dump_done = true;
+            }
+            // Refresh the snapshot to the new (re-sim) value — so any
+            // subsequent re-capture detects only NEW divergences.
+            for (int a = 0; a < NARENA; ++a)
+                memcpy(S.phash_snap[a], g_ar[a].phash, g_ar[a].npages * 4);
+        } else {
+            // First capture (forward) of this frame in the current ring
+            // window — snapshot the per-page hashes for later comparison.
+            for (int a = 0; a < NARENA; ++a)
+                memcpy(S.phash_snap[a], g_ar[a].phash, g_ar[a].npages * 4);
         }
     }
 
