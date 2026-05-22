@@ -25,7 +25,6 @@
 #include "cpp_arena.h"     // C++ std::list node arena
 #include "bullet_arena.h"  // Bullet physics heap arena
 #include "snapshot_ring.h" // dirty-page rollback snapshot for the big arenas
-#include "tf4_snap.h"      // copy-on-write rollback tracker for the TF4 mspace
 #include "input_hist.h"    // per-player input-history capture
 #include "crash_handler.h" // watch_cxx — log C++ throws in a re-sim
 #include "rollback.h"      // layer-4 sq-diff identifier
@@ -745,9 +744,6 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         LARGE_INTEGER _c1; QueryPerformanceCounter(&_c1);
         uint32_t cs = snapshot_ring::capture(frame, smb,
                                              (uint32_t)(sp - smb));
-        // TF4-engine mspace heap — write-watch dirty-page tracked with
-        // byte-run-compressed deltas, separate from the sblob.
-        tf4_snap::capture(frame);
         LARGE_INTEGER _c2; QueryPerformanceCounter(&_c2);
         g_perf_sblob += (uint64_t)(_c1.QuadPart - _c0.QuadPart);
         g_perf_cap   += (uint64_t)(_c2.QuadPart - _c1.QuadPart);
@@ -894,8 +890,6 @@ void load_state_from_buf(const void* buf, uint32_t len) {
     if (g_arena_rollback && snapshot_ring::armed()) {
         uint32_t sl = 0;
         const uint8_t* sblob = snapshot_ring::restore(hdr->frame, &sl);
-        // Roll the TF4-engine mspace heap back too (see save_state_to_buf).
-        tf4_snap::restore(hdr->frame);
         if (sblob) {
             const uint8_t* sp   = sblob;
             const uint8_t* send = sblob + sl;
@@ -1578,9 +1572,6 @@ bool init(uint16_t local_port, uint16_t remote_port,
     // Arm dirty-page snapshotting: arenas installed, pools pre-grown — take
     // the write-watch baseline before the first advance/save.
     snapshot_ring::arm();
-    // COW-track the TF4-engine mspace heap (resolves the mspace + protects
-    // its segments). After snapshot_ring::arm() — independent of it.
-    tf4_snap::arm();
     apply_test_round_frames();
 
     log_printf("gekko_bridge: session up. local=%u port=%u remote=%s (remote_addr_len=%u)\n",
@@ -1629,8 +1620,6 @@ bool init_solo() {
     // Arm dirty-page snapshotting: arenas installed, pools pre-grown — take
     // the write-watch baseline before the first advance/save.
     snapshot_ring::arm();
-    // COW-track the TF4-engine mspace heap (see init()).
-    tf4_snap::arm();
 
     // The battle is already created — vs.Initialize ran under the
     // vanilla loop during the intro. A stress session has no handshake

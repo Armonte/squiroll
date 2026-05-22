@@ -1,0 +1,35 @@
+#include <windows.h>
+#include <stdint.h>
+
+#include "tf4_pool.h"
+#include "cpp_arena.h"
+#include "patch_utils.h"   // _R address literal, hotpatch_rel32
+#include "log.h"
+
+namespace tf4_pool {
+namespace {
+
+// SQVM__Call_0 (th155 0x45D20) grows the Squirrel-instance object pool. At
+// 0x45D99 it does `call TF4__MeshVertex__PoolAlloc` (E8 rel32) with the
+// mspace in ecx and the slab size in edx (__fastcall). Redirecting that one
+// call site moves every pool slab into cpp_arena without disturbing the
+// mspace. hotpatch_rel32 takes the address of the rel32 OPERAND — one byte
+// past the E8 opcode at 0x45D99.
+#define POOL_ALLOC_REL32  (0x45D9A_R)
+
+// __fastcall: arg1 in ecx (the mspace pointer — ignored), arg2 in edx (the
+// slab size in bytes). Returns the slab. cpp_arena::raw_alloc gives a block
+// that the rollback snapshot captures; on overflow it returns nullptr and
+// SQVM__Call_0's own fallback path takes over.
+static void* __fastcall pool_alloc_redirect(void* /*mspace*/, uint32_t size) {
+    return cpp_arena::raw_alloc(size);
+}
+
+} // namespace
+
+void install() {
+    hotpatch_rel32(POOL_ALLOC_REL32, pool_alloc_redirect);
+    log_printf("[tf4_pool] Squirrel-instance pool slabs -> cpp_arena\n");
+}
+
+} // namespace tf4_pool

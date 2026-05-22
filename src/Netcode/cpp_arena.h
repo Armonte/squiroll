@@ -55,6 +55,10 @@ void set_armed(bool on);
 // double-free (STATUS_HEAP_CORRUPTION).
 void set_resim(bool on);
 
+// Raw arena allocation, bypassing the operator-new routing. nullptr on
+// overflow. See tf4_pool — re-homes th155's Squirrel-instance object pool.
+void* raw_alloc(uint32_t n);
+
 uint8_t* base();        // arena base — the MEM_WRITE_WATCH region
 uint32_t used();        // high-water bytes (what save() writes)
 uint32_t capacity();    // arena reservation

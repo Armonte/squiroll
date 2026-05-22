@@ -304,6 +304,15 @@ void trace_alloc(uint32_t addr) {
 
 void     set_armed(bool on) { g_armed = on; }
 void     set_resim(bool on) { g_resim = on; }
+
+// Public raw allocation — hand a block straight out of the arena, bypassing
+// the operator-new routing. Used to re-home th155's TF4 Squirrel-instance
+// object pool (which would otherwise carve its slabs from the TF4-engine
+// mspace, a heap that cannot be rollback-snapshotted because the audio
+// thread keeps live decoder state there). Returns nullptr on overflow, so
+// the caller can fall back. The block is range-routed back to arena_free
+// like any other arena pointer, so a later free is handled.
+void* raw_alloc(uint32_t n) { return g_meta ? arena_alloc(n) : nullptr; }
 uint8_t* base()      { return g_base; }
 uint32_t used()      { return g_meta ? g_meta->bump : 0; }
 uint32_t capacity()  { return ARENA_SIZE; }

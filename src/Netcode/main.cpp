@@ -27,7 +27,7 @@
 #include "cpp_arena.h"
 #include "bullet_arena.h"
 #include "input_hist.h"
-#include "tf4_snap.h"
+#include "tf4_pool.h"
 #include "sq_trace.h"
 
 #include <shared.h>
@@ -300,13 +300,11 @@ bool common_init(
     // fault anywhere lands a module+RVA report in aocf_crash.log.
     crash_handler::install();
 
-    // Patch th155's TF4-engine mspace heap (the dlmalloc at .data:0x4DC0C0)
-    // so its VirtualAlloc segments are MEM_WRITE_WATCH — tf4_snap rollback-
-    // tracks that heap (battle objects allocate through it, e.g. the
-    // Squirrel-instance pool at 0x4DCD00, so it must be snapshotted or a
-    // re-sim diverges). Done first thing so the patch lands before the
-    // engine creates any segment; arm() (at session arm) does the rest.
-    tf4_snap::install();
+    // Redirect th155's Squirrel-instance object pool to allocate its slabs
+    // from cpp_arena (rollback-snapshotted) instead of the TF4-engine mspace
+    // (which can't be — the audio thread keeps live decoder state there).
+    // Must run before any battle Squirrel instance is created.
+    tf4_pool::install();
 
     hotpatch_rel32(0x1DC5A_R, parse_command_line);
 
