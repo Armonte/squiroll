@@ -90,11 +90,6 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Flush the async log queue synchronously — for a fatal fault the
-    // logger's worker thread will not run again. A watched first-chance
-    // exception may be non-fatal (the program continues), so don't drain it.
-    if (!watched) log_crash_drain();
-
     const CONTEXT*          c = ep->ContextRecord;
     const EXCEPTION_RECORD* r = ep->ExceptionRecord;
     char loc[MAX_PATH + 32];
@@ -130,8 +125,20 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
     }
     crash_logf("==== END CRASH ====\r\n");
 
+    // Drain the async log queue AFTER the crash dump is safely on disk: if
+    // the heap is corrupted the drain itself can fault, and we must not
+    // lose the dump to a re-entrant crash. A watched first-chance exception
+    // may be non-fatal (the program continues), so don't drain it.
+    if (!watched) log_crash_drain();
+
     g_in_handler = 0;
-    // Observe only — let the exception propagate and crash normally.
+    if (!watched) {
+        // Real fatal fault. Self-terminate instead of letting it propagate:
+        // the Windows error dialog freezes every thread (including the
+        // logger) and hangs the process. The crash dump is already on disk.
+        TerminateProcess(GetCurrentProcess(), code);
+    }
+    // Watched first-chance exception — observe only, let it propagate.
     return EXCEPTION_CONTINUE_SEARCH;
 }
 

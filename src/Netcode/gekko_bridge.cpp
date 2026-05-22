@@ -741,6 +741,23 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
             if (out_checksum) *out_checksum = 0;
             return sizeof(SaveHeader);
         }
+        // DIAGNOSTIC: per-section sblob checksums — pins a desync to the
+        // exact small-section (battle_pools / engine/.data / input) that
+        // diverged. Sections are [u32 len][data], in sect() order.
+        {
+            const uint8_t* q = smb;
+            const char* nm[4] = { "bp", "eng", "irec", "ihist" };
+            char comps[160]; int cn = 0;
+            for (int s = 0; s < 4 && q + 4 <= sp; ++s) {
+                uint32_t L = *(const uint32_t*)q; q += 4;
+                if (q + L > sp) break;
+                uint32_t h = 2166136261u;
+                for (uint32_t i = 0; i < L; ++i) { h ^= q[i]; h *= 16777619u; }
+                q += L;
+                cn += wsprintfA(comps + cn, " %s=%08x", nm[s], h);
+            }
+            log_printf("[sblob] f=%u%s\n", frame, comps);
+        }
         LARGE_INTEGER _c1; QueryPerformanceCounter(&_c1);
         uint32_t cs = snapshot_ring::capture(frame, smb,
                                              (uint32_t)(sp - smb));

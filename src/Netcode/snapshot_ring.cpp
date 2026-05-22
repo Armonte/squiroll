@@ -241,6 +241,65 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
     uint32_t cs = fold_checksum(sblob, sblob_len);
     LARGE_INTEGER pt2; QueryPerformanceCounter(&pt2);
 
+    // DIAGNOSTIC: per-arena page-hash fold, so a desync can be pinned to the
+    // exact arena (sq / bullet / cpp) that diverged rather than one opaque
+    // combined checksum.
+    {
+        uint32_t hc[NARENA], bc[NARENA];
+        for (int a = 0; a < NARENA; ++a) {
+            uint32_t bump = *(const uint32_t*)(g_ar[a].base + BUMP_OFF[a]);
+            bc[a] = bump;
+            uint32_t upg  = (bump + PAGE - 1) / PAGE;
+            if (upg > g_ar[a].npages) upg = g_ar[a].npages;
+            uint32_t h = 2166136261u;
+            for (uint32_t pg = 0; pg < upg; ++pg) { h ^= g_ar[a].phash[pg]; h *= 16777619u; }
+            hc[a] = h;
+        }
+        log_printf("[comp] f=%u sq=%08x/%u bt=%08x/%u cpp=%08x/%u\n",
+                   frame, hc[0], bc[0], hc[1], bc[1], hc[2], bc[2]);
+    }
+
+    // DIAGNOSTIC: cpp_arena re-sim divergence locator. Snapshot cpp_arena
+    // once at an early frame; when a rollback re-sim re-captures that same
+    // frame, dump the dwords that differ — their values reveal which heap
+    // the divergent pointer targets (cpp_arena / sq / bullet / mspace / the
+    // real Win32 heap).
+    {
+        Arena& C = g_ar[2];
+        static uint8_t* shadow       = nullptr;
+        static int32_t  shadow_frame = -1;
+        static bool     diff_done    = false;
+        if (!diff_done) {
+            if (shadow_frame < 0) {
+                if (!shadow)
+                    shadow = (uint8_t*)VirtualAlloc(nullptr, C.size,
+                                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (shadow && frame >= 6) {
+                    memcpy(shadow, C.base, C.size);
+                    shadow_frame = (int32_t)frame;
+                    log_printf("[cppdiff] shadow of cpp_arena taken at f=%u\n",
+                               frame);
+                }
+            } else if ((int32_t)frame == shadow_frame) {
+                const uint32_t* a = (const uint32_t*)shadow;
+                const uint32_t* b = (const uint32_t*)C.base;
+                uint32_t bump = *(const uint32_t*)(C.base + BUMP_OFF[2]);
+                int hits = 0;
+                for (uint32_t o = 0; o < bump && hits < 12; o += 4) {
+                    uint32_t i = o >> 2;
+                    if (a[i] != b[i]) {
+                        log_printf("[cppdiff] f=%u off=0x%X fwd=%08x now=%08x\n",
+                                   frame, o, a[i], b[i]);
+                        ++hits;
+                    }
+                }
+                log_printf("[cppdiff] done — %d differing dwords "
+                           "(cpp_arena base=%p)\n", hits, (void*)C.base);
+                diff_done = true;
+            }
+        }
+    }
+
     // Periodic report — dirty pages + where capture's time goes.
     static uint32_t prc = 0, psq = 0, pbt = 0;
     static uint64_t a_ww = 0, a_dirty = 0, a_rest = 0, a_fold = 0;
