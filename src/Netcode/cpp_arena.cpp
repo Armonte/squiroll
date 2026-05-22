@@ -339,10 +339,13 @@ void     set_resim(bool on) { g_resim = on; }
 // thread keeps live decoder state there). Returns nullptr on overflow, so
 // the caller can fall back. The block is range-routed back to arena_free
 // like any other arena pointer, so a later free is handled.
-void* raw_alloc(uint32_t n) {
+void* raw_alloc(uint32_t n, uint32_t caller_abs) {
     if (!g_meta) return nullptr;
-    // Tag the block with this call site (see Hdr::link / attribute()).
-    g_opnew_caller = (uint32_t)(uintptr_t)_ReturnAddress();
+    // Tag the block with the real th155 call site (passed through by the
+    // redirect shim) so attribute() names actual code, not the Netcode.dll
+    // shim. See Hdr::link / attribute().
+    g_opnew_caller = caller_abs ? caller_abs
+                   : (uint32_t)(uintptr_t)_ReturnAddress();
     return arena_alloc(n);
 }
 

@@ -57,7 +57,9 @@ void set_resim(bool on);
 
 // Raw arena allocation, bypassing the operator-new routing. nullptr on
 // overflow. See tf4_pool — re-homes th155's Squirrel-instance object pool.
-void* raw_alloc(uint32_t n);
+// caller_abs: the absolute address of the real (th155) call site, so
+// attribute() names it instead of the redirect shim; 0 = use _ReturnAddress.
+void* raw_alloc(uint32_t n, uint32_t caller_abs);
 
 // DIAGNOSTIC: log which allocated block owns arena byte-offset `off`, and
 // the RVA of the code that allocated it — attributes a rollback divergence

@@ -22,7 +22,10 @@ namespace {
 // that the rollback snapshot captures; on overflow it returns nullptr and
 // SQVM__Call_0's own fallback path takes over.
 static void* __fastcall pool_alloc_redirect(void* /*mspace*/, uint32_t size) {
-    return cpp_arena::raw_alloc(size);
+    // Pass our return address — the th155 pool-grow call site (inside
+    // tf4_objpool_grow) — so the arena tags the slab with real th155 code
+    // rather than this shim, keeping cpp_arena::attribute() meaningful.
+    return cpp_arena::raw_alloc(size, (uint32_t)(uintptr_t)_ReturnAddress());
 }
 
 } // namespace
