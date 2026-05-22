@@ -29,6 +29,11 @@ void watch_cxx(bool on);
 void watchpoint_arm(void* addr);
 void watchpoint_disarm();
 
+// Register a th155 worker thread (call from the _beginthreadex hook). The
+// hardware watchpoint then arms DR0 on every registered thread, not just
+// the simulation thread — needed to catch a non-sim-thread writer.
+void register_thread(uint32_t tid);
+
 } // namespace crash_handler
 
 #endif // CRASH_HANDLER_H

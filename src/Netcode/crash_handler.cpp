@@ -27,6 +27,13 @@ static void*         g_wp_addr  = nullptr;
 static volatile LONG g_wp_quota = 0;
 static uint32_t      g_wp_last  = 0;     // last logged value (log on change)
 
+// All th155 worker threads (registered from the _beginthreadex hook), so a
+// hardware watchpoint can be armed on EVERY thread — not just the sim
+// thread — to catch a non-sim writer.
+static DWORD            g_tids[64] = {0};
+static int              g_n_tids   = 0;
+static CRITICAL_SECTION g_tids_lock;
+
 // Append a chunk to the crash log fully synchronously.
 static void crash_write(const char* data, int len) {
     if (len <= 0) return;
@@ -83,8 +90,9 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
                 g_wp_last = v;
                 char loc[MAX_PATH + 32];
                 describe_addr(ep->ContextRecord->Eip, loc);
-                log_printf("[wp] %p <- %08X  eip=%08X %s\n", g_wp_addr, v,
-                           (unsigned)ep->ContextRecord->Eip, loc);
+                log_printf("[wp] %p <- %08X  eip=%08X tid=%u %s\n",
+                           g_wp_addr, v, (unsigned)ep->ContextRecord->Eip,
+                           GetCurrentThreadId(), loc);
             }
             ep->ContextRecord->Dr6 = 0;
         }
@@ -240,38 +248,85 @@ void watch_cxx(bool on) { g_watch_cxx = on ? 1 : 0; }
 // Arm a hardware data-write watchpoint on `addr` (4 bytes) for the CURRENT
 // thread — call this on the simulation thread. Every write to those bytes
 // then traps into veh(), which logs the writing instruction.
+// Set DR0 watchpoint on a non-current th155 thread (Suspend / Get/SetThread-
+// Context / Resume). addr=0 disarms.
+static void wp_apply_other(DWORD tid, void* addr) {
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                          THREAD_SET_CONTEXT, FALSE, tid);
+    if (!h) return;
+    if (SuspendThread(h) != (DWORD)-1) {
+        CONTEXT ctx; ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(h, &ctx)) {
+            ctx.Dr0 = (DWORD)(uintptr_t)addr;
+            ctx.Dr6 = 0;
+            ctx.Dr7 = (ctx.Dr7 & ~0x000F0003u) |
+                      (addr ? 0x000D0001u : 0u);
+            SetThreadContext(h, &ctx);
+        }
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+}
+
+void register_thread(uint32_t tid) {
+    EnterCriticalSection(&g_tids_lock);
+    bool exists = false;
+    for (int i = 0; i < g_n_tids; ++i)
+        if (g_tids[i] == (DWORD)tid) { exists = true; break; }
+    if (!exists && g_n_tids < 64) g_tids[g_n_tids++] = (DWORD)tid;
+    LeaveCriticalSection(&g_tids_lock);
+    // If a watchpoint is already armed, propagate it onto the new thread so
+    // it's covered from the instant of its first instruction.
+    if (g_wp_addr && (DWORD)tid != GetCurrentThreadId())
+        wp_apply_other((DWORD)tid, g_wp_addr);
+}
+
 void watchpoint_arm(void* addr) {
     g_wp_addr  = addr;
     g_wp_quota = 256;
     g_wp_last  = *(volatile uint32_t*)addr;
-    CONTEXT ctx;
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    // Self
+    CONTEXT ctx; ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     HANDLE self = GetCurrentThread();
-    if (!GetThreadContext(self, &ctx)) return;
-    ctx.Dr0 = (DWORD)(uintptr_t)addr;
-    ctx.Dr6 = 0;
-    // DR7: L0 (bit 0) enables DR0; R/W0 (bits 16-17)=01 write; LEN0
-    // (bits 18-19)=11 four bytes -> bits 16-19 = 0xD.
-    ctx.Dr7 = (ctx.Dr7 & ~0x000F0003u) | 0x000D0001u;
-    SetThreadContext(self, &ctx);
-    log_printf("[wp] armed on %p (thread %u)\n", addr, GetCurrentThreadId());
+    if (GetThreadContext(self, &ctx)) {
+        ctx.Dr0 = (DWORD)(uintptr_t)addr;
+        ctx.Dr6 = 0;
+        // DR7: L0=1; R/W0 (bits 16-17)=01 write; LEN0 (bits 18-19)=11 4 bytes.
+        ctx.Dr7 = (ctx.Dr7 & ~0x000F0003u) | 0x000D0001u;
+        SetThreadContext(self, &ctx);
+    }
+    // Fan out to every other registered th155 thread so a non-sim writer
+    // (audio / input polling / loader) is caught too.
+    DWORD me = GetCurrentThreadId();
+    int n = 0;
+    EnterCriticalSection(&g_tids_lock);
+    for (int i = 0; i < g_n_tids; ++i)
+        if (g_tids[i] != me) { wp_apply_other(g_tids[i], addr); ++n; }
+    int total = g_n_tids;
+    LeaveCriticalSection(&g_tids_lock);
+    log_printf("[wp] armed on %p (self tid=%u + %d/%d other th155 threads)\n",
+               addr, me, n, total);
 }
 
-// Disarm the watchpoint on the current thread.
 void watchpoint_disarm() {
-    CONTEXT ctx;
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    CONTEXT ctx; ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     HANDLE self = GetCurrentThread();
     if (GetThreadContext(self, &ctx)) {
         ctx.Dr0 = 0;
         ctx.Dr7 &= ~0x000F0003u;
         SetThreadContext(self, &ctx);
     }
+    DWORD me = GetCurrentThreadId();
+    EnterCriticalSection(&g_tids_lock);
+    for (int i = 0; i < g_n_tids; ++i)
+        if (g_tids[i] != me) wp_apply_other(g_tids[i], nullptr);
+    LeaveCriticalSection(&g_tids_lock);
     g_wp_addr = nullptr;
 }
 
 void install() {
     if (g_veh) return;
+    InitializeCriticalSection(&g_tids_lock);
     // Handler-1 = first in the VEH chain, so we log before anything else
     // gets a chance to swallow the exception.
     g_veh = AddVectoredExceptionHandler(1, veh);

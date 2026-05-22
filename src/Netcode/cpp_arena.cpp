@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "cpp_arena.h"
+#include "crash_handler.h" // register_thread for the hardware watchpoint
 #include "patch_utils.h"   // _R address literal
 #include "util.h"
 #include "log.h"
@@ -361,6 +362,7 @@ static uintptr_t cdecl hook_beginthreadex(void* sec, unsigned stk, void* start,
         bool audio = (g_audio_hi > g_audio_lo) &&
                      (srva >= g_audio_lo && srva < g_audio_hi);
         if (audio && g_n_excl_tid < 16) g_excl_tid[g_n_excl_tid++] = tid;
+        crash_handler::register_thread((uint32_t)tid);
         log_printf("[cpp_arena] thread spawned tid=%u start_rva=%08X%s\n",
                    tid, srva, audio ? "  [excluded from arena]" : "");
     }
