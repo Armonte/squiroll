@@ -15,6 +15,15 @@ namespace {
 // call site moves every pool slab into cpp_arena without disturbing the
 // mspace. hotpatch_rel32 takes the address of the rel32 OPERAND — one byte
 // past the E8 opcode at 0x45D99.
+//
+// HISTORICAL NOTE: an inline-hook on TF4__MeshVertex__PoolAlloc's entry
+// (catching every caller through one gate) was tested — it caught
+// Manbow::NetworkNode::BeginStreaming's 342KB streaming buffer too, whose
+// receive content is inherently non-deterministic, and produced an
+// EARLIER cpp_arena divergence (f=10). The right discriminator isn't
+// "sim thread" but "battle pool vs network/audio/etc" — narrow at the
+// known battle call site for now; a per-caller exclusion list at the
+// entry would be the next step if more battle pool grow sites surface.
 #define POOL_ALLOC_REL32  (0x45D9A_R)
 
 // The original TF4 mspace allocator we replaced. Used as the fallback for
