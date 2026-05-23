@@ -5,6 +5,7 @@
 
 #include "crash_handler.h"
 #include "log.h"
+#include "util.h"   // base_address — needed by the clguard VEH path
 
 // Vectored exception handler — see crash_handler.h. Everything here must be
 // crash-safe: no CRT locks, no heap, no float. wvsprintfA is used instead of
@@ -116,6 +117,69 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
             ep->ContextRecord->Dr6 = 0;
         }
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // DEFENSIVE GUARD: concurrent_list_walk_visit (th155 0x13B00) dereferences
+    // each list node's payload pointer at two sites — and on hit, the game's
+    // task list sometimes contains a stale entry whose payload field has been
+    // overwritten by a small int (~0x870000). We need the game to keep
+    // running so we can hunt the corruptor's source, so absorb the AV and
+    // step past the bad instruction with cleared / set flags that take the
+    // \"skip this node\" branch.
+    if (code == EXCEPTION_ACCESS_VIOLATION) {
+        const CONTEXT* gc = ep->ContextRecord;
+        uint32_t rva = (uint32_t)((uintptr_t)ep->ExceptionRecord->ExceptionAddress
+                                  - ::base_address);
+        // Three crash sites in concurrent_list_walk_visit (th155 0x13B00).
+        // ALL go through the same recovery: jump to the function epilogue
+        // at 0x13B86 (pop edi -> pop esi -> pop ebx -> mov esp,ebp ->
+        // pop ebp -> retn 10h). That bypasses the `mov [edi+8], esi`
+        // store at 0x13B83 so we don't corrupt list_state[2] further.
+        // mov esp,ebp normalizes the stack, so jumping from anywhere
+        // inside the function body lands safely.
+        if (rva == 0x13B31 || rva == 0x13B34 || rva == 0x13B5E) {
+            static uint32_t total_hits = 0;
+            ++total_hits;
+            if ((total_hits & 0xFF) == 1) {
+                crash_logf("\r\n[clguard] AV at 0x%X in walk_visit "
+                           "(esi=%08X edi=%08X) — jumping to epilogue. "
+                           "(total hits #%u)\r\n",
+                           rva, gc->Esi, gc->Edi, total_hits);
+            }
+
+            // First crash at 0x13B34 only: arm DR0 on the list_state+8
+            // slot once so we can attribute the upstream corruptor's
+            // write. list_state was saved at [ebp-4] by the prologue.
+            if (rva == 0x13B34) {
+                uintptr_t list_state = 0;
+                if (!IsBadReadPtr((void*)(uintptr_t)(gc->Ebp - 4), 4)) {
+                    list_state = *(uintptr_t*)(uintptr_t)(gc->Ebp - 4);
+                }
+                static bool g_clguard_armed = false;
+                if (!g_clguard_armed && list_state) {
+                    void* slot = (void*)(list_state + 8);
+                    g_wp_addr  = slot;
+                    g_wp_quota = 256;
+                    g_wp_last  = *(volatile uint32_t*)slot;
+                    CONTEXT* hctx = ep->ContextRecord;
+                    hctx->Dr0 = (DWORD)(uintptr_t)slot;
+                    hctx->Dr6 = 0;
+                    hctx->Dr7 = (hctx->Dr7 & ~0x000F0003u) | 0x000D0001u;
+                    crash_logf("[clguard] DR0 armed on list_state+8 slot "
+                               "%08X (current=%08X) — next write to this "
+                               "slot logs the corruptor\r\n",
+                               (unsigned)(uintptr_t)slot, g_wp_last);
+                    g_clguard_armed = true;
+                }
+            }
+
+            // Jump straight to the function epilogue. Bypass the bad
+            // store at 0x13B83 — we leave list_state[2] untouched so
+            // the corruptor's bogus value is preserved (and the next
+            // walk just re-fires our guard).
+            ep->ContextRecord->Eip = ::base_address + 0x13B86;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
 
     // Genuine fatal faults are always logged. Any OTHER exception code — C++
