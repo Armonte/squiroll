@@ -29,6 +29,7 @@
 #include "input_hist.h"
 #include "tf4_pool.h"
 #include "sq_trace.h"
+#include "actor2d_log.h"
 
 #include <shared.h>
 
@@ -362,6 +363,13 @@ bool common_init(
     // existence. Required by the rollback save/load path (gekko_bridge).
     // Must run before any Squirrel-driven actor creation.
     live_actors::install();
+
+    // DIAGNOSTIC: per-call dump of the count_this vs count_child comparison
+    // in Manbow::Actor2D::UpdateChildMatrices — pins which Actor2D produces
+    // the f=15 rollback divergence by flipping the createProxy/setAabb
+    // branch. Installs unconditionally; the hook self-gates to a tiny frame
+    // window so it's silent in production play outside that window.
+    actor2d_log::install();
 
     // Two-instance local testing: gate XInput reads by which window has
     // focus, so the same controller drives whichever player owns the
