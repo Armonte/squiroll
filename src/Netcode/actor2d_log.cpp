@@ -5,8 +5,9 @@
 
 #include <windows.h>
 #include <stdint.h>
+#include <intrin.h>        // _ReturnAddress
 
-#include "patch_utils.h"   // _R address literal
+#include "patch_utils.h"   // _R address literal, base_address
 #include "util.h"          // thiscall
 #include "log.h"
 
@@ -61,6 +62,22 @@ static int thiscall hook(int this_ptr) {
     int f  = gekko_bridge::g_trace_frame;
     int rb = gekko_bridge::g_trace_rb;
 
+    // Caller RVA so we can attribute each call to its xref. The known
+    // callers all live in th155 (this is a th155-internal function):
+    //   0xC133D StepMovement (Update_mask0/1 inner loop)
+    //   0xC13F0 sub_C13F0    (Update_mask2 inner loop)
+    //   0xC1520 sub_C1520    (Actor2D::InvokeFuncImpl)
+    //   0xC15D0 Actor2D::Warp
+    //   0xC1610 Actor2D::Warp3D
+    //   0x95D22 Actor2D::SetParent
+    //   0xC1206 Actor2DManager::InitActorState
+    //   0xC1D00 a std::function lambda
+    // Knowing which entry path fires at the divergent frame separates a
+    // per-frame StepMovement (mask0/1 vs mask2) divergence from a
+    // Warp/SetParent triggered by a Squirrel script callback in between.
+    uint32_t caller_rva =
+        (uint32_t)((uintptr_t)_ReturnAddress() - base_address);
+
     if (f >= F_LO && f <= F_HI) {
         uint32_t v_begin = *(uint32_t*)(this_ptr + 156);
         uint32_t v_end   = *(uint32_t*)(this_ptr + 160);
@@ -90,9 +107,9 @@ static int thiscall hook(int this_ptr) {
         else if (count_this > count_child)   branch = "THEN(setAabb)";
         else                                  branch = "ELSE(createProxy)";
 
-        log_printf("[a2dlog] f=%d rb=%d this=%08X ct=%u cc=%u %s "
+        log_printf("[a2dlog] f=%d rb=%d this=%08X by=%05X ct=%u cc=%u %s "
                    "vb=%08X ve=%08X cb=%08X ce=%08X g56=%08X g112=%02X\n",
-                   f, rb, (uint32_t)this_ptr,
+                   f, rb, (uint32_t)this_ptr, caller_rva,
                    count_this, count_child, branch,
                    v_begin, v_end, c_begin, c_end,
                    guard_bp, (unsigned)guard_flag);
