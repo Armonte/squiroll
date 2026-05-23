@@ -180,6 +180,30 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
             ep->ContextRecord->Eip = ::base_address + 0x13B86;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // Manbow::Actor2DGroup::RebuildActorList (th155 0x9B1A0) crash
+        // site at 0x9B1AB: `mov [eax], edi` where eax is the current
+        // node's prev pointer — corrupted to a th155 .rdata address.
+        // The same pointer-corruption pattern as walk_visit; here it
+        // shows up during the unlink-bad-entry path.
+        //
+        // Recovery: skip past the unlink + dtor + free, jump to the
+        // \"esi = edi (next)\" advance at 0x9B1EF. The list keeps the
+        // bad node in place, but iteration continues to the next
+        // node so the rebuild doesn't abort the frame.
+        if (rva == 0x9B1AB || rva == 0x9B1B2) {
+            static uint32_t hits = 0;
+            ++hits;
+            if ((hits & 0xFF) == 1) {
+                crash_logf("\r\n[clguard] AV at 0x%X in RebuildActorList "
+                           "(eax=%08X esi=%08X) — skipping unlink, "
+                           "advancing to next node. (hit #%u)\r\n",
+                           rva, gc->Eax, gc->Esi, hits);
+            }
+            // edi already holds `next` (from `mov edi, [esi]` at 0x9B1A9).
+            // Jump to `mov esi, edi` at 0x9B1EF.
+            ep->ContextRecord->Eip = ::base_address + 0x9B1EF;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
 
     // Genuine fatal faults are always logged. Any OTHER exception code — C++

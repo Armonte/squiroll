@@ -33,6 +33,7 @@
 #include "sqfun_log.h"
 #include "input_command_log.h"
 #include "input_global_sync.h"
+#include "cl_iter_guard.h"
 
 #include <shared.h>
 
@@ -397,6 +398,14 @@ bool common_init(
     // every re-sim makes InputCommand's per-frame ring write deterministic
     // regardless of who polls the underlying device.
     input_global_sync::install();
+
+    // DEFENSIVE: short-circuit concurrent_list_iter_step when its iter
+    // position field holds one of our arena bases (cpp/sq/bt). That
+    // value comes from a still-unattributed corruptor, and reaches
+    // walk_visit where it faults on the payload deref. The clguard in
+    // crash_handler absorbs the VEH-level AV; this hook prevents it
+    // from happening at all by skipping the walk upstream.
+    cl_iter_guard::install();
 
     // Two-instance local testing: gate XInput reads by which window has
     // focus, so the same controller drives whichever player owns the
