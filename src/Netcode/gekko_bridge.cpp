@@ -698,16 +698,12 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
     cpp_arena::trace_check(frame);
     cpp_arena::trace_reset();
 
-    // DIAGNOSTIC: hardware-watchpoint a bullet_arena page that the per-frame
-    // phash-snap diagnostic identified as diverging at f=15. Armed after
-    // f=14's save (across f=15's advance) on every registered th155 thread
-    // — catches both the forward writer and the re-sim writer to compare.
-    if (bullet_arena::base()) {
-        // Target one bullet dword the per-frame byte-diff identified as
-        // diverging at f=15 — bt @ 0x480830 (a float ~0x43E37D71 / 466.x).
-        if (frame == 14)      crash_handler::watchpoint_arm(bullet_arena::base() + 0x480830);
-        else if (frame == 15) crash_handler::watchpoint_disarm();
-    }
+    // (Previously: a hardcoded watchpoint arm at frame=14 / disarm at 15
+    // on bullet_arena+0x480830. snapshot_ring's divbyte loop now auto-arms
+    // DR0 on the FIRST divergent dword across the run — leaving that arm
+    // in place catches subsequent writers across every re-sim of f=15.
+    // The hardcoded arm was disarming our auto-arm before the writer
+    // could fire, so removed.)
 
     uint8_t* p = static_cast<uint8_t*>(buf);
     SaveHeader* hdr = reinterpret_cast<SaveHeader*>(p);

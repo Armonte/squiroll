@@ -6,6 +6,7 @@
 #include "sq_arena.h"
 #include "bullet_arena.h"
 #include "cpp_arena.h"
+#include "crash_handler.h"   // watchpoint_arm — auto-attribute first divergence
 #include "log.h"
 
 namespace snapshot_ring {
@@ -349,6 +350,14 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             }
             // Targeted byte-diff on the hardcoded TARGET_PAGES — produces
             // FORWARD vs RE-SIM dwords for the pages we already know diverge.
+            // (DR0 arm moved out — see frame=0 / forward-save hardcode below.
+            // Arming on a re-sim's divbyte detection is TOO LATE: the writer
+            // we want fires in forward's advance(15), which finishes before
+            // the first re-sim of f=15 ever reaches divbyte. By the time we
+            // arm, the writer-of-3 in forward has long since left and only
+            // re-sims run — and re-sims may not even write the dword at all
+            // (as observed: 0 game writes after a re-sim-side arm, the
+            // divergence is forward writing while re-sims don't.)
             for (int i = 0; i < N_TARGETS; ++i) {
                 int       a   = TARGET_PAGES[i].arena;
                 uint32_t  off = TARGET_PAGES[i].off;
@@ -385,6 +394,28 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                 int a = TARGET_PAGES[i].arena; uint32_t off = TARGET_PAGES[i].off;
                 if (off + PAGE <= g_ar[a].size)
                     memcpy(S.page_snap[i], g_ar[a].base + off, PAGE);
+            }
+            // ALSO arm DR0 on the known-divergent sq dword on the FORWARD
+            // save of frame=14. Why here: the writer of the 3↔2 swap fires
+            // in forward's advance(15), which runs after save(14) and
+            // before save(15). Arming at save(14) means DR0 catches that
+            // forward writer when it fires. Arming at save(15) (the first
+            // divbyte detection) is too late — forward has already
+            // written; only re-sims run after, and re-sims may not write
+            // the dword at all.
+            //
+            // Address is sq_arena's first target page + the dword that
+            // divbyte consistently shows diverging — see project_squiroll_
+            // tf4_mspace.md. One-shot — never re-armed or disarmed.
+            static bool g_sq_dr0_armed = false;
+            if (!g_sq_dr0_armed && frame == 14 && g_ar[0].base) {
+                void* sq_target = g_ar[0].base + 0x9EE554;
+                crash_handler::watchpoint_arm(sq_target);
+                log_printf("[snapshot_ring] DR0 -> sq 0x%X (arena=%p + "
+                           "0x9EE554 = %p) — will fire on the forward "
+                           "advance(15) writer of the 3<->2 swap dword\n",
+                           0x9EE554, g_ar[0].base, sq_target);
+                g_sq_dr0_armed = true;
             }
         }
     }

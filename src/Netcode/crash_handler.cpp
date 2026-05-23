@@ -85,7 +85,13 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
     if (code == (DWORD)EXCEPTION_SINGLE_STEP) {
         if (g_wp_addr && (ep->ContextRecord->Dr6 & 0xFu)) {
             uint32_t v = *(volatile uint32_t*)g_wp_addr;
-            if (v != g_wp_last && g_wp_quota > 0) {
+            // Log every write while quota lasts. The previous \"only when v
+            // changed\" filter hid the case where a re-sim writer writes the
+            // same value repeatedly — exactly the f=15 sq-arena pattern we
+            // need to attribute (forward writes 3, re-sims deterministically
+            // write 2; subsequent re-sim writers all write 2 == g_wp_last
+            // and never logged). Quota still bounds total log volume.
+            if (g_wp_quota > 0) {
                 InterlockedDecrement(&g_wp_quota);
                 g_wp_last = v;
                 char loc[MAX_PATH + 32];

@@ -112,35 +112,25 @@ static unsigned thiscall hook(int* this_ptr, int stack_arg) {
     uint8_t* state = (uint8_t*)(uintptr_t)(src_ptr + 4);
 
     if (rb == 0) {
-        // Forward: snapshot the state RIGHT BEFORE the function body reads
-        // it. The capture happens at the same entry our trampoline jumps
-        // to, so capture and the original's read see byte-identical state.
         Slot* s = find_slot(f, this_ptr, /*allocate=*/true);
         if (s) {
             memcpy(s->bytes, state, STATE_BYTES);
         } else {
             static uint32_t overflow_log = 0;
             if ((overflow_log++ & 0x3F) == 0) {
-                log_printf("[igsync] ring overflow f=%d ic=%p — "
-                           "more than %u InputCommands live?\n",
-                           f, this_ptr, INSTANCES);
+                log_printf("[igsync] ring overflow f=%d ic=%p\n", f, this_ptr);
             }
         }
         return g_h.unsafe_thiscall<unsigned>(this_ptr, stack_arg);
     }
 
-    // Re-sim: write the forward-captured bits into source+4 so the
-    // function body reads identical state. Then call the original
-    // normally — its writes to the InputCommand's own rings are
-    // deterministic given identical inputs.
     Slot* s = find_slot(f, this_ptr, /*allocate=*/false);
     if (s) {
         memcpy(state, s->bytes, STATE_BYTES);
     } else {
         static uint32_t miss_log = 0;
         if ((miss_log++ & 0x3F) == 0) {
-            log_printf("[igsync] re-sim miss f=%d ic=%p — falling through "
-                       "(divergence possible)\n", f, this_ptr);
+            log_printf("[igsync] re-sim miss f=%d ic=%p\n", f, this_ptr);
         }
     }
     return g_h.unsafe_thiscall<unsigned>(this_ptr, stack_arg);
