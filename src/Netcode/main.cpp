@@ -31,6 +31,7 @@
 #include "sq_trace.h"
 #include "actor2d_log.h"
 #include "sqfun_log.h"
+#include "input_command_log.h"
 
 #include <shared.h>
 
@@ -379,6 +380,13 @@ bool common_init(
     // a2dstep "noUCM(v=0)" entries (where vx=0) and "UCM" (where vx=11.5);
     // a script function called from this site is the prime suspect.
     sqfun_log::install();
+
+    // DIAGNOSTIC: per-call dump of Manbow::InputCommand::Update's input
+    // source vtable. battle_pools' panopticon found InputCommand's input
+    // ring diverges at every frame from f=2 onwards — the polled bits
+    // bypass gekko's forced_inputs override. This hook names the input
+    // source class so we can route it through the synced path.
+    input_command_log::install();
 
     // Two-instance local testing: gate XInput reads by which window has
     // focus, so the same controller drives whichever player owns the
