@@ -32,6 +32,7 @@
 #include "actor2d_log.h"
 #include "sqfun_log.h"
 #include "input_command_log.h"
+#include "input_global_sync.h"
 
 #include <shared.h>
 
@@ -382,11 +383,20 @@ bool common_init(
     sqfun_log::install();
 
     // DIAGNOSTIC: per-call dump of Manbow::InputCommand::Update's input
-    // source vtable. battle_pools' panopticon found InputCommand's input
-    // ring diverges at every frame from f=2 onwards — the polled bits
-    // bypass gekko's forced_inputs override. This hook names the input
-    // source class so we can route it through the synced path.
-    input_command_log::install();
+    // source vtable. This identified Manbow::InputGlobal/InputMulti as
+    // the source (see input_command_log.cpp comments) and is now disabled
+    // because input_global_sync hooks the SAME function and only one
+    // SafetyHookInline can own a given entry — the fix takes priority.
+    // Re-enable temporarily by commenting out the sync hook below if you
+    // need to re-examine the input source identity.
+    // input_command_log::install();
+
+    // FIX: capture-and-replay the polled input state at InputCommand::Update
+    // entry. The 32-byte buffer at *(InputCommand+0)+4 is what the function
+    // body reads via vtable[4]; capturing it on forward and restoring on
+    // every re-sim makes InputCommand's per-frame ring write deterministic
+    // regardless of who polls the underlying device.
+    input_global_sync::install();
 
     // Two-instance local testing: gate XInput reads by which window has
     // focus, so the same controller drives whichever player owns the

@@ -2118,8 +2118,20 @@ bool tick() {
                                       (int)e->data.adv.rolling_back, "adv-top");
                 if (rb_diag_enabled()) {
                     battle_pools::log_fingerprint("adv-top");
-                    battle_pools::diff_locate((int)e->data.adv.frame,
-                                              (int)e->data.adv.rolling_back);
+                    // NB: adv-top diff_locate disabled. Post-advance
+                    // diff_locate (below, after the advance completes)
+                    // shares the same slot[frame%RING] storage, and a
+                    // pre-advance call's slot value is overwritten by the
+                    // post-advance call for the same frame — so a re-sim
+                    // adv-top compare would diff PRE-advance current
+                    // against POST-advance saved, producing a false
+                    // positive on every frame. Keep just the post-advance
+                    // diff — that's the one that catches \"advance()
+                    // produced different output\" anyway.
+                    //
+                    // battle_pools::diff_locate(
+                    //     (int)e->data.adv.frame,
+                    //     (int)e->data.adv.rolling_back);
                 }
                 LARGE_INTEGER _ta0; QueryPerformanceCounter(&_ta0);
                 advance_one_frame();

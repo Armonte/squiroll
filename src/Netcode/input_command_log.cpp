@@ -54,12 +54,22 @@ static unsigned thiscall hook(int* this_ptr, int arg) {
         uint32_t caller_rva =
             (uint32_t)((uintptr_t)_ReturnAddress() - base_address);
 
+        // Dump the 8 dwords at source+4 — exactly what vtable[4] returns
+        // (`return this+4`) and what InputCommand::Update reads as v3.
+        uint32_t v3[8] = {0};
+        if (src_ptr) {
+            memcpy(v3, (const void*)(uintptr_t)(src_ptr + 4), sizeof(v3));
+        }
+
         log_printf("[icmd] f=%d rb=%d by=%05X this=%08X src=%08X "
-                   "src_vt=%08X poll_rva=%05X ring_idx=%u arg=%d\n",
+                   "src_vt=%08X poll_rva=%05X idx=%u arg=%d "
+                   "v3=[%08X %08X %08X %08X %08X %08X %08X %08X]\n",
                    f, rb, caller_rva, (uint32_t)(uintptr_t)this_ptr,
                    src_ptr, src_vtbl,
                    vt_pollfn ? (vt_pollfn - (uint32_t)base_address) : 0,
-                   ring_idx, arg);
+                   ring_idx, arg,
+                   v3[0], v3[1], v3[2], v3[3],
+                   v3[4], v3[5], v3[6], v3[7]);
     }
 
     return g_h.unsafe_thiscall<unsigned>(this_ptr, arg);
