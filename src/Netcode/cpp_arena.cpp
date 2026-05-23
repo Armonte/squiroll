@@ -232,9 +232,25 @@ static void arena_free(void* p) {
     g_meta->live_bytes -= h->reqsize;
     uint32_t foff = (uint32_t)((uint8_t*)h - g_base);
     trace_rec(2, h->reqsize, 0, foff);
+    // EXPERIMENTAL — option (ii): instead of putting the block on its
+    // size-class free list, LEAK it. arena_alloc always bumps to fresh
+    // memory, no recycle. Used to test the hypothesis that cpp_arena's
+    // deterministic recycle exposes a latent use-after-free in TH155
+    // (a freed list node gets reused immediately and the new owner's
+    // bytes look like list pointers when the stale list walks it).
+    //
+    // If this fixes the hit-crash, the recycle is the cause and we
+    // need either a quarantine (delay recycle N frames) or to find
+    // the offending freer. Memory cost is real — full 128MB capacity
+    // gets exhausted faster — but should comfortably last one match.
+    // Zero-fill the payload too so any stale read sees null, not the
+    // previous live data.
+    memset(p, 0, h->reqsize);
     h->magic     = 0;
-    h->link      = g_meta->free_off[ci];
-    g_meta->free_off[ci] = foff;
+    // Free-list link NOT updated: block stays orphaned, arena_alloc
+    // will skip the free list and bump.
+    (void)foff;
+    (void)ci;
     LeaveCriticalSection(&g_lock);
 }
 
