@@ -322,9 +322,15 @@ static void cdecl hook_free(void* block) {
         return;
     }
     if (g_resim) {
-        if (g_warn && (g_resim_skips & 0x3FF) == 0) {
+        // DIAGNOSTIC: log caller RVA every 64 suppressions so we can
+        // identify the divergence sources (real-heap frees that the
+        // forward run does but the re-sim suppresses). The forward run's
+        // matching free DOES happen — the asymmetry is exactly here.
+        if ((g_resim_skips & 0x3F) == 0) {
+            uint32_t caller = (uint32_t)(uintptr_t)_ReturnAddress();
             log_printf("[cpp_arena] re-sim: suppressed real-heap free %p "
-                       "(#%u)\n", block, g_resim_skips);
+                       "(#%u) by rva=%08X\n", block, g_resim_skips,
+                       caller - (uint32_t)base_address);
         }
         ++g_resim_skips;
         return;
