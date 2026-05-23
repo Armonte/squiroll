@@ -406,7 +406,9 @@ static constexpr uint32_t DIFF_CAP  = 4u * 1024 * 1024;
 struct DiffEntry { int frame; uint32_t len; uint8_t* buf; };
 static DiffEntry g_diff[DIFF_RING];
 static bool      g_diff_init = false;
-static bool      g_diff_done = false;
+// Was: g_diff_done — a one-shot gate that stopped diff_locate after the
+// first divergence. Removed when chasing the f=15 1-of-8 transient: we
+// want EVERY divergent re-sim attributed.
 
 // Serialize just the suspect pools. Per pool: [pool-index 4][Pool 0x1C]
 // [nblocks 4] then per block [addr 4][size 4][bytes...].
@@ -600,7 +602,13 @@ static void diff_decode(const uint8_t* fwd, const uint8_t* re,
 } // namespace
 
 void diff_locate(int frame, int rb) {
-    if (g_diff_done || frame < 0) return;
+    // NB: previously g_diff_done was set after the FIRST divergence so we
+    // wouldn't spam the log. But the panopticon use-case wants every
+    // divergent re-sim attributed — a 1-of-8 transient divergence (the
+    // f=15 EC2C/EE1C velocity write) needs each occurrence dumped. The
+    // arm_field_watch() side-effect inside diff_decode is itself a single
+    // shot (g_watch_addr guard), so the runaway risk is bounded.
+    if (frame < 0) return;
     if (!g_diff_init) {
         for (int i = 0; i < DIFF_RING; ++i) {
             g_diff[i].frame = -1;
@@ -637,7 +645,9 @@ void diff_locate(int frame, int rb) {
     log_printf("[bpdiff] *** NON-DETERMINISM frame=%d  fwd-len=%u resim-len=%u\n",
                frame, e.len, rn);
     diff_decode(e.buf, re, e.len, d);
-    g_diff_done = true;  // one-shot — the first divergence pins the field
+    // No g_diff_done flip — let every divergent re-sim of this or any
+    // later frame surface. (The HW watchpoint inside diff_decode is itself
+    // single-shot, so we don't keep re-arming Dr0.)
 }
 
 } // namespace battle_pools

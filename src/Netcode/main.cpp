@@ -30,6 +30,7 @@
 #include "tf4_pool.h"
 #include "sq_trace.h"
 #include "actor2d_log.h"
+#include "sqfun_log.h"
 
 #include <shared.h>
 
@@ -370,6 +371,14 @@ bool common_init(
     // branch. Installs unconditionally; the hook self-gates to a tiny frame
     // window so it's silent in production play outside that window.
     actor2d_log::install();
+
+    // DIAGNOSTIC: per-call dump of the SQObject targeted by the
+    // Sqrat::Function callback that Actor2DGroup::Update_mask1 fires between
+    // its Update and StepMovement passes. Same in-window gating as a2dlog.
+    // The divergent f=15 re-sim writes per-actor velocities BETWEEN our
+    // a2dstep "noUCM(v=0)" entries (where vx=0) and "UCM" (where vx=11.5);
+    // a script function called from this site is the prime suspect.
+    sqfun_log::install();
 
     // Two-instance local testing: gate XInput reads by which window has
     // focus, so the same controller drives whichever player owns the

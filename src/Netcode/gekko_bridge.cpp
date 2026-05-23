@@ -1527,6 +1527,16 @@ void advance_one_frame() {
     if (g_trace_rb) crash_handler::watch_cxx(false);
     cpp_arena::set_resim(false);
     log_state_fingerprint(g_trace_frame, g_trace_rb, "post-upd");
+    // Post-advance battle_pools diff. diff_locate at adv-top only compares
+    // load-state — i.e. the snapshot's deterministic round-trip — and rarely
+    // diverges in our setup. The interesting divergence is what advance()
+    // PRODUCED: the f=15 1-of-8 actor velocity write that ripples through
+    // sq/bt. Capture the forward post-state per frame, compare every re-sim's
+    // post-state against it, and dump the first diverging field (with HW
+    // write-watch armed) on each non-matching re-sim.
+    if (rb_diag_enabled()) {
+        battle_pools::diff_locate(g_trace_frame, g_trace_rb);
+    }
     ++*(uint32_t*)(0x4DACE0_R);                             // g_frame_counter
     if (trace) log_printf("[gekko_bridge] advance: exit\n");
 }
