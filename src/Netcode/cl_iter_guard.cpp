@@ -10,6 +10,7 @@
 #include "cpp_arena.h"
 #include "sq_arena.h"
 #include "bullet_arena.h"
+#include "crash_handler.h" // watchpoint_arm — corruptor hunt
 
 namespace cl_iter_guard {
 
@@ -41,6 +42,13 @@ static inline bool is_arena_base(uintptr_t v) {
 static int* thiscall hook(int* this_, int a2) {
     if (this_) {
         uintptr_t iter_pos = (uintptr_t)(uint32_t)this_[2];
+
+        // (Previously: corruptor-hunt DR0 arm on first heap list_state.
+        // Removed — the hits are all legitimate task-list writes by
+        // Act::ScriptAPI::RunOneFrame; arming on any one list rarely
+        // catches the corruptor since each run picks a different
+        // affected list. Hunt continues via the IDA route.)
+
         if (is_arena_base(iter_pos)) {
             static uint32_t hits = 0;
             if (((hits++) & 0x3F) == 0) {

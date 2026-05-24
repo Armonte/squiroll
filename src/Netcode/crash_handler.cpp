@@ -7,6 +7,10 @@
 #include "log.h"
 #include "util.h"   // base_address — needed by the clguard VEH path
 
+// Zydis — used by the universal NULL-deref skip in the VEH.
+#define ZYAN_NO_LIBC
+#include <Zydis/Zydis.h>
+
 // Vectored exception handler — see crash_handler.h. Everything here must be
 // crash-safe: no CRT locks, no heap, no float. wvsprintfA is used instead of
 // snprintf because it touches none of those (it also has no %f, which we
@@ -178,6 +182,99 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
             // the corruptor's bogus value is preserved (and the next
             // walk just re-fires our guard).
             ep->ContextRecord->Eip = ::base_address + 0x13B86;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // UNIVERSAL NULL-DEREF SKIP. Once cpp_arena leak-on-free is on,
+        // every post-UAF crash is a deref of a zeroed object: read or
+        // write at a low (< 0x10000) address. Skip the offending
+        // instruction wholesale: decode it with Zydis, advance EIP by
+        // its length, and continue. The destination register keeps
+        // its prior value — which is acceptable downstream because the
+        // higher-level th155 logic ALREADY tolerates the deref's result
+        // (the only path that should write to a freed object SHOULD
+        // have checked the object's validity, but didn't; the rest of
+        // the function expects a sane return).
+        //
+        // Special case: EIP is at NULL itself (the AV's fault address
+        // is the EIP we're trying to execute). That happens after a
+        // `call eax` where eax=0 — the call pushed the return address
+        // and then jumped to 0. We simulate the called function
+        // returning immediately: pop the return address off the stack
+        // and resume there. eax is left at whatever value it had
+        // (which is 0 anyway), and caller-saved regs are clobbered the
+        // same way a no-op function would clobber them.
+        if (ep->ExceptionRecord->NumberParameters >= 2 &&
+            gc->Eip < 0x10000u) {
+            // EXEC-at-NULL recovery — only for AVs where EIP=fault_addr
+            // and both are in the NULL page.
+            uintptr_t fault_addr =
+                (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+            if (fault_addr == (uintptr_t)gc->Eip) {
+                static uint32_t hits = 0;
+                ++hits;
+                if ((hits & 0x7F) == 1) {
+                    crash_logf("\r\n[clguard] EXEC-at-NULL recovery: "
+                               "eip=%08X esp=%08X (popping return addr). "
+                               "(hit #%u)\r\n",
+                               gc->Eip, gc->Esp, hits);
+                }
+                if (!IsBadReadPtr((void*)(uintptr_t)gc->Esp, 4)) {
+                    uintptr_t ret_addr = *(uintptr_t*)(uintptr_t)gc->Esp;
+                    ep->ContextRecord->Eip = (DWORD)ret_addr;
+                    ep->ContextRecord->Esp += 4;
+                    ep->ContextRecord->Eax = 0;  // dtor-style "void"
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+        if (ep->ExceptionRecord->NumberParameters >= 2) {
+            uintptr_t fault_addr =
+                (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+            if (fault_addr < 0x500000u && gc->Eip >= 0x10000u) {
+                // Decode the faulting instruction so we can step over it.
+                ZydisDecoder dec;
+                ZydisDecoderInit(&dec,
+                                 ZYDIS_MACHINE_MODE_LEGACY_32,
+                                 ZYDIS_STACK_WIDTH_32);
+                ZydisDecodedInstruction insn;
+                ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+                ZyanStatus zs = ZydisDecoderDecodeFull(
+                    &dec,
+                    (const void*)(uintptr_t)gc->Eip,
+                    16, &insn, ops);
+                if (ZYAN_SUCCESS(zs)) {
+                    static uint32_t hits = 0;
+                    ++hits;
+                    if ((hits & 0x7F) == 1) {
+                        crash_logf("\r\n[clguard] universal NULL-deref skip: "
+                                   "eip=%08X rva=%05X fault=%08X insn_len=%u "
+                                   "(hit #%u)\r\n",
+                                   gc->Eip, rva, (unsigned)fault_addr,
+                                   (unsigned)insn.length, hits);
+                    }
+                    ep->ContextRecord->Eip += insn.length;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+
+        // sub_EC130 at 0xEC1CD: `call dword ptr [eax]` where eax = NULL
+        // because we zero-filled a freed object in cpp_arena. The
+        // surrounding code does `if (edx)` to NULL-check the object
+        // itself, but not its vtable pointer. With leak-on-free zeroing
+        // the freed block, edx is non-null (points at the zeroed slot)
+        // and [edx] = 0, so [eax] = [0] = AV. Skip the call to the
+        // natural continuation at 0xEC1CF.
+        if (rva == 0xEC1CD) {
+            static uint32_t hits = 0;
+            ++hits;
+            if ((hits & 0x7F) == 1) {
+                crash_logf("\r\n[clguard] AV at 0xEC1CD (call [eax]) "
+                           "eax=%08X edx=%08X — skipping bad dtor call. "
+                           "(hit #%u)\r\n",
+                           gc->Eax, gc->Edx, hits);
+            }
+            ep->ContextRecord->Eip = ::base_address + 0xEC1CF;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // Manbow::Actor2DGroup::RebuildActorList (th155 0x9B1A0) crash
