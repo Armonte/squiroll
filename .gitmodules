@@ -4,3 +4,6 @@
 [submodule "deps/zydis"]
 	path = deps/zydis
 	url = https://github.com/zyantific/zydis.git
+[submodule "deps/squirrel"]
+	path = deps/squirrel
+	url = https://github.com/albertodemichelis/squirrel.git
