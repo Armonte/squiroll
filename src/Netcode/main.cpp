@@ -34,6 +34,8 @@
 #include "input_command_log.h"
 #include "input_global_sync.h"
 #include "cl_iter_guard.h"
+#include "eft_freer_log.h"
+#include "tree_walker_guard.h"
 
 #include <shared.h>
 
@@ -406,6 +408,23 @@ bool common_init(
     // crash_handler absorbs the VEH-level AV; this hook prevents it
     // from happening at all by skipping the walk upstream.
     cl_iter_guard::install();
+
+    // DIAGNOSTIC: hook the cEftGroup destructor (sub_ECB00) and the prune
+    // walk (sub_EC130) to identify any code path that destructs a group
+    // while it is still in Ew::sEffect's live-groups vector at
+    // sEffect+0xEC/0xF0. That is the buggy-freer pattern behind the
+    // "crash on hit" UAF — the universal NULL-skip in crash_handler
+    // currently absorbs the consequence but doesn't tell us the source.
+    // Hits land in the Netcode log as "[eftfreer] !!! BUGGY FREER".
+    eft_freer_log::install();
+
+    // FIX: bound std__map_string_int__lower_bound walk to kMaxSteps so a
+    // corrupted boost::signals2 grouped_list tree can't hang the game.
+    // Without this, a NULL or non-canonical child pointer makes the loop
+    // fault every iteration; crash_handler's universal NULL-skip absorbs
+    // the AV but never updates the node register, so the loop spins
+    // forever — observed as a freeze-on-hit during rollback re-sim.
+    tree_walker_guard::install();
 
     // Two-instance local testing: gate XInput reads by which window has
     // focus, so the same controller drives whichever player owns the

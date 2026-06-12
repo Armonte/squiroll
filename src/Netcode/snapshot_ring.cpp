@@ -10,6 +10,67 @@
 #include "log.h"
 
 namespace snapshot_ring {
+
+// Per-session bitset of cpp_arena pages we've already attributed via
+// cpp_arena::attribute(). 32k pages × 1 bit = 4 KB. Indexing: page N
+// is bit N. Used by the divf logging to fire one [cpp_attr] line per
+// page per session (the persistently-divergent pages — 23397, 23396,
+// 23424 in the user's repro — would otherwise spam every re-sim).
+static uint32_t g_attr_seen[32768 / 32] = {0};
+bool divf_attr_seen(uint32_t pg) {
+    if (pg >= 32768) return true;
+    uint32_t idx = pg >> 5;
+    uint32_t bit = 1u << (pg & 31);
+    if (g_attr_seen[idx] & bit) return true;
+    g_attr_seen[idx] |= bit;
+    return false;
+}
+
+// Per-session bitset for per-page byte-dump diagnostic. When a cpp_arena
+// page diverges between forward and re-sim, log the first 8 dwords that
+// differ between the live bytes and the snapshot-saved bytes. The
+// bitset rate-limits this to one dump per page so the persistent
+// divergent pages (23397 / 23396 / 22A9 / etc) get sampled once each.
+static uint32_t g_divword_seen[32768 / 32] = {0};
+bool divword_seen(uint32_t pg) {
+    if (pg >= 32768) return true;
+    uint32_t idx = pg >> 5;
+    uint32_t bit = 1u << (pg & 31);
+    if (g_divword_seen[idx] & bit) return true;
+    g_divword_seen[idx] |= bit;
+    return false;
+}
+
+// Per-page latch of cpp_arena bytes captured at save time. When a page
+// matches a "track this" allowlist (the persistent divergent pages),
+// we copy its 4 KB into the latch on every save. On re-sim divergence,
+// we compare live bytes against the latch and log the offending dwords.
+//
+// Allowlist hits per the 2026-05-27 diagnostic: pages 23397, 23396,
+// 8873, 10234, 10235, 23424, 23706 — all cpp_arena. Total memory
+// footprint = 7 × 4 KB = 28 KB. Trivial.
+struct TrackedPage {
+    uint32_t pg;
+    uint8_t  bytes[4096];
+    bool     captured;
+};
+static TrackedPage g_tracked[] = {
+    {23397, {}, false},   // boost::signals2 connection_body
+    {23396, {}, false},   // World2D__Init  4-byte flag
+    {8873,  {}, false},   // Ew::sTask per-worker stats
+    {10234, {}, false},   // boost::log shared_count
+    {10235, {}, false},   // boost::log shared_count slot
+    {23424, {}, false},   // sub_E0F00? freed neighbour
+    {23706, {}, false},   // UDPInnerD 256KB buffer (first page)
+};
+static constexpr int N_TRACKED =
+    sizeof(g_tracked) / sizeof(g_tracked[0]);
+
+TrackedPage* find_tracked(uint32_t pg) {
+    for (int i = 0; i < N_TRACKED; ++i)
+        if (g_tracked[i].pg == pg) return &g_tracked[i];
+    return nullptr;
+}
 namespace {
 
 static constexpr uint32_t PAGE   = 4096;
@@ -264,6 +325,18 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             ++n;
             memcpy(A.mirror + off, A.base + off, PAGE);     // sync mirror -> frame
             A.phash[off / PAGE] = hash_page(A.base + off);  // hash -> frame
+            // Tracked-page latch (cpp_arena only). On FORWARD save the
+            // current bytes become the baseline for the next re-sim's
+            // dword-level diff log. The gate on !is_resim() avoids the
+            // re-sim overwriting the latch with its own (divergent)
+            // bytes — we want the latch to hold the forward-sim
+            // ground truth so divword can show what changed.
+            if (a == 2 && !cpp_arena::is_resim()) {
+                if (TrackedPage* tp = find_tracked(off / PAGE)) {
+                    memcpy(tp->bytes, A.base + off, PAGE);
+                    tp->captured = true;
+                }
+            }
         }
         S.dn[a] = n;
         LARGE_INTEGER d1; QueryPerformanceCounter(&d1);
@@ -312,6 +385,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
         if (re_capture_diag) {
             static const char* names[NARENA] = { "sq", "bt", "cpp" };
             static bool first_dump_done = false;   // dump page bytes ONCE
+            (void)first_dump_done;                 // kept for binary stability
             int totalp = 0;
             for (int a = 0; a < NARENA; ++a) {
                 int hits = 0;
@@ -321,22 +395,48 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                                    "fwd_hash=%08x now=%08x\n",
                                    names[a], frame, pg, pg * PAGE,
                                    S.phash_snap[a][pg], g_ar[a].phash[pg]);
-                        // On the first divergent re-capture EVER, also dump
-                        // the first few differing dwords inside the page so
-                        // the values themselves are visible (cpp only — it
-                        // has cpp_arena::attribute to name the owner).
-                        if (a == 2 && !first_dump_done) {
-                            const uint32_t* lv =
-                                (const uint32_t*)(g_ar[a].base + pg * PAGE);
-                            int dw_hits = 0;
-                            for (uint32_t o = 0; o < PAGE && dw_hits < 4; o += 4) {
-                                // We only have the forward HASH, not bytes — so
-                                // log the live value and let attribute() name
-                                // the block; a follow-up shadow can dump bytes.
-                                (void)lv; (void)o; (void)dw_hits;
-                                break;
+                        // Attribute every divergent cpp_arena page so the
+                        // persistent divergence sources (the late-pre-gate
+                        // singletons that always flip the same two-value
+                        // hash pattern across re-sim) get their allocating
+                        // caller named. Rate-limited per-page-per-session
+                        // via a small bitset so the log doesn't spam the
+                        // same RVA every frame for the same offset.
+                        if (a == 2) {
+                            extern bool divf_attr_seen(uint32_t);
+                            if (!divf_attr_seen(pg)) {
+                                cpp_arena::attribute(pg * PAGE);
                             }
-                            cpp_arena::attribute(pg * PAGE);
+                            extern bool divword_seen(uint32_t);
+                            // Per-page dword diff against the save-time
+                            // latch — only for tracked pages, only once
+                            // per session, so it gives us the bytes that
+                            // are flipping for the persistent divergent
+                            // sources (connection_body refcount, etc).
+                            TrackedPage* tp = find_tracked(pg);
+                            if (tp && tp->captured && !divword_seen(pg)) {
+                                const uint32_t* live =
+                                    (const uint32_t*)(g_ar[a].base + pg * PAGE);
+                                const uint32_t* saved =
+                                    (const uint32_t*)tp->bytes;
+                                int diffs = 0;
+                                for (uint32_t i = 0;
+                                     i < PAGE / 4 && diffs < 16; ++i) {
+                                    if (live[i] != saved[i]) {
+                                        log_printf("[divword] pg=%u dw=%u "
+                                                   "off=0x%X saved=%08x "
+                                                   "live=%08x\n",
+                                                   pg, i, pg * PAGE + i * 4,
+                                                   saved[i], live[i]);
+                                        ++diffs;
+                                    }
+                                }
+                                if (diffs) {
+                                    log_printf("[divword] pg=%u: %d dword(s) "
+                                               "differ in first 4KB\n",
+                                               pg, diffs);
+                                }
+                            }
                         }
                         ++hits;
                     }

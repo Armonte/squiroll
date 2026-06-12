@@ -106,9 +106,38 @@ static int      g_n_excl_tid   = 0;
 static uint32_t g_audio_lo = 0;
 static uint32_t g_audio_hi = 0;
 
+// "Deterministic workers" — additional threads beyond g_sim_tid that ARE
+// allowed to allocate into the arena. The Ew::cJobThread workers spawned
+// via Manbow__EwCJobThread__StartAddress (RVA 0x1205A0) handle per-frame
+// task dispatch and DO mutate game state (boost::signals2 grouped_list
+// connection inserts, etc). Until 2026-05-27 these were locked out of the
+// arena by the sim-only gate, so their allocations landed in the real
+// Win32 heap which is NOT snapshotted — that's the source of the freeze-
+// on-hit during rollback re-sim: re-sim's boost::signals2 mutations
+// duplicated the forward-sim state, eventually corrupting the
+// grouped_list trees with cycles.
+//
+// We identify these threads at _beginthreadex time by matching start
+// against the cJobThread StartAddress thunk. Once added here, the same
+// gate that admits the sim thread admits these too.
+static DWORD    g_worker_tid[64] = {0};
+static int      g_n_worker_tid   = 0;
+// Start-routine RVA window for the cJobThread StartAddress thunk.
+// 0x1205A0 is the single entry point (StartAddress in IDB) — we match
+// it exactly. lo<=srva<hi range is left for any future cohort that needs
+// wider matching.
+static uint32_t g_worker_start_lo = 0x1205A0;
+static uint32_t g_worker_start_hi = 0x1205A1;
+
 static bool thread_excluded(DWORD tid) {
     for (int i = 0; i < g_n_excl_tid; ++i)
         if (g_excl_tid[i] == tid) return true;
+    return false;
+}
+
+static bool thread_is_worker(DWORD tid) {
+    for (int i = 0; i < g_n_worker_tid; ++i)
+        if (g_worker_tid[i] == tid) return true;
     return false;
 }
 
@@ -301,8 +330,27 @@ static void* cdecl hook_op_new(size_t size) {
         // heap — those objects are not battle state. better_game_loop sets
         // the sim thread very early, before menus / vs.Initialize.
         DWORD tid = GetCurrentThreadId();
-        bool sim = (g_sim_tid != 0) && (tid == g_sim_tid);
-        if (sim && !thread_excluded(tid) && !caller_excluded(caller)) {
+        bool sim    = (g_sim_tid != 0) && (tid == g_sim_tid);
+        bool worker = thread_is_worker(tid);
+        // PRE-GATE window: between cpp_arena::install() and
+        // set_sim_thread(), g_sim_tid is 0. Without this branch the
+        // sim-only gate rejects EVERY allocation in that window, so
+        // bootstrap objects (boost::signals2 signal owners, the
+        // grouped_list_state structs the Actor2D render slots connect
+        // INTO, font tables, etc.) land in the real Win32 heap and
+        // permanently escape the rollback snapshot. That's the source
+        // of the freeze-on-hit: re-sim mutates the in-arena connection
+        // node list, but the signal owner that POINTS into that list
+        // is at a fixed real-heap address holding stale forward-sim
+        // pointers — eventually a cycle, then the walk loops forever.
+        //
+        // Pre-gate we admit ALL threads (still respecting excluded
+        // sets / callers). The arena is 128 MB which comfortably
+        // covers boot. Once sim_tid is set the gate narrows to
+        // sim + workers + non-excluded — same as before.
+        bool pre_gate = (g_sim_tid == 0);
+        bool admitted = sim || worker || pre_gate;
+        if (admitted && !thread_excluded(tid) && !caller_excluded(caller)) {
             void* p = arena_alloc(size);
             if (p) return p;
         }
@@ -322,12 +370,19 @@ static void* cdecl hook_op_new(size_t size) {
 // growing std::vector sheds — they stop once capacity settles).
 static void cdecl hook_free(void* block) {
     if (in_arena(block)) {
-        // A non-simulation thread (the audio thread) freeing an arena block
-        // — necessarily a pre-gate baseline object — would push it onto a
-        // free-list at a non-deterministic time, shifting where the next
-        // simulation allocation lands and diverging the snapshot. Leak it
-        // instead; the set of such blocks is bounded (pre-gate only).
-        if (g_sim_tid != 0 && GetCurrentThreadId() != g_sim_tid) {
+        // Non-sim, non-worker threads (the audio thread) freeing an arena
+        // block — necessarily a pre-gate baseline object — would push it
+        // onto a free-list at a non-deterministic time, shifting where the
+        // next simulation allocation lands and diverging the snapshot.
+        // Leak it instead; the set of such blocks is bounded (pre-gate
+        // only). Worker threads (Ew::cJobThread) ARE allowed to free —
+        // their allocations come from the arena too and live in the
+        // rollback snapshot just like the sim thread's.
+        DWORD tid = GetCurrentThreadId();
+        bool admitted = (g_sim_tid == 0)                       // pre-gate
+                     || (g_sim_tid != 0 && tid == g_sim_tid)   // sim
+                     || thread_is_worker(tid);                 // worker
+        if (g_sim_tid != 0 && !admitted) {
             if (g_warn && (g_xthr_skips & 0xFF) == 0)
                 log_printf("[cpp_arena] off-thread arena free leaked %p (#%u)\n",
                            block, g_xthr_skips);
@@ -383,10 +438,22 @@ static uintptr_t cdecl hook_beginthreadex(void* sec, unsigned stk, void* start,
         uint32_t srva = (uint32_t)((uintptr_t)start - base_address);
         bool audio = (g_audio_hi > g_audio_lo) &&
                      (srva >= g_audio_lo && srva < g_audio_hi);
+        // Ew::cJobThread workers spawn at Manbow__EwCJobThread__StartAddress
+        // (0x1205A0). These are deterministic per-frame task workers and
+        // their allocations MUST land in cpp_arena so the rollback snapshot
+        // covers them (the freeze-on-hit issue was their boost::signals2
+        // grouped_list inserts landing on the un-snapshotted real heap).
+        bool worker = (g_worker_start_hi > g_worker_start_lo) &&
+                      (srva >= g_worker_start_lo && srva < g_worker_start_hi);
         if (audio && g_n_excl_tid < 16) g_excl_tid[g_n_excl_tid++] = tid;
+        if (worker && g_n_worker_tid <
+                          (int)(sizeof(g_worker_tid) / sizeof(g_worker_tid[0])))
+            g_worker_tid[g_n_worker_tid++] = tid;
         crash_handler::register_thread((uint32_t)tid);
-        log_printf("[cpp_arena] thread spawned tid=%u start_rva=%08X%s\n",
-                   tid, srva, audio ? "  [excluded from arena]" : "");
+        log_printf("[cpp_arena] thread spawned tid=%u start_rva=%08X%s%s\n",
+                   tid, srva,
+                   audio  ? "  [excluded from arena]" : "",
+                   worker ? "  [WORKER: allocations -> cpp_arena]" : "");
     }
     return h;
 }
@@ -457,6 +524,7 @@ void trace_alloc(uint32_t addr) {
 
 void     set_armed(bool on) { g_armed = on; }
 void     set_resim(bool on) { g_resim = on; }
+bool     is_resim()         { return g_resim; }
 
 // Designate the simulation thread — call from the battle/game thread once,
 // before snapshot_ring::arm() takes the baseline. From here on only this

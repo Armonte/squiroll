@@ -16,6 +16,42 @@ namespace {
 #define G_FRAME_COUNTER  ((void*)(0x4DACE0_R))   // ++ per logical frame
 #define G_ACTOR_TASK_ID  ((void*)(0x4DB068_R))   // Actor2D SetTask* id ctr
 
+// Manbow effect-system singletons (verified 2026-05-24 via the IDB rename
+// pass). Both objects are heap-allocated at startup (operator new) and
+// sit OUTSIDE every tracked arena, so the live pointers persist across
+// a snapshot-load while the objects they point to (e.g. cEftGroup* in
+// cpp_arena) get restored — leaving stale pointers in the singletons'
+// vectors. The eft_freer_log harness cleans that symptom up; this is
+// the structural fix.
+//
+//   Ew::sEffect  @ *G_EW_SEFFECT  — 0x218 bytes. Holds the live-groups
+//                                    vector at +0xEC/+0xF0/+0xF4.
+//   Ew::sTask    @ *G_EW_STASK    — 0x1AAC8 bytes total, but we only
+//                                    need the 32 per-layer vector
+//                                    triples at +0x18024..+0x181A4 and
+//                                    a handful of status/counter slots.
+#define G_EW_SEFFECT     ((void**)(0x4DB0C8_R))
+#define G_EW_STASK       ((void**)(0x4DB0B8_R))
+static constexpr uint32_t SEFFECT_BYTES = 0x218;
+// sTask layout (verified):
+//   +0x18014  worker-frame head counter (Interlocked, incremented by
+//             DispatchWorkerTask + reset at start of StepLayers32)
+//   +0x18024..+0x181A4   32 × {begin,end,cap} layer-task-array triples
+//   +0x18228..+0x1AAC0   per-layer state structs (timing, smoothing)
+//                        — captured by cpp_arena's dirty-page tracking;
+//                        only the triples NEED restoration to refer to
+//                        the right buffers.
+//   +0x1AAC0  current frame time (float)
+//   +0x1AAC4  byte flag: timed-update enabled
+//   +0x1AAC7  byte flag: step-in-progress
+#define STASK_LAYER_BASE_OFF  0x18024
+#define STASK_LAYER_COUNT     32
+#define STASK_LAYER_TRIPLE    0x0C
+#define STASK_FLAGS_OFF       0x1AAC0
+#define STASK_FLAGS_BYTES     0x08    // covers float-time + 4 status bytes
+#define STASK_FRAME_OFF       0x18014
+#define STASK_FRAME_BYTES     0x10    // 4 dwords of counters around 0x18014
+
 // th155 CRT __acrt_getptd() — returns the calling thread's per-thread data
 // block. The CRT rand() seed (_holdrand) lives at offset 0x18 within it.
 // Squirrel's global rand()/srand() (the battle PRNG) wrap this CRT rand;
@@ -51,7 +87,9 @@ static constexpr uint32_t FRAMEDRV_BYTES = 0x14;
 static constexpr uint32_t SENTINEL_BYTES = 8;
 
 static constexpr uint32_t SNAP_MAGIC = 0x50414E53;  // 'SNAP'
-static constexpr int      MAX_REGIONS = 16;
+// Bumped from 16 → 24 to fit the new Ew::sEffect / Ew::sTask regions
+// (sEffect: 1 region; sTask: 3 regions — counters, triples, status).
+static constexpr int      MAX_REGIONS = 24;
 
 // True if [p, p+len) lies entirely in committed, accessible memory.
 // Resolving the scheduler graph walks reverse-engineered struct offsets;
@@ -154,6 +192,54 @@ static int collect(Region* r) {
 
     // DirectInput keyboard state table (see KBD_STATE_ADDR above).
     add(KBD_STATE_ADDR, KBD_STATE_BYTES);
+
+    // ENV gate: SQUIROLL_SNAP_EFFECT=0 disables the sEffect / sTask
+    // additions from this snapshot. Use it to A/B test whether these
+    // regions are implicated in a hang/freeze before reverting.
+    static int s_snap_effect = -1;
+    if (s_snap_effect < 0) {
+        char buf[8] = {0};
+        DWORD got = GetEnvironmentVariableA("SQUIROLL_SNAP_EFFECT", buf,
+                                            sizeof(buf));
+        s_snap_effect = (got == 0 || buf[0] != '0') ? 1 : 0;
+        log_printf("[engine_snap] sEffect/sTask regions %s "
+                   "(SQUIROLL_SNAP_EFFECT=%s)\n",
+                   s_snap_effect ? "ENABLED" : "DISABLED",
+                   got ? buf : "<unset>");
+    }
+    if (!s_snap_effect) return n;
+
+    // Ew::sEffect — the effect-group manager singleton. We ONLY restore
+    // the live-groups vector triple at +0xEC/+0xF0/+0xF4 (12 bytes).
+    //
+    // DO NOT snapshot the whole 0x218-byte object: it contains a Win32
+    // HANDLE mutex at +0x4 (CreateMutexA in its ctor) and 16
+    // std::shared_ptr<Concurrency::reader_writer_lock> slots populated
+    // by the ctor. Restoring HANDLE bytes desyncs OS mutex state with
+    // our "is-locked" view — observed as a hard freeze on hit when a
+    // worker thread is mid-Wait/Release across a rollback save/load.
+    //
+    // The 12-byte triple is the only field that mutates per-frame in a
+    // way that diverges from cpp_arena-restored state; the rest of
+    // sEffect (locks, shared_ptrs, counters) is set up at boot and
+    // persistent for the battle.
+    if (void* seffect = *G_EW_SEFFECT) {
+        add((uint8_t*)seffect + 0xEC, 12);  // begin/end/cap
+    }
+
+    // Ew::sTask — the job-scheduler singleton (0x1AAC8 bytes total).
+    // Same surgical approach: only the per-frame counters around
+    // +0x18014, the 32 per-layer vector triples, and the status/timing
+    // flags near +0x1AAC0. Layer task-member objects live in cpp_arena
+    // and ride that snapshot. The mutex at sTask+0x4 and the
+    // shared_ptrs at sTask+0x28.. are deliberately NOT touched.
+    if (void* stask = *G_EW_STASK) {
+        add((uint8_t*)stask + STASK_FRAME_OFF, STASK_FRAME_BYTES);
+        add((uint8_t*)stask + STASK_LAYER_BASE_OFF,
+            STASK_LAYER_COUNT * STASK_LAYER_TRIPLE);
+        add((uint8_t*)stask + STASK_FLAGS_OFF, STASK_FLAGS_BYTES);
+    }
+
     return n;
 }
 

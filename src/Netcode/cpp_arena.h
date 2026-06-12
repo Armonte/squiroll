@@ -66,6 +66,12 @@ bool is_sim_thread();
 // double-free (STATUS_HEAP_CORRUPTION).
 void set_resim(bool on);
 
+// Read accessor for the same flag. Other guards use this to no-op
+// real-heap mutations during re-sim (e.g. boost::signals2 connection
+// inserts that would otherwise corrupt the heap-resident grouped_list
+// state which is not part of any tracked arena).
+bool is_resim();
+
 // Raw arena allocation, bypassing the operator-new routing. nullptr on
 // overflow. See tf4_pool — re-homes th155's Squirrel-instance object pool.
 // caller_abs: the absolute address of the real (th155) call site, so
