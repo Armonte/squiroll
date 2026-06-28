@@ -406,6 +406,22 @@ static void log_fastfail_stack(const char* via) {
         if (next <= ebp) break;
         ebp = next;
     }
+    // Raw ESP scan — the EBP chain skips FPO/CRT frames, so the IMMEDIATE
+    // abort caller (the th155 native binding / SQVM opcode that aborts) is
+    // hidden. Scan the live stack for th155 code return addresses to recover it.
+    crash_logf("  --- raw stack scan (th155 ret addrs) ---\r\n");
+    volatile uint32_t marker = 0;
+    const uint32_t* sp = (const uint32_t*)&marker;
+    for (int k = 0, shown = 0; k < 400 && shown < 28; ++k) {
+        if (IsBadReadPtr((void*)&sp[k], 4)) break;
+        const uintptr_t v = sp[k];
+        const uint32_t rva = (uint32_t)(v - base_address);
+        if (rva >= 0x1000 && rva < 0x300000) {
+            describe_addr(v, loc);
+            crash_logf("    sp[+0x%03X] rva=%08X  %s\r\n", k * 4, rva, loc);
+            ++shown;
+        }
+    }
     crash_logf("==== END FASTFAIL ====\r\n");
 }
 

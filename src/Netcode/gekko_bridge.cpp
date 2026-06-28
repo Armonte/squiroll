@@ -21,6 +21,7 @@
 #include "live_actors.h"
 #include "sq_arena.h"      // Squirrel subsystem arena (objects + VM + stacks)
 #include "battle_pools.h"  // TF4 TPoolAllocator battle objects
+#include "tf4_pool.h"      // generic-grow objpool redirect + freeze
 #include "engine_snap.h"   // scheduler fixed-region snapshot
 #include "cpp_arena.h"     // C++ std::list node arena
 #include "bullet_arena.h"  // Bullet physics heap arena
@@ -692,11 +693,10 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                            uint32_t frame) {
     if (cap < sizeof(SaveHeader)) return 0;
 
-    // DIAGNOSTIC: the events recorded since the last reset are this frame's
-    // advance. Diff the forward vs re-sim trace of the traced frame, then
-    // start a fresh recording for the next frame.
-    cpp_arena::trace_check(frame);
-    cpp_arena::trace_reset();
+    // DIAGNOSTIC: the alloc-sequence trace is now reset/checked INSIDE
+    // advance_one_frame (around update_related), bracketing exactly that
+    // advance's allocations — the save/load points cleared it at the wrong
+    // time (empty window on battle frames).
 
     // (Previously: a hardcoded watchpoint arm at frame=14 / disarm at 15
     // on bullet_arena+0x480830. snapshot_ring's divbyte loop now auto-arms
@@ -937,9 +937,7 @@ void load_state_from_buf(const void* buf, uint32_t len) {
             sect(&input_rec_load);
             sect(&input_hist::load);
         }
-        // DIAGNOSTIC: the re-sim's first advance after this restore records
-        // a fresh arena trace.
-        cpp_arena::trace_reset();
+        // (trace_reset moved into advance_one_frame — see save_state_to_buf note.)
         return;
     }
 
@@ -1515,6 +1513,7 @@ void advance_one_frame() {
     // Mark the re-sim so cpp_arena suppresses real-heap frees (the real heap
     // is not snapshotted — a re-sim re-free would double-free).
     cpp_arena::set_resim(g_trace_rb != 0);
+    cpp_arena::trace_reset();                               // start THIS advance's alloc trace
     update_related(*MAIN_SCRIPTAPI_PTR);                    // RunOneFrame(g_main), once
     log_state_fingerprint(g_trace_frame, g_trace_rb, "post-run");
     if (rb_diag_enabled()) battle_pools::log_fingerprint("post-run");
@@ -1533,6 +1532,8 @@ void advance_one_frame() {
     if (rb_diag_enabled()) {
         battle_pools::diff_locate(g_trace_frame, g_trace_rb);
     }
+    cpp_arena::trace_check(g_trace_frame, g_trace_rb);        // diff fwd vs re-sim alloc seq
+    cpp_arena::diag_alloc_counts(g_trace_frame, g_trace_rb);  // Phase 1 render/signal diag
     ++*(uint32_t*)(0x4DACE0_R);                             // g_frame_counter
     if (trace) log_printf("[gekko_bridge] advance: exit\n");
 }
@@ -1603,6 +1604,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
     // Pre-grow the C++ battle object pools so their block set is frozen
     // for the match — the rollback snapshot copies those blocks raw.
     battle_pools::pregrow();
+    tf4_pool::pregrow_objpools();        // freeze the generic-grow objpool family (f=34 hang)
     // Re-home each animation controller's CompositeSprite std::vector
     // buffers into cpp_arena (they were operator-new'd during vs.Initialize,
     // before cpp_arena was armed, so they sit uncaptured on the CRT heap).
@@ -1660,6 +1662,7 @@ bool init_solo() {
     live_actors::set_defer_release(!g_arena_rollback);
     cpp_arena::set_armed(true);          // capture operator-new for the whole match
     battle_pools::pregrow();             // freeze the C++ battle pools' block set
+    tf4_pool::pregrow_objpools();        // freeze the generic-grow objpool family (f=34 hang)
     battle_pools::reserve_anim_vectors(); // re-home AnimCtrl CompositeSprite vectors into cpp_arena
     // Fix each player's input-history vector capacity so it never reallocs
     // mid-match (its backing buffer then keeps a stable address to snapshot).

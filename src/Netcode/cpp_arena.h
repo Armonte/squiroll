@@ -87,7 +87,11 @@ void attribute(uint32_t off);
 // starts a fresh recording; trace_check(frame) saves the forward run's
 // sequence and diffs a re-sim of the same frame against it. See cpp_arena.cpp.
 void trace_reset();
-void trace_check(uint32_t frame);
+void trace_check(uint32_t frame, int rb);
+
+// DIAGNOSTIC (Phase 1): log + reset the per-advance count of the residual
+// render (DrawCommandSlot) / boost::signals2 allocators. Call once per advance.
+void diag_alloc_counts(int frame, int rb);
 
 uint8_t* base();        // arena base — the MEM_WRITE_WATCH region
 uint32_t used();        // high-water bytes (what save() writes)

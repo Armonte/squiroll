@@ -91,6 +91,13 @@ static DWORD    g_sim_tid   = 0;       // simulation thread; once set, ONLY this
 static uint32_t g_opnew_caller = 0;
 static int      g_cls13_log    = 96;
 
+// DIAGNOSTIC (Phase 1, post-input-fix residual): per-advance count of the two
+// divergent allocators — DrawCommandSlot reset (0x57DC0) and boost::signals2
+// shared_count (0x31C00) — to test the forward-vs-re-sim asymmetry hypothesis.
+static uint32_t g_diag_render = 0;
+static uint32_t g_diag_signal = 0;
+static uint32_t g_diag_signal_off = 0;   // signal-node allocs on a NON-sim thread
+
 static SafetyHookInline g_h_opnew{};
 static SafetyHookInline g_h_free{};
 static SafetyHookInline g_h_malloc{};
@@ -163,13 +170,18 @@ static uint32_t   g_mw_idx = 0;
 // the exact point the re-sim deviates. See trace_reset / trace_check.
 struct TraceEv { uint8_t op; uint32_t size, caller, off; };  // op 1=alloc 2=free
 static constexpr uint32_t TRACE_CAP   = 65536;
-static const     uint32_t TRACE_FRAME = 4;       // the frame to diff
-static TraceEv  g_tr[TRACE_CAP];
+static TraceEv  g_tr[TRACE_CAP];          // the current advance's events
 static uint32_t g_tr_n        = 0;
-static TraceEv  g_tr_saved[TRACE_CAP];
-static uint32_t g_tr_saved_n  = 0;
-static bool     g_tr_have     = false;
-static bool     g_tr_done     = false;
+// Per-frame ring of forward alloc sequences: a re-sim of ANY frame diffs
+// against that frame's forward sequence, so the divergence ONSET frame is
+// found automatically (it is run-variable). RING > rollback window (8).
+static constexpr uint32_t TR_RING     = 12;
+static constexpr uint32_t TR_SLOT_CAP = 8192;
+static TraceEv  g_tr_ring[TR_RING][TR_SLOT_CAP];
+static uint32_t g_tr_ring_n[TR_RING]     = {0};
+static int32_t  g_tr_ring_frame[TR_RING];          // frame in each slot (-1 = empty)
+static bool     g_tr_ring_init = false;
+static int      g_tr_div_log   = 8;                // log the first N divergent frames
 
 static void trace_rec(uint8_t op, uint32_t size, uint32_t caller, uint32_t off) {
     if (g_tr_n < TRACE_CAP) {
@@ -318,6 +330,40 @@ static void* cdecl hook_op_new(size_t size) {
     if (g_armed && g_meta) {
         uint32_t caller = (uint32_t)(uintptr_t)_ReturnAddress();
         g_opnew_caller = caller;
+        // DIAGNOSTIC: tally the residual render/signal allocators (Phase 1).
+        uint32_t crva = caller - (uint32_t)base_address;
+        // render = DrawCommandSlot create site (Manbow__DrawCommandSlot__create_and_bind);
+        // signal = boost::signals2 grouped connection-list node alloc (_Buynode0 0x13F10).
+        if (crva >= 0x56A90 && crva < 0x56AD0) ++g_diag_render;
+        else if (crva >= 0x13F00 && crva < 0x13F40) {
+            ++g_diag_signal;
+            // Is this connection-list node allocated on the SIM thread or a
+            // cJobThread WORKER? Worker-thread allocs at non-deterministic times
+            // swap node addresses (same total bump) -> the residual swap.
+            // (tid isn't computed until further down, so query directly here.)
+            if (g_sim_tid && GetCurrentThreadId() != g_sim_tid) ++g_diag_signal_off;
+            // One-shot caller-chain dump for the per-frame signals2 connection-
+            // list node alloc (_Buynode0) — names the connect() SITE up the
+            // stack so we can see what orders the 8-10 per-frame connections
+            // (the swap source after the input fix).
+            // Skip the f=0 setup burst (~1105 connections) so the chain we dump
+            // is a PER-FRAME (battle) connect — the divergent kind (high-addr).
+            static uint32_t sig_skip = 1150;
+            static int sig_chain_log = 12;
+            if (sig_skip) {
+                --sig_skip;
+            } else if (!g_resim && sig_chain_log > 0) {
+                --sig_chain_log;
+                volatile uint32_t marker = 0;
+                const uint32_t* sp = (const uint32_t*)&marker;
+                log_printf("[sigchain] connlist node alloc — caller chain:\n");
+                for (int k = 0; k < 48; ++k) {
+                    uint32_t r = sp[k] - (uint32_t)base_address;
+                    if (r >= 0x1000 && r < 0x300000)
+                        log_printf("[sigchain]   stk[+0x%02X] rva=%08X\n", k * 4, r);
+                }
+            }
+        }
         // Thread gate: once the simulation thread is known, only IT may draw
         // from the arena. Background threads — the audio thread above all —
         // go to the real heap; their non-deterministic alloc/free would
@@ -526,6 +572,16 @@ void     set_armed(bool on) { g_armed = on; }
 void     set_resim(bool on) { g_resim = on; }
 bool     is_resim()         { return g_resim; }
 
+// DIAGNOSTIC (Phase 1): log + reset the per-advance render/signal alloc counts.
+void diag_alloc_counts(int frame, int rb) {
+    if (g_diag_render || g_diag_signal)
+        log_printf("[allocdiag] f=%d rb=%d render=%u signal=%u signal_offthread=%u\n",
+                   frame, rb, g_diag_render, g_diag_signal, g_diag_signal_off);
+    g_diag_render = 0;
+    g_diag_signal = 0;
+    g_diag_signal_off = 0;
+}
+
 // Designate the simulation thread — call from the battle/game thread once,
 // before snapshot_ring::arm() takes the baseline. From here on only this
 // thread's operator new is routed into the arena.
@@ -592,37 +648,48 @@ void trace_reset() { g_tr_n = 0; }
 // DIAGNOSTIC: at frame `frame`'s capture, if it is the traced frame, save
 // the forward run's event sequence the first time and diff a later (re-sim)
 // pass against it — the first differing event is where the re-sim deviates.
-void trace_check(uint32_t frame) {
-    if (frame != TRACE_FRAME || g_tr_done) return;
-    if (!g_tr_have) {
-        uint32_t n = g_tr_n < TRACE_CAP ? g_tr_n : TRACE_CAP;
-        memcpy(g_tr_saved, g_tr, sizeof(TraceEv) * n);
-        g_tr_saved_n = n;
-        g_tr_have = true;
-        log_printf("[cpptrace] f=%u forward trace saved: %u arena events\n",
-                   frame, n);
+void trace_check(uint32_t frame, int rb) {
+    if (!g_tr_ring_init) {
+        for (uint32_t i = 0; i < TR_RING; ++i) g_tr_ring_frame[i] = -1;
+        g_tr_ring_init = true;
+    }
+    uint32_t slot = frame % TR_RING;
+    if (!rb) {   // forward (g_resim is already reset to 0 by this point — use rb)
+        // Forward: stash this frame's alloc sequence for the later re-sim diff.
+        uint32_t n = g_tr_n < TR_SLOT_CAP ? g_tr_n : TR_SLOT_CAP;
+        memcpy(g_tr_ring[slot], g_tr, sizeof(TraceEv) * n);
+        g_tr_ring_n[slot]     = n;
+        g_tr_ring_frame[slot] = (int32_t)frame;
         return;
     }
-    log_printf("[cpptrace] f=%u re-sim trace: %u events (forward had %u)\n",
-               frame, g_tr_n, g_tr_saved_n);
-    uint32_t lim = g_tr_n < g_tr_saved_n ? g_tr_n : g_tr_saved_n;
-    int hits = 0;
-    for (uint32_t i = 0; i < lim && hits < 8; ++i) {
-        const TraceEv& a = g_tr_saved[i];
+    // Re-sim: diff against this frame's saved forward sequence; report the
+    // first frame whose ALLOC ORDER diverges (the swap onset).
+    if (g_tr_ring_frame[slot] != (int32_t)frame || g_tr_div_log <= 0) return;
+    uint32_t rn  = g_tr_n < TR_SLOT_CAP ? g_tr_n : TR_SLOT_CAP;
+    uint32_t sn  = g_tr_ring_n[slot];
+    uint32_t lim = rn < sn ? rn : sn;
+    uint32_t i = 0;
+    for (; i < lim; ++i) {
+        const TraceEv& a = g_tr_ring[slot][i];
         const TraceEv& b = g_tr[i];
-        if (a.op != b.op || a.size != b.size || a.caller != b.caller ||
-            a.off != b.off) {
-            log_printf("[cpptrace]  #%u  FWD %s sz=%u caller=%08X off=%X  vs  "
-                       "RESIM %s sz=%u caller=%08X off=%X\n", i,
-                       a.op == 1 ? "alloc" : "free ", a.size, a.caller, a.off,
-                       b.op == 1 ? "alloc" : "free ", b.size, b.caller, b.off);
-            ++hits;
-        }
+        if (a.op != b.op || a.size != b.size || a.caller != b.caller || a.off != b.off)
+            break;
     }
-    if (hits == 0)
-        log_printf("[cpptrace]  first %u events IDENTICAL%s\n", lim,
-                   g_tr_n == g_tr_saved_n ? "" : " — but event COUNT differs");
-    g_tr_done = true;
+    if (i >= lim && rn == sn) return;     // identical — nothing to report
+    --g_tr_div_log;
+    log_printf("[cpptrace] f=%u FIRST DIVERGENT ALLOC @ event #%u (fwd %u events, "
+               "resim %u)\n", frame, i, sn, rn);
+    uint32_t lo = i >= 3 ? i - 3 : 0;
+    uint32_t hi = (i + 4 < lim) ? i + 4 : lim;
+    for (uint32_t k = lo; k < hi; ++k) {
+        const TraceEv& a = g_tr_ring[slot][k];
+        const TraceEv& b = g_tr[k];
+        log_printf("[cpptrace]   #%u  FWD %s sz=%u caller=%08X off=%X  vs  RESIM %s "
+                   "sz=%u caller=%08X off=%X %s\n", k,
+                   a.op == 1 ? "alloc" : "free ", a.size, a.caller, a.off,
+                   b.op == 1 ? "alloc" : "free ", b.size, b.caller, b.off,
+                   k == i ? "<-- FIRST DIFF" : "");
+    }
 }
 uint8_t* base()      { return g_base; }
 uint32_t used()      { return g_meta ? g_meta->bump : 0; }

@@ -7,6 +7,7 @@
 #include "bullet_arena.h"
 #include "cpp_arena.h"
 #include "crash_handler.h"   // watchpoint_arm — auto-attribute first divergence
+#include "patch_utils.h"     // base_address (vtable -> RVA resolution in the f=15 probe)
 #include "log.h"
 
 namespace snapshot_ring {
@@ -428,6 +429,20 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                                                    "live=%08x\n",
                                                    pg, i, pg * PAGE + i * 4,
                                                    saved[i], live[i]);
+                                        // Attribute the divergent dword's OWN
+                                        // block, and — when the flipping values
+                                        // are cpp_arena pointers — what each
+                                        // side points at (the per-frame object
+                                        // whose address swaps).
+                                        if (diffs == 0) {
+                                            uint32_t b = (uint32_t)(uintptr_t)g_ar[a].base;
+                                            uint32_t c = g_ar[a].size;
+                                            cpp_arena::attribute(pg * PAGE + i * 4);
+                                            if (saved[i] > b && saved[i] < b + c)
+                                                cpp_arena::attribute(saved[i] - b);
+                                            if (live[i] > b && live[i] < b + c)
+                                                cpp_arena::attribute(live[i] - b);
+                                        }
                                         ++diffs;
                                     }
                                 }
@@ -475,6 +490,62 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                     }
                 }
             }
+            // --- f=15 swapped-object IDENTITY probe ------------------------
+            // Root: two adjacent sq objects A@+0x550 / B@+0x5D0 on the sq
+            // 0x9EE000 page swap their refcounts. Dump each object header —
+            // forward (shadow) vs re-sim (live) — with the leading vtable
+            // dword resolved to an RVA so the C++ class can be named offline,
+            // plus the parent reference region around sq 0xBF5328.
+            {
+                static int objq = 8;
+                int sqi = -1, bpi = -1;
+                for (int i = 0; i < N_TARGETS; ++i) {
+                    if (TARGET_PAGES[i].arena == 0 && TARGET_PAGES[i].off == 0x9EE000) sqi = i;
+                    if (TARGET_PAGES[i].arena == 0 && TARGET_PAGES[i].off == 0xBF5000) bpi = i;
+                }
+                if (objq > 0 && sqi >= 0) {
+                    --objq;
+                    const uint8_t* sh = S.page_snap[sqi];
+                    const uint8_t* lv = g_ar[0].base + 0x9EE000;
+                    static const uint32_t objoff[2] = { 0x550, 0x5D0 };
+                    for (int o = 0; o < 2; ++o) {
+                        const uint32_t* f = (const uint32_t*)(sh + objoff[o]);
+                        const uint32_t* r = (const uint32_t*)(lv + objoff[o]);
+                        log_printf("[objid] f=%u %s@sq+0x%X vtbl fwd=%08X(rva %08X) "
+                                   "resim=%08X(rva %08X)\n", frame, o == 0 ? "A" : "B",
+                                   0x9EE000 + objoff[o], f[0],
+                                   (uint32_t)(f[0] - (uint32_t)base_address), r[0],
+                                   (uint32_t)(r[0] - (uint32_t)base_address));
+                        for (int d = 0; d < 14; ++d)
+                            log_printf("[objid]   +0x%02X fwd=%08X resim=%08X%s\n",
+                                       d * 4, f[d], r[d], f[d] != r[d] ? "  <-DIFF" : "");
+                        // Chase closure._function (+0x20) -> SQFunctionProto;
+                        // print its _name (FP+0x24 -> SQString+0x1C chars) and
+                        // _sourcename (FP+0x1C). All derefs range-checked to the
+                        // sq arena so a wrong offset can't fault.
+                        uint32_t lo = (uint32_t)(uintptr_t)g_ar[0].base;
+                        uint32_t hi = lo + g_ar[0].size;
+                        uint32_t fp = r[8];                       // _function
+                        if (fp >= lo && fp + 0x28 < hi) {
+                            const uint32_t* fpw = (const uint32_t*)(uintptr_t)fp;
+                            uint32_t nm = fpw[9], sn = fpw[7];    // _name / _sourcename values
+                            const char* nms = (nm >= lo && nm + 0x40 < hi) ? (const char*)(uintptr_t)(nm + 0x1C) : "?";
+                            const char* sns = (sn >= lo && sn + 0x40 < hi) ? (const char*)(uintptr_t)(sn + 0x1C) : "?";
+                            log_printf("[objid]   %s _function rva=%08X  name='%.40s'  src='%.40s'\n",
+                                       o == 0 ? "A" : "B", fp - lo, nms, sns);
+                        }
+                    }
+                    if (bpi >= 0) {
+                        const uint32_t* pf = (const uint32_t*)(S.page_snap[bpi] + 0x300);
+                        const uint32_t* pr = (const uint32_t*)(g_ar[0].base + 0xBF5000 + 0x300);
+                        log_printf("[objid] f=%u parent region sq+0xBF5300:\n", frame);
+                        for (int d = 0; d < 18; ++d)
+                            log_printf("[objid]   +0x%03X fwd=%08X resim=%08X%s\n",
+                                       0x300 + d * 4, pf[d], pr[d],
+                                       pf[d] != pr[d] ? "  <-DIFF" : "");
+                    }
+                }
+            }
             // Refresh ALL snapshots to the new (re-sim) value — so any
             // subsequent re-capture detects only NEW divergences.
             for (int a = 0; a < NARENA; ++a)
@@ -507,7 +578,9 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             // Address is sq_arena's first target page + the dword that
             // divbyte consistently shows diverging — see project_squiroll_
             // tf4_mspace.md. One-shot — never re-armed or disarmed.
-            static bool g_sq_dr0_armed = false;
+            // DR0 now owned by input_global_sync (InputGlobal+4 writer hunt);
+            // the sq 0x9EE554 dword is understood (a closure refcount).
+            static bool g_sq_dr0_armed = true;
             if (!g_sq_dr0_armed && frame == 14 && g_ar[0].base) {
                 void* sq_target = g_ar[0].base + 0x9EE554;
                 crash_handler::watchpoint_arm(sq_target);

@@ -9,6 +9,7 @@
 
 #include "patch_utils.h"   // _R address literal
 #include "util.h"          // thiscall
+#include "crash_handler.h" // watchpoint_arm — hunt the InputGlobal+4 writer
 #include "log.h"
 
 // gekko_bridge.cpp publishes these (sq_trace pattern).
@@ -43,21 +44,69 @@ namespace input_global_sync {
 // =============================================================================
 
 #define INPUTCOMMAND_UPDATE (0x74390_R)
+#define INPUTMULTI_UPDATE   (0x6F360_R)
+#define GROUPED_INSERT      (0x11860_R)   // boost::signals2 grouped_list::insert_with_group
+#define GROUPED_INSERT2     (0x30390_R)   // the Squirrel-bound per-frame connect path
 
 namespace {
 
 static SafetyHookInline g_h{};
+static SafetyHookInline g_h_multi{};
+static SafetyHookInline g_h_grp{};
+static SafetyHookInline g_h_grp2{};
 
-// InputCommand reads 8 ints from source+4. We capture & restore exactly
-// those 32 bytes — the read range is tight (vtable[4] returns source+4,
-// InputCommand reads v3[0..7]).
-static constexpr uint32_t STATE_BYTES = 32;
+// 0x30390(this=signal, a2, Block, a4, a5): the per-frame Squirrel-driven draw
+// connect. The group is computed inside, so just log the CONNECT SEQUENCE
+// (which signal, in what order) per frame — comparing fwd rb=0 vs re-sim rb=1
+// shows whether two connects to the same signal swap order (the residual).
+static int thiscall grp_hook2(int this_ecx, int a2, void* Block, int a4, int a5) {
+    int f  = gekko_bridge::g_trace_frame;
+    int rb = gekko_bridge::g_trace_rb;
+    // Log render-time (f==-1) connects too, rate-limited — confirms these draw
+    // connections are made OUTSIDE the sim advance (window_render), explaining
+    // why no advance-time hook caught them.
+    static int n = 0;
+    if (f <= 14 && n < 80) { ++n; log_printf("[grpconn] f=%d rb=%d sig=%08X\n", f, rb, (unsigned)this_ecx); }
+    return g_h_grp2.unsafe_thiscall<int>(this_ecx, a2, Block, a4, a5);
+}
+
+// DIAGNOSTIC: the residual rollback divergence is a boost::signals2 grouped-list
+// ORDER swap (two connections ordered differently fwd vs re-sim) -> the
+// DrawCommandSlot connection head points to a different node. The order is by
+// group key. If the key is a pointer-derived/transient value it diverges while
+// the arena content hash stays equal (the observed symptom). Log the group key
+// at the onset frames, fwd vs re-sim, to confirm + capture the diverging value.
+// __thiscall(this, a2, Block, a4=groupkey*, a5, a6); `thiscall` macro = this in ecx.
+static int thiscall grp_hook(int this_ecx, int a2, void* Block,
+                             int* a4, int a5, int a6) {
+    int f  = gekko_bridge::g_trace_frame;
+    int rb = gekko_bridge::g_trace_rb;
+    if (f >= 8 && f <= 11 && a4) {
+        log_printf("[grpkey] f=%d rb=%d sig=%08X keytype=%08X keyval=%08X\n",
+                   f, rb, (unsigned)this_ecx, (unsigned)a4[0], (unsigned)a4[2]);
+    }
+    return g_h_grp.unsafe_thiscall<int>(this_ecx, a2, Block, a4, a5, a6);
+}
+
+// The decoded InputGlobal/InputMulti body is x/y/b0..b11/s0..s9 (24 ints =
+// 0x60) plus state — far more than the 8 ints InputCommand itself reads.
+// Capturing only 32 bytes left b6..b11 + the analog sticks (offset >=0x24)
+// non-deterministic; a spawn/special-move script that reads those diverges
+// (two actors spawn/link in swapped order — the post-input-fix residual). The
+// InputGlobal body is 0x128 bytes, so 0x80 is safely inside it and covers
+// every decoded input field with headroom.
+static constexpr uint32_t STATE_BYTES = 0x80;
 
 // Per-frame, per-instance ring. Gekko rollback window = 8 frames; 16 frames
 // gives headroom. We see exactly 2 InputCommand instances live per frame
 // (one per player); 8 buys headroom for any future variant.
 static constexpr uint32_t RING        = 16;
-static constexpr uint32_t INSTANCES   = 8;
+// Now TWO hooks share this ring (InputCommand::Update + InputMulti::Update),
+// and boot frames touch many input objects. The 8-slot ring overflowed at f=0
+// and dropped captures (re-sim misses on a player's instance at f=2/10/12 ->
+// that input wasn't replayed -> residual cpp divergence). 64 slots/frame is
+// ample headroom for both hooks across all live input objects.
+static constexpr uint32_t INSTANCES   = 64;
 
 struct Slot {
     int       frame;                 // gekko frame this state was captured at
@@ -136,6 +185,34 @@ static unsigned thiscall hook(int* this_ptr, int stack_arg) {
     return g_h.unsafe_thiscall<unsigned>(this_ptr, stack_arg);
 }
 
+// Manbow::InputMulti::Update (0x6F360): walks its child inputs, then invokes
+// the std::function at this+0xCC (the device poll) with &(this+4), writing the
+// decoded 8-int input buffer at this+4. THAT buffer is what every consumer
+// reads — InputCommand AND the character state script (this.input.x in
+// player_input.nut, which chooses Stand vs MoveBack). The poll is
+// non-deterministic across the rollback window, so capture it on the forward
+// pass and restore it on every re-sim right after the original runs — making
+// the decoded input identical for ALL readers. This is the source-level fix
+// the InputCommand-only read-site hook (above) missed: the state machine reads
+// InputGlobal directly, bypassing InputCommand::Update. Keyed by (frame, this);
+// `this` is the input buffer object, distinct from the InputCommand key.
+static int thiscall hook_multi(int* this_ptr) {
+    int r = g_h_multi.unsafe_thiscall<int>(this_ptr);   // poll + write this+4..36
+    int f  = gekko_bridge::g_trace_frame;
+    int rb = gekko_bridge::g_trace_rb;
+    if (f >= 0 && this_ptr) {
+        uint8_t* state = (uint8_t*)(uintptr_t)((uint32_t)(uintptr_t)this_ptr + 4);
+        if (rb == 0) {
+            Slot* s = find_slot(f, this_ptr, /*allocate=*/true);
+            if (s) memcpy(s->bytes, state, STATE_BYTES);
+        } else {
+            Slot* s = find_slot(f, this_ptr, /*allocate=*/false);
+            if (s) memcpy(state, s->bytes, STATE_BYTES);
+        }
+    }
+    return r;
+}
+
 } // namespace
 
 void install() {
@@ -149,6 +226,19 @@ void install() {
     g_h = safetyhook::create_inline((void*)INPUTCOMMAND_UPDATE, (void*)hook);
     log_printf("[igsync] hook Manbow::InputCommand::Update @ 0x%X %s\n",
                (uint32_t)INPUTCOMMAND_UPDATE, g_h.enabled() ? "OK" : "FAIL");
+
+    g_h_multi = safetyhook::create_inline((void*)INPUTMULTI_UPDATE, (void*)hook_multi);
+    log_printf("[igsync] hook Manbow::InputMulti::Update @ 0x%X %s (source-level "
+               "input determinism for ALL readers)\n",
+               (uint32_t)INPUTMULTI_UPDATE, g_h_multi.enabled() ? "OK" : "FAIL");
+
+    g_h_grp = safetyhook::create_inline((void*)GROUPED_INSERT, (void*)grp_hook);
+    log_printf("[grpkey] hook grouped_list::insert_with_group @ 0x%X %s\n",
+               (uint32_t)GROUPED_INSERT, g_h_grp.enabled() ? "OK" : "FAIL");
+
+    g_h_grp2 = safetyhook::create_inline((void*)GROUPED_INSERT2, (void*)grp_hook2);
+    log_printf("[grpconn] hook squirrel connect path @ 0x%X %s\n",
+               (uint32_t)GROUPED_INSERT2, g_h_grp2.enabled() ? "OK" : "FAIL");
 }
 
 } // namespace input_global_sync

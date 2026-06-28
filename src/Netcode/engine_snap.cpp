@@ -15,6 +15,13 @@ namespace {
 #define G_FRAMEDRV_PTR   ((void**)(0x49B01C_R))  // RunOneFrame driver*
 #define G_FRAME_COUNTER  ((void*)(0x4DACE0_R))   // ++ per logical frame
 #define G_ACTOR_TASK_ID  ((void*)(0x4DB068_R))   // Actor2D SetTask* id ctr
+// Manbow::Actor2DManager::LinkActor (0x9AEB0) assigns each newly-linked actor a
+// monotonic serial from this global (actor[+232] = (*0x4DCEE8)++). It was NOT
+// snapshotted, so after a rollback the counter never rewinds: the re-sim of a
+// frame hands its actors DIFFERENT serial ids than the forward pass did, which
+// diverges actor[+232] (cpp_arena) and cascades into the boost::signals2
+// connection-list pointers (the f=8 onset). Same class as G_ACTOR_TASK_ID.
+#define G_ACTOR_SERIAL_ID ((void*)(0x4DCEE8_R))  // Actor2DManager::LinkActor serial
 
 // Manbow effect-system singletons (verified 2026-05-24 via the IDB rename
 // pass). Both objects are heap-allocated at startup (operator new) and
@@ -89,7 +96,7 @@ static constexpr uint32_t SENTINEL_BYTES = 8;
 static constexpr uint32_t SNAP_MAGIC = 0x50414E53;  // 'SNAP'
 // Bumped from 16 → 24 to fit the new Ew::sEffect / Ew::sTask regions
 // (sEffect: 1 region; sTask: 3 regions — counters, triples, status).
-static constexpr int      MAX_REGIONS = 24;
+static constexpr int      MAX_REGIONS = 64;
 
 // True if [p, p+len) lies entirely in committed, accessible memory.
 // Resolving the scheduler graph walks reverse-engineered struct offsets;
@@ -117,6 +124,16 @@ static int collect(Region* r) {
             r[n].addr = a;
             r[n].len  = l;
             ++n;
+        } else {
+            // A silently-dropped region is a snapshot GAP (this is exactly how
+            // the whole-.data copy was lost). Log them once so other gaps like
+            // .data surface instead of hiding as residual divergence.
+            static int faillog = 0;
+            if (faillog < 40) {
+                ++faillog;
+                log_printf("[engine_snap] DROPPED region addr=%p len=0x%X (region_ok fail%s)\n",
+                           a, l, (n >= MAX_REGIONS) ? " / table full" : "");
+            }
         }
     };
 
@@ -134,7 +151,37 @@ static int collect(Region* r) {
     // losing game; at ~293 KB the full-section copy is trivially cheap and
     // strictly supersedes the hand-picked engine globals below (those are
     // kept only as a backstop / for the few that are NOT in .data).
-    add((void*)(0x498000_R), 0x47AA4);
+    // Added as committed SUB-REGIONS, not one add(): a single add() of the
+    // whole [0x498000, +0x47AA4) range FAILS region_ok whenever the loader
+    // splits .data by page protection (it does) — region_ok requires the whole
+    // range inside ONE VirtualQuery region, so the ENTIRE engine-global
+    // snapshot was silently dropped. That is why hand-picked counters (frame,
+    // task id, actor serial 0x4DCEE8) had to be re-added one at a time and
+    // STILL left systematic residual divergence (other un-captured globals).
+    // Iterating the sub-regions snapshots the whole section in one shot.
+    {
+        uintptr_t dstart = (uintptr_t)(0x498000_R);
+        uintptr_t dend   = dstart + 0x47AA4;
+        uintptr_t p = dstart;
+        int dseg = 0;
+        while (p < dend) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery((void*)p, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
+            uintptr_t rend = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+            uintptr_t seg_end = (rend < dend) ? rend : dend;
+            if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+                add((void*)p, (uint32_t)(seg_end - p));
+                ++dseg;
+            }
+            if (rend <= p) break;
+            p = rend;
+        }
+        static bool dlogged = false;
+        if (!dlogged) {
+            dlogged = true;
+            log_printf("[engine_snap] .data snapshot split into %d committed sub-region(s)\n", dseg);
+        }
+    }
 
     // Act::ScriptAPI object + its four std::list sentinel nodes.
     void* sapi = *G_SCRIPTAPI_PTR;
@@ -166,6 +213,7 @@ static int collect(Region* r) {
     // Determinism scalars.
     add(G_FRAME_COUNTER, 4);
     add(G_ACTOR_TASK_ID, 4);
+    add(G_ACTOR_SERIAL_ID, 4);
 
     // CRT rand() seed — the global battle PRNG (see TH155_ACRT_GETPTD above).
     uintptr_t ptd = TH155_ACRT_GETPTD();

@@ -26,9 +26,19 @@
 
 namespace tf4_pool {
 
-// Patch the pool's slab-allocation call site. Call once at squiroll init
-// (common_init) — before any battle Squirrel instance is created.
+// Patch the pool's slab-allocation call site, and install the objpool
+// grow-hook that auto-discovers the generic-grow battle pools. Call once at
+// squiroll init (common_init) — before any battle Squirrel instance is
+// created.
 void install();
+
+// Freeze the generic-grow battle object pools (the Squirrel-instance pool,
+// effect-actor pool, mesh pools, ...) so they never grow mid-match. Call at
+// session arm, on the sim thread, while cpp_arena is armed and AFTER any
+// pool the match needs has been discovered — i.e. right next to
+// battle_pools::pregrow(). Prevents the in-rollback-window tf4_objpool_grow
+// sorted-free-list-insert that spins/corrupts (the f=34 hang).
+void pregrow_objpools();
 
 } // namespace tf4_pool
 
