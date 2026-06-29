@@ -1571,6 +1571,28 @@ void advance_one_frame() {
         battle_pools::diff_locate(g_trace_frame, g_trace_rb);
     }
     engine_snap::diff_locate(g_trace_frame, g_trace_rb);     // [engdiff] residual .data desync locator
+    battle_pools::diff_live(g_trace_frame, g_trace_rb);       // [bplive] live-slot bp divergence locator (f=24)
+
+    // Self-terminate at a target battle frame so diagnostic runs exit cleanly.
+    // The solo stress harness otherwise HANGS at the round end (~f=70), keeping
+    // Netcode.dll locked against the next build.sh deploy. SQUIROLL_EXIT_FRAME=N
+    // (default off) ExitProcess()es once the forward sim passes frame N.
+    if (g_trace_rb == 0) {
+        static int exit_frame = -2;
+        if (exit_frame == -2) {
+            char buf[16] = {0};
+            DWORD n = GetEnvironmentVariableA("SQUIROLL_EXIT_FRAME", buf, sizeof buf);
+            int v = 0;
+            for (const char* s = buf; *s >= '0' && *s <= '9'; ++s) v = v * 10 + (*s - '0');
+            exit_frame = (n > 0 && v > 0) ? v : -1;
+        }
+        if (exit_frame > 0 && g_trace_frame >= exit_frame) {
+            log_printf("[gekko_bridge] SQUIROLL_EXIT_FRAME=%d reached (f=%d) — exiting clean\n",
+                       exit_frame, g_trace_frame);
+            Sleep(400);            // let the async logger drain to disk
+            ExitProcess(0);
+        }
+    }
     cpp_arena::trace_check(g_trace_frame, g_trace_rb);        // diff fwd vs re-sim alloc seq
     cpp_arena::diag_alloc_counts(g_trace_frame, g_trace_rb);  // Phase 1 render/signal diag
     ++*(uint32_t*)(0x4DACE0_R);                             // g_frame_counter

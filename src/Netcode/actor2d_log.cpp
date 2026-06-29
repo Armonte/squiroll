@@ -419,7 +419,7 @@ static void topmost_nut_name(uint32_t vm, char* out, int cap) {
 
 static int cdecl hook_get(int vm) {
     int f = gekko_bridge::g_trace_frame;
-    if (f == 15 && g_getcmp_budget > 0 && vm) {
+    if (f >= 23 && f <= 25 && g_getcmp_budget > 0 && vm) {   // f=24 attack-velocity divergence window
         char caller[48];
         topmost_nut_name((uint32_t)vm, caller, sizeof caller);
         if (__builtin_strcmp(caller, "ConvertTotalSpeed") == 0) {

@@ -66,6 +66,13 @@ void log_fingerprint(const char* tag);
 // pure non-determinism — the field offset maps straight to a struct member.
 void diff_locate(int frame, int rb);
 
+// DIAGNOSTIC: lean LIVE-SLOT forward-vs-resim diff ([bplive]). Unlike
+// diff_locate (RB_DIAG, all-blocks, noisy on free slots), this diffs the
+// save() blob (live slots only = what the [sblob] bp checksum hashes), so it
+// surfaces the real bp divergence cleanly. Runs unconditionally, frame-gated +
+// budget-capped. Reports pool / live-slot real address / field offset.
+void diff_live(int frame, int rb);
+
 } // namespace battle_pools
 
 #endif // BATTLE_POOLS_H

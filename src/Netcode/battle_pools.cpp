@@ -544,7 +544,7 @@ namespace {
 static const int g_suspect[]  = { 18, 19, 20, 21 };  // InputGlobal/Single/Multi/Command
 static constexpr int NSUSPECT = sizeof(g_suspect) / sizeof(g_suspect[0]);
 
-static constexpr int      DIFF_RING = 10;
+static constexpr int      DIFF_RING = 10;            // > the 8-frame rollback window
 static constexpr uint32_t DIFF_CAP  = 4u * 1024 * 1024;
 
 struct DiffEntry { int frame; uint32_t len; uint8_t* buf; };
@@ -792,6 +792,102 @@ void diff_locate(int frame, int rb) {
     // No g_diff_done flip — let every divergent re-sim of this or any
     // later frame surface. (The HW watchpoint inside diff_decode is itself
     // single-shot, so we don't keep re-arming Dr0.)
+}
+
+// --- lean LIVE-SLOT bp diff ([bplive]) -------------------------------------
+// Diffs the save() blob (live slots only -- exactly what the [sblob] bp
+// checksum hashes) forward-vs-resim, so it surfaces the REAL bp divergence
+// (the f=24 actor/hitbox state) WITHOUT the free-slot/stale-pointer noise that
+// the all-blocks suspect_serialize diff produced. Runs unconditionally (no
+// RB_DIAG), frame-gated to the divergence window so the extra save() is cheap,
+// and budget-capped. Decodes the first diverging byte to pool / live-slot real
+// address / field offset (save() format: [magic][npool] then per pool
+// [Pool][nblk][nblk*(addr,size)][nlive][nlive*(addr,slot_bytes)][nfree][...]).
+namespace {
+// Walk the save() blob (fwd's structure) and report EVERY diverging live slot
+// (pool / slot real address / first diverging field + value), capped. Reporting
+// all -- not just the first -- shows whether the actor (Actor2D, late in the
+// blob) is the root or whether AnimCtrl2D (early in the blob) diverges on its
+// own. Requires matching structure (same liveness); a length mismatch is noted
+// by the caller and the walk is best-effort.
+void bplive_decode(const uint8_t* fwd, const uint8_t* re, uint32_t len) {
+    uint32_t off = 8;  // skip [magic][npool]
+    int reports = 0;
+    for (int i = 0; i < NPOOL && reports < 14; ++i) {
+        if (off + sizeof(Pool) + 4 > len) break;
+        const Pool* pl = (const Pool*)(fwd + off);
+        uint32_t ss = pl->slot_size ? pl->slot_size : 1;
+        const char* nm = g_pool_rva[i].name;
+        off += sizeof(Pool);
+        uint32_t nblk = *(const uint32_t*)(fwd + off); off += 4 + nblk * 8;
+        if (off + 4 > len) break;
+        uint32_t nlive = *(const uint32_t*)(fwd + off); off += 4;
+        int pool_hits = 0;
+        for (uint32_t s = 0; s < nlive; ++s) {
+            if (off + 4 > len) return;
+            uint32_t sa = *(const uint32_t*)(fwd + off);
+            uint32_t bytes0 = off + 4;
+            if (bytes0 + ss > len) return;
+            // Does this slot diverge? And for the FIRST diverging slot of each
+            // pool, dump ALL its diverging dwords (so e.g. the actor's vx/vy as
+            // well as pos show up, not just the first field).
+            bool slot_div = false;
+            for (uint32_t k = 0; k + 4 <= ss; k += 4) {
+                if (*(const uint32_t*)(fwd + bytes0 + k) !=
+                    *(const uint32_t*)(re  + bytes0 + k)) { slot_div = true; break; }
+            }
+            if (slot_div && reports < 16 && pool_hits < 2) {
+                ++pool_hits;
+                log_printf("[bplive]   pool='%s' slot=%08X (slot_size=0x%X):\n", nm, sa, ss);
+                for (uint32_t k = 0; k + 4 <= ss && reports < 16; k += 4) {
+                    uint32_t fv = *(const uint32_t*)(fwd + bytes0 + k);
+                    uint32_t rv = *(const uint32_t*)(re  + bytes0 + k);
+                    if (fv != rv) {
+                        ++reports;
+                        log_printf("[bplive]      +0x%02X fwd=%08X resim=%08X\n", k, fv, rv);
+                    }
+                }
+            }
+            off = bytes0 + ss;
+        }
+        if (off + 4 > len) break;
+        uint32_t nfree = *(const uint32_t*)(fwd + off); off += 4 + nfree * 4;
+    }
+}
+}  // namespace
+
+void diff_live(int frame, int rb) {
+    if (frame < 18 || frame > 45) return;   // the bp divergence window (f=24..31)
+    static constexpr int      RING = 14;
+    static constexpr uint32_t CAP  = 4u * 1024 * 1024;
+    static uint8_t* ring[RING] = {};
+    static uint32_t rlen[RING] = {};
+    static int      rframe[RING];
+    static uint8_t* tmp = nullptr;
+    static bool     init = false;
+    static int      budget = 40;
+    if (!init) { init = true; for (int i = 0; i < RING; ++i) rframe[i] = -1; }
+    int slot = ((frame % RING) + RING) % RING;
+    if (!ring[slot]) {
+        ring[slot] = (uint8_t*)VirtualAlloc(nullptr, CAP,
+                                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!ring[slot]) return;
+    }
+    if (rb == 0) { rlen[slot] = save(ring[slot], CAP); rframe[slot] = frame; return; }
+    if (rframe[slot] != frame || rlen[slot] == 0 || budget <= 0) return;
+    if (!tmp) {
+        tmp = (uint8_t*)VirtualAlloc(nullptr, CAP, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!tmp) return;
+    }
+    uint32_t nlen = save(tmp, CAP);
+    if (nlen == 0) return;
+    if (nlen == rlen[slot] && memcmp(tmp, ring[slot], nlen) == 0) return;  // deterministic
+    --budget;
+    if (nlen != rlen[slot])
+        log_printf("[bplive] f=%d blob LEN differs fwd=%u now=%u (liveness changed)\n",
+                   frame, rlen[slot], nlen);
+    log_printf("[bplive] *** bp NON-DET f=%d (all diverging live slots) ***\n", frame);
+    bplive_decode(ring[slot], tmp, rlen[slot]);
 }
 
 } // namespace battle_pools
