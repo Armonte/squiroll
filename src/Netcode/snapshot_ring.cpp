@@ -369,6 +369,26 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
     uint32_t cs = fold_checksum(sblob, sblob_len);
     LARGE_INTEGER pt2; QueryPerformanceCounter(&pt2);
 
+    // TRACE: ungated per-component checksum for EVERY save of the first frames, so
+    // the residual intermittent f=2 desync (cs diverges fwd-vs-resim while [comp]
+    // sq/bt look clean) can be pinned to the exact component — sq fold, bt fold, or
+    // the sblob (bp/mp/eng/irec/ihist). The 'fwd ' vs 'RESIM' tag + frame let us
+    // diff a frame's forward save against each of its re-sim saves.
+    if (frame <= 3) {
+        uint32_t sqh = 2166136261u, bth = 2166136261u, sbh = 2166136261u;
+        for (int a = 0; a <= 1; ++a) {
+            uint32_t bump = *(const uint32_t*)(g_ar[a].base + BUMP_OFF[a]);
+            uint32_t upg  = (bump + PAGE - 1) / PAGE;
+            if (upg > g_ar[a].npages) upg = g_ar[a].npages;
+            uint32_t h = 2166136261u;
+            for (uint32_t pg = 0; pg < upg; ++pg) { h ^= g_ar[a].phash[pg]; h *= 16777619u; }
+            if (a == 0) sqh = h; else bth = h;
+        }
+        for (uint32_t i = 0; i < sblob_len; ++i) { sbh ^= sblob[i]; sbh *= 16777619u; }
+        log_printf("[cspart] f=%u %s sq=%08x bt=%08x sblob=%08x cs=%08x\n",
+                   frame, re_capture_diag ? "RESIM" : "fwd ", sqh, bth, sbh, cs);
+    }
+
     // DIAGNOSTIC: per-arena page-hash fold, so a desync can be pinned to the
     // exact arena (sq / bullet / cpp) that diverged rather than one opaque
     // combined checksum.

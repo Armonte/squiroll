@@ -175,21 +175,37 @@ static int collect(Region* r) {
     {
         uintptr_t dstart = (uintptr_t)(0x498000_R);
         uintptr_t dend   = dstart + 0x47AA4;
-        uintptr_t ex0 = (uintptr_t)(0x4DB004_R), ex1 = ex0 + 4;
+        // Excluded sub-ranges: LIVE / non-deterministic .data that must stay OUT
+        // of the snapshot+checksum because it is re-polled or free-running every
+        // frame and is NOT simulation state (the sim's real input comes from the
+        // GekkoNet replay, not these raw buffers). Sorted ascending, disjoint:
+        //   [0x4DAEB8,+20) DirectInput GetDeviceState device buffer
+        //                  (dword_4D9F0C[1003]) — _input_get_states polls the live
+        //                  joystick/device into it each frame; the forward read
+        //                  varies while the headless re-sim's doesn't → false
+        //                  desync (pinned via [engdiff]: the residual intermittent
+        //                  eng divergence at 0x4DAEB8/0x4DAEBC).
+        //   [0x4DB004,+4)  g_engine_loop_tick — free-running main-loop counter
+        //                  (++ per Manbow_main_game_loop, read only by
+        //                  SoundPlayer::Play), diverges ±1 forward-vs-re-sim.
+        //   [0x4DAD10,+4)  _Wndproc window/input state (async OS message handler)
+        //                  — non-deterministic across the headless re-sim.
+        const struct { uintptr_t lo, hi; } exr[] = {
+            { (uintptr_t)(0x4DAD10_R), (uintptr_t)(0x4DAD10_R) + 4  },
+            { (uintptr_t)(0x4DAEB8_R), (uintptr_t)(0x4DAEB8_R) + 20 },
+            { (uintptr_t)(0x4DB004_R), (uintptr_t)(0x4DB004_R) + 4  },
+        };
 
-        // Emit a committed run [a,e) as snapshot region(s), splitting around the
-        // excluded g_engine_loop_tick (0x4DB004): a main-loop counter (++ per
-        // Manbow_main_game_loop pass, read only by SoundPlayer::Play) that
-        // diverges +/-1 forward-vs-resim -- [engdiff] proved it was the only
-        // .data value divergence, so it's left live and out of the snapshot.
+        // Emit committed run [a,e) as snapshot region(s), carving out every exr[].
         auto add_data = [&](uintptr_t a, uintptr_t e) {
-            if (e <= a) return;
-            if (e <= ex0 || a >= ex1) {
-                add((void*)a, (uint32_t)(e - a));
-            } else {
-                if (a < ex0) add((void*)a,   (uint32_t)(ex0 - a));
-                if (e > ex1) add((void*)ex1, (uint32_t)(e - ex1));
+            uintptr_t cur = a;
+            for (const auto& r : exr) {
+                if (r.hi <= cur || r.lo >= e) continue;   // exclusion not in [cur,e)
+                if (r.lo > cur) add((void*)cur, (uint32_t)(r.lo - cur));
+                if (r.hi > cur) cur = r.hi;
+                if (cur >= e) return;
             }
+            if (cur < e) add((void*)cur, (uint32_t)(e - cur));
         };
 
         // MERGE contiguous committed pages into one run regardless of protection

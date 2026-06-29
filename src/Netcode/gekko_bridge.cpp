@@ -186,19 +186,29 @@ static void fake_input_init() {
     g_fake_input = (n > 0 && n < sizeof(buf) && atoi(buf) != 0);
     if (!g_fake_input) return;
 
-    uint32_t seed = 0x9E3779B9u;
+    uint32_t seed;
     char sb[16] = {0};
     DWORD sn = GetEnvironmentVariableA("SQUIROLL_INPUT_SEED", sb, sizeof(sb));
-    if (sn > 0 && sn < sizeof(sb)) {
-        int s = atoi(sb);
-        if (s != 0) seed = (uint32_t)s;
+    bool explicit_seed = (sn > 0 && sn < sizeof(sb) && atoi(sb) != 0);
+    if (explicit_seed) {
+        seed = (uint32_t)strtoul(sb, nullptr, 0);   // override -> reproduce a run
+    } else {
+        // The harness bat does NOT set SQUIROLL_INPUT_SEED, so a fixed default
+        // made EVERY run play the identical input stream. Derive the seed from
+        // the wall clock instead -> each run differs; the seed is logged so any
+        // interesting run can be reproduced with SQUIROLL_INPUT_SEED=<that seed>.
+        uint32_t t = GetTickCount();
+        seed = (t * 2654435761u) ^ (t << 13) ^ (t >> 7) ^ 0x9E3779B9u;
+        if (seed == 0) seed = 0x9E3779B9u;
     }
     // Two distinct, non-zero streams — one per player.
     g_fake_rng[0] = seed ^ 0xA5A5A5A5u;
     g_fake_rng[1] = seed ^ 0x5A5A5A5Au;
     g_fake_held[0] = g_fake_held[1] = 0;
     g_fake_hold[0] = g_fake_hold[1] = 0;
-    log_printf("[gekko_bridge] FAKE INPUT enabled, seed=0x%08x\n", seed);
+    log_printf("[gekko_bridge] FAKE INPUT enabled, seed=0x%08x (%s) — "
+               "set SQUIROLL_INPUT_SEED=0x%08x to reproduce this run\n",
+               seed, explicit_seed ? "explicit" : "time-based", seed);
 }
 
 // Generate one player's packed input for this frame: a direction held for
@@ -1602,9 +1612,10 @@ void advance_one_frame() {
     if (rb_diag_enabled()) {
         battle_pools::diff_locate(g_trace_frame, g_trace_rb);
     }
-    // [engdiff]/[bplive] residual-divergence locators — DISABLED: eng/.data and bp
-    // are clean (verified). Leftover from the f=24/.data hunts; pure log noise now.
-    // engine_snap::diff_locate(g_trace_frame, g_trace_rb);
+    // [engdiff] .data divergence locator — RE-ENABLED: the residual intermittent
+    // desync is eng (.data) diverging on some rollback re-sims. This pins the exact
+    // .data offset. ([bplive] stays off — bp is clean.)
+    engine_snap::diff_locate(g_trace_frame, g_trace_rb);
     // battle_pools::diff_live(g_trace_frame, g_trace_rb);
 
     // Self-terminate at a target battle frame so diagnostic runs exit cleanly.
