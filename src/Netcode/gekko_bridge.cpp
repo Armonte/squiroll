@@ -750,7 +750,7 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         };
         LARGE_INTEGER _c0; QueryPerformanceCounter(&_c0);
         sect(&battle_pools::save);
-        sect(&battle_pools::mathpool_save);   // Sqrat math boost::pools (this.va/vf/vfBaria)
+        sect(&battle_pools::boostpool_save);   // Sqrat math boost::pools (this.va/vf/vfBaria)
         // cpp_arena is now dirty-page-snapshotted by snapshot_ring, not full-copied in the small blob.
         sect(&engine_snap::save);
         sect(&input_rec_save);
@@ -871,7 +871,7 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         };
         bool ok = put_section("sq_arena",  &sq_arena::save)
                && put_section("pools",     &battle_pools::save)
-               && put_section("mathpools", &battle_pools::mathpool_save)
+               && put_section("boostpools", &battle_pools::boostpool_save)
                && put_section("engine",    &engine_snap::save)
                && put_section("cpp_arena", &cpp_arena::save)
                && put_section("bullet",    &bullet_arena::save)
@@ -940,7 +940,7 @@ void load_state_from_buf(const void* buf, uint32_t len) {
                 sp += w;
             };
             sect(&battle_pools::load);
-            sect(&battle_pools::mathpool_load);   // Sqrat math boost::pools (this.va/vf/vfBaria)
+            sect(&battle_pools::boostpool_load);   // Sqrat math boost::pools (this.va/vf/vfBaria)
             // cpp_arena is now dirty-page-snapshotted by snapshot_ring, not full-copied in the small blob.
             sect(&engine_snap::load);
             sect(&input_rec_load);
@@ -1102,7 +1102,7 @@ void load_state_from_buf(const void* buf, uint32_t len) {
         };
         if (get_section("sq_arena", &sq_arena::load) &&
             get_section("pools",    &battle_pools::load) &&
-            get_section("mathpools", &battle_pools::mathpool_load)) {
+            get_section("boostpools", &battle_pools::boostpool_load)) {
             if (get_section("engine", &engine_snap::load) &&
                 get_section("cpp_arena", &cpp_arena::load) &&
                 get_section("bullet", &bullet_arena::load))

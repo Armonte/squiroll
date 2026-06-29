@@ -282,40 +282,77 @@ uint32_t save(uint8_t* out, uint32_t cap) {
     return (uint32_t)(p - out);
 }
 
-// --- math-object boost::pools (Sqrat::PoolAllocator) -----------------------
-// SqVector3 (this.va / this.vf / this.vfBaria), SqMatrix and SqIndexVector3
-// are drawn from Manbow Sqrat boost::pools whose blocks come from the TF4
-// dlmalloc mspace g_tf4_mspace at ~0x19Dxxxxx -- OUTSIDE every snapshot arena
-// and NOT TF4 TPoolAllocators, so they are not in g_pool_rva[] above and were
-// never captured. That left this.va.x (the player's active velocity)
-// un-snapshotted: ConvertTotalSpeed recomputes vx = va.x+vf.x+vfBaria.x every
-// frame, and a depth-1 rollback (loads save(N), skips re-running frame N) read
-// the stale LIVE va.x and WALKED where forward STOOD -- the f=15 divergence.
-// See IDB g_Manbow_SqVector3_pool @0x4DCCC0 + [getcmp] proof in actor2d_log.
+// --- Manbow boost::singleton_pool family (Sqrat::PoolAllocator + layer tasks)
+// A whole FAMILY of Manbow boost::singleton_pools (struct in .data at 0x4DCxxx/
+// 0x4DDxxx, blocks from g_tf4_mspace at ~0x19Dxxxxx) sit OUTSIDE every snapshot
+// arena and are NOT TF4 TPoolAllocators, so g_pool_rva[] above never captured
+// them. Their .data STRUCT (free_head/block_list/sizes) IS captured by
+// engine_snap, but the BLOCKS were not -- a half-capture that is WORSE than
+// none: after a rollback engine_snap restores free_head to frame-N while the
+// block free-chunks keep their live (post-frame) link values, so the free list
+// is INCONSISTENT. Two symptoms, one root:
+//   * SqVector3 (this.va/vf/vfBaria): stale va.x -> the f=15 depth-1 walk-vs-
+//     stand divergence ([getcmp] proof in actor2d_log).
+//   * The per-frame draw-task pools (TPrimitiveLayer<Sprite/...> tasks, the
+//     *Layer task/dyn-task pools, EwLayer::Task, effect_actor): a free chunk
+//     that was "free" at frame N is LIVE after rollback (reallocated, holding a
+//     vtable ptr); AnimationController2D::SetMotion on a HIT frees a layer task,
+//     walks the free list, reads that vtable as a next-link and writes through
+//     it -> the deterministic AV at th155+0x7F7D4 (Manbow_SpritePrimitiveLayer_
+//     free_to_pool). All pool names verified in the IDB.
+// Fix: whole-block snapshot of the SIM-MUTATED pools (the pool struct is in
+// .data via engine_snap, so only block CONTENTS are needed). Whole-block (not
+// live-slot like save()) also restores the free-chunk links, keeping them
+// consistent with engine_snap's restored free_head -> alloc determinism for
+// free, no dependence on each pool's (differently-encoded) slot stride.
+// boost::pool never frees a block mid-match, so block addresses are match-
+// stable -> restore in place by address; a block grown after a save is absent
+// from the blob and engine_snap restores the struct to exclude it (harmless).
 //
-// The pool STRUCT (free_head/block_list/sizes) sits in .data and is already
-// captured by engine_snap, so we only need the BLOCK CONTENTS. We snapshot
-// WHOLE BLOCKS (not live-slots like save() above): the blocks hold only these
-// fixed-size objects plus the boost::pool free-list links -- all deterministic
-// sim state -- and whole-block restore keeps the free chunks consistent with
-// engine_snap's restored free_head for allocation determinism, with far less
-// code and no dependence on the boost::pool's (differently-encoded) slot
-// stride. boost::pool never frees a block mid-match, so block addresses are
-// match-stable -> restore in place by address. A block grown AFTER a save is
-// simply absent from the blob; engine_snap restores the pool struct to exclude
-// it (it orphans in the mspace, harmless). If we ever need these to survive
-// block reallocation, switch to a live-slot serialize like save() -- but that
-// must ALSO capture the free list, which whole-block gives for free.
-static const uint32_t g_mathpool_rva[] = {
-    0x4DCCC0,  // g_Manbow_SqVector3_pool       (this.va / vf / vfBaria)
+// EXCLUDED on purpose: the build-once *LayerData pools (Sprite/Ring/Cylinder/
+// CompositeSprite LayerData @ 0x4DC6B0..0x4DC730 -- stage/character-load layer
+// definitions, not per-frame state) and the font/UI pools (FontPool/BitmapFont
+// @ 0x4DC790/7B0/0x4DD0A0) which are render-side. The mp [sblob] checksum is a
+// safety net: if any captured pool is render-nondeterministic it shows up as a
+// forward-vs-resim mp divergence and gets pulled back out.
+static const uint32_t g_boostpool_rva[] = {
+    // Sqrat math pools (Sqrat::PoolAllocator) -- this.va/vf/vfBaria etc.
+    0x4DCCC0,  // g_Manbow_SqVector3_pool          (this.va / vf / vfBaria == X)
     0x4DCCE0,  // g_Manbow_SqIndexVector3_pool
     0x4DCD00,  // g_Manbow_SqMatrix_pool
+    // TPrimitiveLayer<T> draw-task pools (built per-frame by the animation tree)
+    0x4DC3E0,  // PrimLayer_Sprite_DynTask
+    0x4DC400,  // PrimLayer_CompositeSprite_Task
+    0x4DC420,  // PrimLayer_Cylinder_Task
+    0x4DC440,  // PrimLayer_Ring_Task
+    0x4DC460,  // g_Manbow_SpritePrimitiveLayer_pool (the SetMotion-on-hit crash)
+    0x4DC480,  // PrimLayer_CompositeSprite_DynTask
+    0x4DC4A0,  // PrimLayer_Cylinder_DynTask
+    0x4DC4C0,  // PrimLayer_Ring_DynTask
+    // ILayer task pools
+    0x4DC4F0,  // RectangleLayer_Task
+    0x4DC510,  // RingLayer_Task
+    0x4DC540,  // CylinderLayer_Task
+    0x4DC560,  // ParallelLayer_Task
+    0x4DC5F0,  // CompositeRectangleLayer_Task
+    0x4DC580,  // TrailLayer_LayerTask
+    0x4DC5B0,  // TrailLayer_DynLayerTask
+    0x4DC5D0,  // TrailLayer_Task
+    0x4DC690,  // CompositeRectangleLayer_DynLayerTask
+    0x4DD000,  // RectangleLayer_DynLayerTask
+    0x4DD020,  // RingLayer_DynLayerTask
+    0x4DD040,  // CylinderLayer_DynLayerTask
+    0x4DD060,  // ParallelLayer_DynLayerTask
+    0x4DD0D0,  // EwLayer_Task
+    // actor-hierarchy + effects (sim state)
+    0x4DC630,  // Actor2D_ChildNode (Actor2D::SetParent)
+    0x4DC770,  // effect_actor
 };
-static constexpr int NMATHPOOL =
-    (int)(sizeof(g_mathpool_rva) / sizeof(g_mathpool_rva[0]));
-static constexpr uint32_t MATHPOOL_MAGIC = 0x4C4F4F4D;  // 'MOOL'
+static constexpr int NBOOSTPOOL =
+    (int)(sizeof(g_boostpool_rva) / sizeof(g_boostpool_rva[0]));
+static constexpr uint32_t BOOSTPOOL_MAGIC = 0x4C4F4F4D;  // 'MOOL'
 
-uint32_t mathpool_save(uint8_t* out, uint32_t cap) {
+uint32_t boostpool_save(uint8_t* out, uint32_t cap) {
     uint8_t* p = out;
     uint8_t* end = out + cap;
     auto put = [&](const void* s, uint32_t n) -> bool {
@@ -325,11 +362,11 @@ uint32_t mathpool_save(uint8_t* out, uint32_t cap) {
         return true;
     };
 
-    uint32_t magic = MATHPOOL_MAGIC, npool = (uint32_t)NMATHPOOL;
+    uint32_t magic = BOOSTPOOL_MAGIC, npool = (uint32_t)NBOOSTPOOL;
     if (!put(&magic, 4) || !put(&npool, 4)) return 0;
 
-    for (int i = 0; i < NMATHPOOL; ++i) {
-        const Pool* pl = (const Pool*)(g_mathpool_rva[i] + base_address);
+    for (int i = 0; i < NBOOSTPOOL; ++i) {
+        const Pool* pl = (const Pool*)(g_boostpool_rva[i] + base_address);
         // Count blocks first (single-threaded save: the set is stable between
         // the two walks) so the reader knows how many block records follow.
         uint32_t nblk = 0;
@@ -348,7 +385,7 @@ uint32_t mathpool_save(uint8_t* out, uint32_t cap) {
     return (uint32_t)(p - out);
 }
 
-void mathpool_load(const uint8_t* blob, uint32_t len) {
+void boostpool_load(const uint8_t* blob, uint32_t len) {
     if (len < 8) return;
     const uint8_t* p   = blob;
     const uint8_t* end = blob + len;
@@ -361,14 +398,14 @@ void mathpool_load(const uint8_t* blob, uint32_t len) {
 
     uint32_t magic = 0, npool = 0;
     if (!get(&magic, 4) || !get(&npool, 4)) return;
-    if (magic != MATHPOOL_MAGIC || npool != (uint32_t)NMATHPOOL) {
-        log_printf("[battle_pools] mathpool_load: bad header magic=%08x "
+    if (magic != BOOSTPOOL_MAGIC || npool != (uint32_t)NBOOSTPOOL) {
+        log_printf("[battle_pools] boostpool_load: bad header magic=%08x "
                    "npool=%u\n", magic, npool);
         return;
     }
 
-    for (uint32_t i = 0; i < npool && i < (uint32_t)NMATHPOOL; ++i) {
-        const Pool* pl = (const Pool*)(g_mathpool_rva[i] + base_address);
+    for (uint32_t i = 0; i < npool && i < (uint32_t)NBOOSTPOOL; ++i) {
+        const Pool* pl = (const Pool*)(g_boostpool_rva[i] + base_address);
         uint32_t nblk = 0;
         if (!get(&nblk, 4)) return;
         for (uint32_t b = 0; b < nblk; ++b) {

@@ -50,8 +50,8 @@ void load(const uint8_t* blob, uint32_t len);
 // them. Leaving this.va.x un-snapshotted caused the f=15 depth-1 walk-vs-stand
 // divergence. Whole-block capture (the pool struct itself is in .data, covered
 // by engine_snap). See battle_pools.cpp for the full rationale.
-uint32_t mathpool_save(uint8_t* out, uint32_t cap);
-void mathpool_load(const uint8_t* blob, uint32_t len);
+uint32_t boostpool_save(uint8_t* out, uint32_t cap);
+void boostpool_load(const uint8_t* blob, uint32_t len);
 
 // DIAGNOSTIC: log a per-pool checksum line, tagged. Comparing the forward
 // vs re-sim line shows which specific pool first diverges.
