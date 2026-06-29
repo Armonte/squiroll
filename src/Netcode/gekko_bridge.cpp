@@ -231,11 +231,15 @@ static uint16_t fake_input_gen(int p) {
     return in;
 }
 
-static uint32_t fletcher32(const uint8_t* data, size_t len) {
-    // TODO: use whatever checksum GekkoNet's desync detector prefers.
-    uint32_t a = 0xFFFFFFFFu;
+// Accumulating form — carries the rolling state `a` so a checksum can span
+// several disjoint byte ranges (used to skip the cpp_arena/render section).
+static uint32_t fletcher32_acc(uint32_t a, const uint8_t* data, size_t len) {
     for (size_t i = 0; i < len; ++i) a = (a >> 8) ^ (a + data[i]);
     return a;
+}
+static uint32_t fletcher32(const uint8_t* data, size_t len) {
+    // TODO: use whatever checksum GekkoNet's desync detector prefers.
+    return fletcher32_acc(0xFFFFFFFFu, data, len);
 }
 
 } // namespace gekko_bridge — temporarily close so the extern is global
@@ -852,6 +856,10 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
     // is kept only for the value-based desync checksum; this trailer is
     // what load() restores from when g_arena_rollback is on.
     uint8_t* trailer2_start = p;
+    // Byte span of the cpp_arena (render-signal) section within trailer2, so the
+    // desync checksum can skip it (see below). Empty span when rollback is off.
+    uint8_t* cpp_sect_start = p;
+    uint8_t* cpp_sect_end   = p;
     if (g_arena_rollback) {
         auto put_section = [&](const char* name, auto save_fn) -> bool {
             uint32_t off = (uint32_t)(p - static_cast<uint8_t*>(buf));
@@ -877,13 +885,21 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
             p += wrote;
             return true;
         };
+        // cpp_arena holds render-signal state (DrawCommandSlot / boost::signals2
+        // grouped-signal connection nodes). That is NOT simulation state and the
+        // rollback re-sim is headless by design, so it legitimately differs
+        // forward-vs-re-sim. We still SAVE + restore it (snapshot_ring) for visual
+        // correctness, but EXCLUDE its bytes from the desync checksum below. Track
+        // its span so the checksum can skip it.
         bool ok = put_section("sq_arena",  &sq_arena::save)
                && put_section("pools",     &battle_pools::save)
                && put_section("boostpools", &battle_pools::boostpool_save)
-               && put_section("engine",    &engine_snap::save)
-               && put_section("cpp_arena", &cpp_arena::save)
-               && put_section("bullet",    &bullet_arena::save)
-               && put_section("input",     &input_rec_save);
+               && put_section("engine",    &engine_snap::save);
+        cpp_sect_start = p;
+        ok = ok && put_section("cpp_arena", &cpp_arena::save);
+        cpp_sect_end = p;
+        ok = ok && put_section("bullet",    &bullet_arena::save)
+                && put_section("input",     &input_rec_save);
         if (!ok) {
             log_printf("[gekko_bridge] !! arena save overflow frame=%u — "
                        "bump GekkoConfig::state_size\n", frame);
@@ -907,8 +923,15 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         // identical bytes when the logical state matches). With arena
         // rollback off, fall back to the legacy value-based text blob.
         if (g_arena_rollback) {
-            *out_checksum = fletcher32(trailer2_start,
-                                       (size_t)(p - trailer2_start));
+            // Checksum the SIM sections only — skip the cpp_arena (render-signal)
+            // span. Render != simulation and the re-sim is headless, so cpp_arena
+            // legitimately differs forward-vs-re-sim; including it would flag false
+            // desyncs. cpp_arena is still saved+restored for visuals; the sim is
+            // fully covered by sq/pools/boostpools/engine/bullet/input.
+            uint32_t a = fletcher32_acc(0xFFFFFFFFu, trailer2_start,
+                                        (size_t)(cpp_sect_start - trailer2_start));
+            a = fletcher32_acc(a, cpp_sect_end, (size_t)(p - cpp_sect_end));
+            *out_checksum = a;
         } else {
             *out_checksum = sq_n > 0 ? fletcher32(text_blob, sq_n) : 0;
         }
@@ -1579,14 +1602,24 @@ void advance_one_frame() {
     if (rb_diag_enabled()) {
         battle_pools::diff_locate(g_trace_frame, g_trace_rb);
     }
-    engine_snap::diff_locate(g_trace_frame, g_trace_rb);     // [engdiff] residual .data desync locator
-    battle_pools::diff_live(g_trace_frame, g_trace_rb);       // [bplive] live-slot bp divergence locator (f=24)
+    // [engdiff]/[bplive] residual-divergence locators — DISABLED: eng/.data and bp
+    // are clean (verified). Leftover from the f=24/.data hunts; pure log noise now.
+    // engine_snap::diff_locate(g_trace_frame, g_trace_rb);
+    // battle_pools::diff_live(g_trace_frame, g_trace_rb);
 
     // Self-terminate at a target battle frame so diagnostic runs exit cleanly.
     // The solo stress harness otherwise HANGS at the round end (~f=70), keeping
     // Netcode.dll locked against the next build.sh deploy. SQUIROLL_EXIT_FRAME=N
     // (default off) ExitProcess()es once the forward sim passes frame N.
     if (g_trace_rb == 0) {
+        static DWORD t_start = 0;
+        if (t_start == 0) t_start = GetTickCount();
+        // Ungated heartbeat — proves how far the forward sim actually got (the
+        // [adv]/[save] logs are rate-gated and stop early). One line per 30 frames.
+        if ((g_trace_frame % 30) == 0)
+            log_printf("[hb] forward f=%d t=%ums\n", g_trace_frame,
+                       GetTickCount() - t_start);
+
         static int exit_frame = -2;
         if (exit_frame == -2) {
             char buf[16] = {0};
@@ -1601,9 +1634,29 @@ void advance_one_frame() {
             Sleep(400);            // let the async logger drain to disk
             ExitProcess(0);
         }
+        // Wall-clock cap — run ~N seconds then exit clean (the preferred harness:
+        // run for a fixed time, terminate only on desync/crash before then).
+        static int exit_secs = -2;
+        if (exit_secs == -2) {
+            char buf[16] = {0};
+            DWORD n = GetEnvironmentVariableA("SQUIROLL_EXIT_SECONDS", buf, sizeof buf);
+            int v = 0;
+            for (const char* s = buf; *s >= '0' && *s <= '9'; ++s) v = v * 10 + (*s - '0');
+            exit_secs = (n > 0 && v > 0) ? v : -1;
+        }
+        if (exit_secs > 0 && (GetTickCount() - t_start) >= (DWORD)exit_secs * 1000) {
+            log_printf("[gekko_bridge] SQUIROLL_EXIT_SECONDS=%d reached (f=%d, %ums) — exiting clean\n",
+                       exit_secs, g_trace_frame, GetTickCount() - t_start);
+            Sleep(400);
+            ExitProcess(0);
+        }
     }
-    cpp_arena::trace_check(g_trace_frame, g_trace_rb);        // diff fwd vs re-sim alloc seq
-    cpp_arena::diag_alloc_counts(g_trace_frame, g_trace_rb);  // Phase 1 render/signal diag
+    // cpp_arena divergence diagnostics ([cpptrace]/[allocdiag]) — DISABLED: cpp is
+    // intentionally excluded from the desync checksum (render state), so it
+    // diverges by design every frame. Diagnosing it just floods the log (the ~10
+    // fps) and walks the divergent arena. Re-enable only when debugging cpp itself.
+    // cpp_arena::trace_check(g_trace_frame, g_trace_rb);
+    // cpp_arena::diag_alloc_counts(g_trace_frame, g_trace_rb);
     ++*(uint32_t*)(0x4DACE0_R);                             // g_frame_counter
     if (trace) log_printf("[gekko_bridge] advance: exit\n");
 }

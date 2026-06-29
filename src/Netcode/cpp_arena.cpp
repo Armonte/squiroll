@@ -89,7 +89,7 @@ static DWORD    g_sim_tid   = 0;       // simulation thread; once set, ONLY this
 // size-class-13 (8 KB) bump-allocations — the rollback re-sim does one extra,
 // diverging cpp_arena (the DESYNC frame=11 root).
 static uint32_t g_opnew_caller = 0;
-static int      g_cls13_log    = 96;
+static int      g_cls13_log    = 0;   // [cpp13] dump DISABLED (cpp excluded from checksum)
 
 // DIAGNOSTIC (Phase 1, post-input-fix residual): per-advance count of the two
 // divergent allocators — DrawCommandSlot reset (0x57DC0) and boost::signals2
@@ -569,6 +569,7 @@ void trace_alloc(uint32_t addr) {
 }
 
 void     set_armed(bool on) { g_armed = on; }
+bool     is_armed()         { return g_armed; }
 void     set_resim(bool on) { g_resim = on; }
 bool     is_resim()         { return g_resim; }
 

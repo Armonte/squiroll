@@ -253,9 +253,22 @@ static const uint32_t BUMP_OFF[NARENA] = { 0, 4, 4 };
 // accumulators. A byte-wise hash of ~1 MB is a 1-million-long serial multiply
 // chain (~3.6 ms — measured); striding by 8 and splitting the dependency
 // chain in two cuts it ~16x.
+// Arena 2 (cpp_arena) holds render-signal state — DrawCommandSlot objects and
+// the boost::signals2 grouped-signal connection-list nodes bound to them. That
+// is RENDER output, not simulation state, and the rollback re-sim is headless by
+// design (it never renders), so cpp_arena legitimately differs forward-vs-re-sim
+// (and, in real netcode, between a peer that rolled back and one that didn't).
+// It is still dirty-page captured + restored below for visual correctness, but it
+// is EXCLUDED from the desync checksum — folding it in produces false desyncs.
+// The simulation is fully covered by arena 0 (sq_arena/Squirrel VM), arena 1
+// (bullet_arena/LiquidFun) and the small blob (battle pools / engine .data /
+// input). See ROLLBACK_NETCODE_PLAN.md "cpp_arena render divergence".
+static constexpr int CPP_ARENA = 2;
+
 static uint32_t fold_checksum(const uint8_t* sblob, uint32_t sblob_len) {
     uint32_t h = 2166136261u;
     for (int a = 0; a < NARENA; ++a) {
+        if (a == CPP_ARENA) continue;   // render state — not part of the sim checksum
         uint32_t bump = *(const uint32_t*)(g_ar[a].base + BUMP_OFF[a]);
         uint32_t upg  = (bump + PAGE - 1) / PAGE;
         if (upg > g_ar[a].npages) upg = g_ar[a].npages;
@@ -389,6 +402,13 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             (void)first_dump_done;                 // kept for binary stability
             int totalp = 0;
             for (int a = 0; a < NARENA; ++a) {
+                // cpp_arena (arena 2) is intentionally excluded from the desync
+                // checksum (render state — see fold_checksum). It diverges every
+                // frame by design, so do NOT diagnose/attribute it: the attribute
+                // walk follows pointers in the divergent arena and can fault, and
+                // it floods the log (the ~10 fps + the f≈27 crash). Only sq/bt
+                // divergence is a real desync worth surfacing.
+                if (a == CPP_ARENA) continue;
                 int hits = 0;
                 for (uint32_t pg = 0; pg < g_ar[a].npages && hits < 6; ++pg) {
                     if (S.phash_snap[a][pg] != g_ar[a].phash[pg]) {
@@ -497,7 +517,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             // dword resolved to an RVA so the C++ class can be named offline,
             // plus the parent reference region around sq 0xBF5328.
             {
-                static int objq = 8;
+                static int objq = 0;   // f=15 sq-hunt object dump DISABLED (sq clean)
                 int sqi = -1, bpi = -1;
                 for (int i = 0; i < N_TARGETS; ++i) {
                     if (TARGET_PAGES[i].arena == 0 && TARGET_PAGES[i].off == 0x9EE000) sqi = i;

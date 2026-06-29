@@ -60,6 +60,10 @@ void set_sim_thread(uint32_t tid);
 // slabs (Ogg/FMOD stream readers, etc.) out of the snapshot.
 bool is_sim_thread();
 
+// True while a match's rollback session is armed (set_armed(true)). Used to force
+// the Ew::sTask layer/effect dispatch synchronous during the rollback window.
+bool is_armed();
+
 // Mark a rollback re-simulation advance in progress. While set, a free of a
 // real-heap (non-arena) block is suppressed — the real Win32 heap is not
 // snapshotted, so the forward run already freed it and re-freeing would
