@@ -38,6 +38,13 @@ uint32_t save(uint8_t* out, uint32_t cap);
 // address. Each region is range-checked before the write.
 void load(const uint8_t* blob, uint32_t len);
 
+// DIAGNOSTIC: forward-vs-resim byte-diff of the th155 .data section. Called
+// post-advance with (frame, rb). On a forward advance it snapshots .data into
+// a per-frame ring; on a re-sim of the same frame it diffs and logs the first
+// diverging dwords as RVAs (-> IDA globals). [divf] covers sq/bt/cpp arenas
+// only, so this is the tool for the residual `eng` (.data) desync.
+void diff_locate(int frame, int rb);
+
 } // namespace engine_snap
 
 #endif // ENGINE_SNAP_H

@@ -1570,6 +1570,7 @@ void advance_one_frame() {
     if (rb_diag_enabled()) {
         battle_pools::diff_locate(g_trace_frame, g_trace_rb);
     }
+    engine_snap::diff_locate(g_trace_frame, g_trace_rb);     // [engdiff] residual .data desync locator
     cpp_arena::trace_check(g_trace_frame, g_trace_rb);        // diff fwd vs re-sim alloc seq
     cpp_arena::diag_alloc_counts(g_trace_frame, g_trace_rb);  // Phase 1 render/signal diag
     ++*(uint32_t*)(0x4DACE0_R);                             // g_frame_counter

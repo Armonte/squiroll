@@ -102,14 +102,27 @@ static constexpr int      MAX_REGIONS = 64;
 // Resolving the scheduler graph walks reverse-engineered struct offsets;
 // validating every region turns a wrong offset into a skipped region
 // (-> a detectable desync) instead of a crash.
+// True if EVERY page of [p, p+len) is committed + readable. Walks the range
+// rather than requiring a single VirtualQuery region, so a span that crosses a
+// PAGE_WRITECOPY->PAGE_READWRITE boundary (a .data page becomes RW on first
+// write) still passes. That protection split is non-deterministic across a
+// forward advance vs its rollback re-sim, so requiring one region made the
+// .data capture split — and thus the blob structure and its checksum —
+// diverge even when the bytes matched (the residual `eng` desync). Reads and
+// writes are both fine on WRITECOPY pages (a write just COWs to a private RW).
 static bool region_ok(const void* p, uint32_t len) {
     if (!p || len == 0) return false;
-    MEMORY_BASIC_INFORMATION mbi;
-    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
-    if (mbi.State != MEM_COMMIT) return false;
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
-    uintptr_t region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-    return (uintptr_t)p + len <= region_end;
+    uintptr_t a = (uintptr_t)p, e = a + len;
+    while (a < e) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((void*)a, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+        uintptr_t rend = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (rend <= a) return false;
+        a = rend;
+    }
+    return true;
 }
 
 struct Region { void* addr; uint32_t len; };
@@ -162,24 +175,51 @@ static int collect(Region* r) {
     {
         uintptr_t dstart = (uintptr_t)(0x498000_R);
         uintptr_t dend   = dstart + 0x47AA4;
-        uintptr_t p = dstart;
+        uintptr_t ex0 = (uintptr_t)(0x4DB004_R), ex1 = ex0 + 4;
+
+        // Emit a committed run [a,e) as snapshot region(s), splitting around the
+        // excluded g_engine_loop_tick (0x4DB004): a main-loop counter (++ per
+        // Manbow_main_game_loop pass, read only by SoundPlayer::Play) that
+        // diverges +/-1 forward-vs-resim -- [engdiff] proved it was the only
+        // .data value divergence, so it's left live and out of the snapshot.
+        auto add_data = [&](uintptr_t a, uintptr_t e) {
+            if (e <= a) return;
+            if (e <= ex0 || a >= ex1) {
+                add((void*)a, (uint32_t)(e - a));
+            } else {
+                if (a < ex0) add((void*)a,   (uint32_t)(ex0 - a));
+                if (e > ex1) add((void*)ex1, (uint32_t)(e - ex1));
+            }
+        };
+
+        // MERGE contiguous committed pages into one run regardless of protection
+        // (region_ok now walks, so a WRITECOPY->READWRITE boundary no longer
+        // forces a split). This makes the region structure deterministic: it
+        // depends only on the COMMITTED set (stable for the whole battle), not
+        // on which pages happen to have been written -- killing the residual
+        // eng/.data desync that was pure blob-structure noise.
+        uintptr_t p = dstart, run = 0;
         int dseg = 0;
         while (p < dend) {
             MEMORY_BASIC_INFORMATION mbi;
             if (VirtualQuery((void*)p, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
             uintptr_t rend = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-            uintptr_t seg_end = (rend < dend) ? rend : dend;
-            if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
-                add((void*)p, (uint32_t)(seg_end - p));
-                ++dseg;
+            bool committed = (mbi.State == MEM_COMMIT &&
+                              !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)));
+            if (committed) {
+                if (!run) run = p;          // start/extend the committed run
+            } else if (run) {
+                add_data(run, p); run = 0; ++dseg;   // run ended at this gap
             }
             if (rend <= p) break;
             p = rend;
         }
+        if (run) { add_data(run, dend); ++dseg; }
         static bool dlogged = false;
         if (!dlogged) {
             dlogged = true;
-            log_printf("[engine_snap] .data snapshot split into %d committed sub-region(s)\n", dseg);
+            log_printf("[engine_snap] .data snapshot: %d committed run(s) "
+                       "(merged across protection)\n", dseg);
         }
     }
 
@@ -339,6 +379,94 @@ void load(const uint8_t* blob, uint32_t len) {
         if (region_ok(addr, l)) memcpy(addr, p, l);
         p += l;
     }
+}
+
+void diff_locate(int frame, int rb) {
+    // Diffs the actual save() BLOB forward-vs-resim, region by region, so it
+    // covers BOTH the .data sub-regions (minus exclusions) AND the extra
+    // captured objects (ScriptAPI lists, framedrv, seffect/stask, kbd). The
+    // blob is self-describing: [magic][count] then per region [addr][len][bytes].
+    static constexpr int      RING = 16;
+    static constexpr uint32_t CAP  = 0x80000;   // 512K headroom for the eng blob
+    static uint8_t* ring[RING] = {};
+    static uint32_t rlen[RING] = {};
+    static int      rframe[RING];
+    static uint8_t* tmp = nullptr;
+    static bool     init = false;
+    static int      budget = 120;
+    if (!init) { init = true; for (int i = 0; i < RING; ++i) rframe[i] = -1; }
+    if (frame < 0) return;
+
+    int slot = ((frame % RING) + RING) % RING;
+    if (!ring[slot]) {
+        ring[slot] = (uint8_t*)VirtualAlloc(nullptr, CAP,
+                                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!ring[slot]) return;
+    }
+    if (rb == 0) {                              // forward: store the baseline blob
+        rlen[slot] = save(ring[slot], CAP);
+        rframe[slot] = frame;
+        return;
+    }
+    if (rframe[slot] != frame || budget <= 0) return;
+    if (!tmp) {
+        tmp = (uint8_t*)VirtualAlloc(nullptr, CAP, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!tmp) return;
+    }
+    uint32_t nlen = save(tmp, CAP);
+    const uint8_t* a = ring[slot];
+    const uint8_t* b = tmp;
+    if (rlen[slot] == 0 || nlen == 0) return;
+    if (rlen[slot] != nlen) {
+        // Region SET changed (a conditionally-captured region appeared or
+        // vanished). Walk both region tables in lockstep (collect() emits them
+        // in a fixed order) and report the first region whose (addr,len) header
+        // differs -> names the added/removed region.
+        uint32_t ca = *(const uint32_t*)(a + 4);
+        uint32_t cb = *(const uint32_t*)(b + 4);
+        const uint8_t* pa = a + 8;
+        const uint8_t* pb = b + 8;
+        uint32_t nmin = ca < cb ? ca : cb;
+        for (uint32_t r = 0; r < nmin; ++r) {
+            uint32_t aa = *(const uint32_t*)pa, al = *(const uint32_t*)(pa + 4);
+            uint32_t ba = *(const uint32_t*)pb, bl = *(const uint32_t*)(pb + 4);
+            if (aa != ba || al != bl) {
+                log_printf("[engdiff] f=%d region[%u] STRUCT diff: "
+                           "fwd=%08X(rva %08X)/len%u  now=%08X(rva %08X)/len%u\n",
+                           frame, r, aa, aa - (uint32_t)base_address, al,
+                           ba, ba - (uint32_t)base_address, bl);
+                break;
+            }
+            pa += 8 + al; pb += 8 + bl;
+        }
+        log_printf("[engdiff] f=%d blob LEN fwd=%u now=%u  nreg fwd=%u now=%u\n",
+                   frame, rlen[slot], nlen, ca, cb);
+        --budget; return;
+    }
+    uint32_t count = *(const uint32_t*)(a + 4);
+    const uint8_t* pa = a + 8;
+    const uint8_t* pb = b + 8;
+    int hits = 0;
+    for (uint32_t r = 0; r < count && hits < 10; ++r) {
+        uint32_t addr = *(const uint32_t*)pa;
+        uint32_t len  = *(const uint32_t*)(pa + 4);
+        const uint8_t* da = pa + 8;
+        const uint8_t* db = pb + 8;
+        for (uint32_t i = 0; i + 4 <= len && hits < 10; i += 4) {
+            uint32_t fv = *(const uint32_t*)(da + i);
+            uint32_t nv = *(const uint32_t*)(db + i);
+            if (fv != nv) {
+                ++hits;
+                log_printf("[engdiff] f=%d region=%08X(rva %08X)+0x%X "
+                           "fwd=%08X now=%08X\n", frame, addr,
+                           addr - (uint32_t)base_address, i, fv, nv);
+            }
+        }
+        pa += 8 + len;
+        pb += 8 + len;
+    }
+    if (hits) --budget;
+    else      log_printf("[engdiff] f=%d rb=%d eng blob IDENTICAL\n", frame, rb);
 }
 
 } // namespace engine_snap
