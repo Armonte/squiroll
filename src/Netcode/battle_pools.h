@@ -53,6 +53,12 @@ void load(const uint8_t* blob, uint32_t len);
 uint32_t boostpool_save(uint8_t* out, uint32_t cap);
 void boostpool_load(const uint8_t* blob, uint32_t len);
 
+// Diagnostics for the f=24 va.x rollback bug: set_va_probe publishes the
+// player's va.x C++ address; set_load_frame publishes the frame whose blob is
+// being restored. boostpool_save/load then log [bpsave]/[bpload]/[bpcover].
+void set_va_probe(uint32_t addr);
+void set_load_frame(int frame);
+
 // DIAGNOSTIC: log a per-pool checksum line, tagged. Comparing the forward
 // vs re-sim line shows which specific pool first diverges.
 void log_fingerprint(const char* tag);

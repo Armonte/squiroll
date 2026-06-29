@@ -362,6 +362,11 @@ static constexpr uint32_t BOOSTPOOL_MAGIC = 0x4C4F4F4D;  // 'MOOL'
 // RESTORED at the f=24 divergence -- and whether the block is in the blob at all.
 uint32_t g_va_probe = 0;
 void set_va_probe(uint32_t a) { g_va_probe = a; log_printf("[bpprobe] set_va_probe(%08X)\n", a); }
+// The frame whose save-blob boostpool_load is currently restoring (set by
+// gekko_bridge::load_state from hdr->frame), so the va.x probe can attribute
+// the restored value to a specific save.
+int g_load_frame = -2;
+void set_load_frame(int f) { g_load_frame = f; }
 
 uint32_t boostpool_save(uint8_t* out, uint32_t cap) {
     uint8_t* p = out;
@@ -424,6 +429,25 @@ uint32_t boostpool_save(uint8_t* out, uint32_t cap) {
     return (uint32_t)(p - out);
 }
 
+// Committed + writable + in-region sanity for a restore target. This REPLACES the
+// old "walk the pool's block list to validate the address" guard, which is
+// unreliable inside boostpool_load: this runs BEFORE engine_snap restores the
+// pool struct (block_list_head) and before the block trailers are restored, so the
+// walk follows the live/un-reverted (and across many rollbacks, cross-linked)
+// chain and misses the saved block. A page-state check is the right guard against
+// a malformed blob and doesn't depend on the (in-flux) block list.
+static bool bp_writable(uint32_t a, uint32_t n) {
+    if (!a || !n) return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((void*)(uintptr_t)a, &mbi, sizeof mbi)) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    const DWORD W = PAGE_READWRITE | PAGE_WRITECOPY |
+                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (!(mbi.Protect & W)) return false;
+    uint32_t rbase = (uint32_t)(uintptr_t)mbi.BaseAddress;
+    return (uint64_t)a + n <= (uint64_t)rbase + mbi.RegionSize;
+}
+
 void boostpool_load(const uint8_t* blob, uint32_t len) {
     if (len < 8) return;
     const uint8_t* p   = blob;
@@ -455,32 +479,34 @@ void boostpool_load(const uint8_t* blob, uint32_t len) {
             uint32_t addr = 0, size = 0;
             if (!get(&addr, 4) || !get(&size, 4)) return;
             if (p + size > end) return;  // truncated blob guard
-            // Restore only to a CURRENTLY-VALID block of THIS pool (match-
-            // stable, but guard against a malformed blob writing arbitrary
-            // memory). Blocks are never freed mid-match, so a saved block is
-            // always still present; growth only adds blocks (absent here).
-            bool valid = false;
-            for_each_block(pl, [&](uint32_t cb, uint32_t cs) {
-                if (cb == addr && cs == size) valid = true;
-            });
+            // Restore the saved block DIRECTLY to its saved address. The boostpool
+            // TF4 object pools are frozen for the match (tf4_pool freeze-on-grow),
+            // so a saved block never moves and is always present at its saved
+            // address. We must NOT re-walk the pool's block list to "validate":
+            // boostpool_load runs BEFORE engine_snap restores the pool struct
+            // (block_list_head) and the block trailers, so the walk follows the
+            // live/un-reverted (and across many rollbacks, cross-linked/corrupted)
+            // chain and MISSES the saved block -> it got silently skipped -> the
+            // player's va/vf/vfBaria were never restored on a rollback -> the f=24
+            // first-attack divergence. A committed+writable bound is the only guard
+            // needed against a malformed blob.
+            bool ok_target = bp_writable(addr, size);
             bool probe_here = (g_va_probe >= addr && g_va_probe < addr + size);
             uint32_t va_live  = probe_here ? *(const uint32_t*)(uintptr_t)g_va_probe : 0;
             uint32_t va_blob  = probe_here ? *(const uint32_t*)(p + (g_va_probe - addr)) : 0;
-            if (valid) memcpy((void*)(uintptr_t)addr, p, size);
+            if (ok_target) memcpy((void*)(uintptr_t)addr, p, size);
             if (probe_here && _llog) {
                 _probe_seen = true;
-                log_printf("[bpload] f=%d d=%d pool#%u block %08X valid=%d "
+                log_printf("[bpload] loadframe=%d f=%d d=%d pool#%u block %08X ok=%d "
                            "va.x: live=%08X blob=%08X -> now=%08X\n",
-                           _lf, gekko_bridge::g_trace_depth, i, addr, valid,
+                           g_load_frame, _lf, gekko_bridge::g_trace_depth, i, addr, ok_target,
                            va_live, va_blob, *(const uint32_t*)(uintptr_t)g_va_probe);
-            } else if (!valid && _llog)
-                log_printf("[bpskip] f=%d d=%d pool#%u SKIP saved block addr=%08X..%08X size=%X\n",
-                           _lf, gekko_bridge::g_trace_depth, i, addr, addr + size, size);
+            }
             p += size;
         }
     }
     if (_llog && !_probe_seen)
-        log_printf("[bpload] f=%d d=%d va.x probe @%08X NOT in any saved block -> NOT restored\n",
+        log_printf("[bpload] f=%d d=%d va.x probe @%08X NOT in any saved block\n",
                    _lf, gekko_bridge::g_trace_depth, g_va_probe);
 }
 

@@ -940,6 +940,7 @@ void load_state_from_buf(const void* buf, uint32_t len) {
                 sp += w;
             };
             sect(&battle_pools::load);
+            battle_pools::set_load_frame((int)hdr->frame);  // probe: which save is being restored
             sect(&battle_pools::boostpool_load);   // Sqrat math boost::pools (this.va/vf/vfBaria)
             // cpp_arena is now dirty-page-snapshotted by snapshot_ring, not full-copied in the small blob.
             sect(&engine_snap::load);
