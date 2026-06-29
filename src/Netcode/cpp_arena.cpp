@@ -71,11 +71,21 @@ static_assert(sizeof(Hdr) == 16, "Hdr must be 16 bytes");
 // bit-reproducible across a rollback re-simulation.
 struct Meta {
     uint32_t magic;
-    uint32_t bump;             // offset of next fresh block (high-water)
+    uint32_t bump;             // offset of next fresh SIM block (high-water, grows up)
     uint32_t live_bytes;       // currently-handed-out payload bytes
     uint32_t free_off[NCLS];   // per-class free-list head offset (0 = empty)
-    uint32_t reserved[8];
+    uint32_t render_bump;      // next fresh RENDER block (grows up from RENDER_BASE)
+    uint32_t reserved[7];
 };
+
+// The arena is split into a SIM region [Meta, RENDER_BASE) and a RENDER region
+// [RENDER_BASE, ARENA_SIZE). Render allocs (DrawCommandSlot &c) are forward-only
+// and alloc'd+freed every frame; keeping them in their OWN bump means that churn
+// can NEVER move the sim's boost::signals2 connection nodes (the cpp-divergence
+// root). Both regions are dirty-page captured+restored, so the sim's refs into the
+// render region stay valid; cpp is excluded from the desync checksum so the render
+// region diverging fwd-vs-resim is harmless. 16 MB is ample for per-frame render.
+static constexpr uint32_t RENDER_BASE = 112u * 1024 * 1024;
 
 static uint8_t* g_base      = nullptr;
 static Meta*    g_meta      = nullptr;
@@ -255,7 +265,7 @@ static int class_for(size_t n) {
     return sh;
 }
 
-static void* arena_alloc(size_t n) {
+static void* arena_alloc(size_t n, bool is_render) {
     int sh = class_for(n);
     if (sh > CLS_MAX_SH) return nullptr;
     int      ci  = sh - CLS_MIN_SH;
@@ -263,15 +273,20 @@ static void* arena_alloc(size_t n) {
     uint32_t off;
     // Lock spans every read/write of g_meta->bump and g_meta->free_off[].
     EnterCriticalSection(&g_lock);
-    if (g_meta->free_off[ci]) {
+    if (is_render && (uint64_t)g_meta->render_bump + blk <= ARENA_SIZE) {
+        // RENDER region bump (separate from the sim — see RENDER_BASE). Leaks like
+        // the sim (no recycle); 16 MB holds plenty of per-frame render churn.
+        off = g_meta->render_bump;
+        g_meta->render_bump += blk;
+    } else if (g_meta->free_off[ci]) {
         off = g_meta->free_off[ci];
         g_meta->free_off[ci] = ((Hdr*)(g_base + off))->link;
     } else {
-        if ((uint64_t)g_meta->bump + blk > ARENA_SIZE) {
+        if ((uint64_t)g_meta->bump + blk > RENDER_BASE) {
             if (g_warn) {
                 --g_warn;
-                log_printf("[cpp_arena] !! ARENA FULL bump=%u +%u\n",
-                           g_meta->bump, blk);
+                log_printf("[cpp_arena] !! SIM region FULL bump=%u +%u (cap=%u)\n",
+                           g_meta->bump, blk, RENDER_BASE);
             }
             LeaveCriticalSection(&g_lock);
             return nullptr;
@@ -385,6 +400,15 @@ static bool caller_excluded(uint32_t abs_caller) {
     return false;
 }
 
+// True for the FORWARD-ONLY render allocators (DrawCommandSlot create_and_bind /
+// reset). Their objects go to the arena's separate RENDER region so their per-frame
+// alloc/free churn can't move the sim's connection nodes (the cpp-divergence root).
+static bool is_render_caller(uint32_t abs_caller) {
+    uint32_t rva = abs_caller - (uint32_t)base_address;
+    return (rva >= 0x56A90u && rva < 0x56AD0u)    // Manbow::DrawCommandSlot::create_and_bind
+        || (rva >= 0x57DC0u && rva < 0x57E00u);   // DrawCommandSlot reset
+}
+
 // operator new: while a rollback session is armed, serve from the arena so
 // the battle's C++ heap is part of the snapshot. Outside a match (boot,
 // menus) pass straight to the real allocator — that keeps the arena, hence
@@ -462,7 +486,7 @@ static void* cdecl hook_op_new(size_t size) {
         bool pre_gate = (g_sim_tid == 0);
         bool admitted = sim || worker || pre_gate;
         if (admitted && !thread_excluded(tid) && !caller_excluded(caller)) {
-            void* p = arena_alloc(size);
+            void* p = arena_alloc(size, is_render_caller(caller));
             if (p) {
                 // TRACE f=2 arena allocs (fwd vs re-sim) to settle the cpp root:
                 // same caller+size at a DIFFERENT addr => free-list reuse diverged
@@ -606,8 +630,9 @@ void install() {
     }
     g_meta = (Meta*)g_base;
     g_meta->magic      = META_MAGIC;
-    g_meta->bump       = (sizeof(Meta) + 15u) & ~15u;  // first block 16-aligned
-    g_meta->live_bytes = 0;
+    g_meta->bump        = (sizeof(Meta) + 15u) & ~15u;  // first SIM block 16-aligned
+    g_meta->render_bump = RENDER_BASE;                  // render region grows from here
+    g_meta->live_bytes  = 0;
     for (int i = 0; i < NCLS; ++i) g_meta->free_off[i] = 0;
 
     // Install the FREE hook first: the instant the operator-new hook goes
@@ -692,7 +717,7 @@ void* raw_alloc(uint32_t n, uint32_t caller_abs) {
     // shim. See Hdr::link / attribute().
     g_opnew_caller = caller_abs ? caller_abs
                    : (uint32_t)(uintptr_t)_ReturnAddress();
-    return arena_alloc(n);
+    return arena_alloc(n, is_render_caller(g_opnew_caller));
 }
 
 // DIAGNOSTIC: attribute an arena byte offset to the block that owns it and
