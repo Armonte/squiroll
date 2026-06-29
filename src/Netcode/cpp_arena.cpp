@@ -558,6 +558,15 @@ static void* cdecl hook_malloc(size_t size) {
     return p;
 }
 
+// FLATTEN (SQUIROLL_FLATTEN_JOBS=1): run each one-shot Ew::cJobThread job INLINE on
+// the dispatching thread instead of on its own worker thread, so the per-frame jobs
+// (which allocate boost::signals2 / sim objects into cpp_arena) run in a single
+// DETERMINISTIC ORDER — killing the residual broad cpp divergence from concurrent
+// worker allocation interleaving. A no-op thread is still spawned so the dispatcher
+// gets a real, immediately-signaled handle to join/close.
+static bool g_flatten_jobs = false;
+static unsigned stdcall noop_thread_start(void*) { return 0; }
+
 // _beginthreadex: tag every th155 worker thread by its start routine at
 // creation. A thread whose start routine falls in the audio window is
 // excluded from the arena before it runs a single instruction, so no audio
@@ -565,6 +574,16 @@ static void* cdecl hook_malloc(size_t size) {
 static uintptr_t cdecl hook_beginthreadex(void* sec, unsigned stk, void* start,
                                           void* arg, unsigned flag,
                                           unsigned* tidp) {
+    uint32_t srva0 = (uint32_t)((uintptr_t)start - base_address);
+    if (g_flatten_jobs && (g_worker_start_hi > g_worker_start_lo) &&
+        srva0 >= g_worker_start_lo && srva0 < g_worker_start_hi &&
+        !(flag & CREATE_SUSPENDED)) {
+        // Run the job NOW, in dispatch order, on this thread.
+        ((unsigned (stdcall*)(void*))start)(arg);
+        // Hand back a real handle (no-op thread) so the dispatcher's wait/close works.
+        return g_h_bthreadex.unsafe_ccall<uintptr_t>(sec, stk,
+                   (void*)noop_thread_start, nullptr, flag, tidp);
+    }
     uintptr_t h = g_h_bthreadex.unsafe_ccall<uintptr_t>(sec, stk, start, arg,
                                                         flag, tidp);
     if (h) {
@@ -597,6 +616,14 @@ static uintptr_t cdecl hook_beginthreadex(void* sec, unsigned stk, void* start,
 
 void install() {
     if (g_installed) return;
+
+    {   // SQUIROLL_FLATTEN_JOBS=1 -> run cJobThread jobs inline (deterministic order)
+        char fb[8] = {0};
+        DWORD fn = GetEnvironmentVariableA("SQUIROLL_FLATTEN_JOBS", fb, sizeof fb);
+        g_flatten_jobs = (fn > 0 && fn < sizeof fb && atoi(fb) != 0);
+        if (g_flatten_jobs)
+            log_printf("[cpp_arena] SQUIROLL_FLATTEN_JOBS=1 — cJobThread jobs run INLINE\n");
+    }
 
     // Serialises arena_alloc/arena_free across th155's threads. Created
     // before the hooks go live so the very first hooked call is already
