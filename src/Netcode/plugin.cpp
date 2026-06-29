@@ -853,6 +853,8 @@ extern "C" {
 
                     if (SQ_FAILED(sq_getstring(v, 2, &file))) return sq_throwerror(v, _SC("Invalid file path"));
                     if (SQ_FAILED(sq_getstackobj(v, 3, &root))) return sq_throwerror(v, _SC("Invalid root object"));
+                    if (GetEnvironmentVariableA("SQUIROLL_NUT_TRACE", nullptr, 0))
+                        log_printf("[cf] %s\n", file);   // TEMP: trace every CompileFile
 
                     if (EmbedData embed = get_embed_data(file)) {
                         // log_printf("found %s in buffer,compiling...\n",file);
@@ -888,6 +890,40 @@ extern "C" {
                             sq_pushobject(v, root);
                             if (SQ_FAILED(sq_call(v, 1, SQFalse, SQTrue)))return sq_throwerror(v, _SC("failed to apply patch"));
                         }
+
+                    // [nuttrace] wrap Actor2D.VX_Brake the instant actor_game.nut
+                    // finishes compiling into ::manbow.Actor2D (root), BEFORE any
+                    // DerivedClass(Actor2D) copies the method table. Done from C++
+                    // (not ::plugin.patches) because the actor base classes compile
+                    // BEFORE the .nut plugin patch registration runs, so a .nut
+                    // Patch() would miss this file. The wrapper calls the original
+                    // (_vxb) so behaviour is unchanged; ::__gekko_trace gates on
+                    // SQUIROLL_NUT_TRACE + a frame window. Self-balancing on the SQ
+                    // stack (compilebuffer +1, push root +1, call -1, pop -1).
+                    if (strcmp(file, "data/actor/script/actor_game.nut") == 0) {
+                        static const char WRAP[] =
+                            "if (!(\"__vxbhit_n\" in ::getroottable())) ::__vxbhit_n <- 0;\n"
+                            "local _vxb = VX_Brake;\n"
+                            "function VX_Brake(x_, min_ = null) {\n"
+                            "  if (::__vxbhit_n < 40) { ::__vxbhit_n = ::__vxbhit_n + 1; ::print(\"[vxbhit] VX_Brake invoked\\n\"); }\n"
+                            "  ::__gekko_trace(\"VXB_in_vax\", this.va.x);\n"
+                            "  ::__gekko_trace(\"VXB_x\", x_);\n"
+                            "  ::__gekko_trace(\"VXB_min\", min_ == null ? -99999.0 : min_);\n"
+                            "  local r = _vxb.call(this, x_, min_);\n"
+                            "  ::__gekko_trace(\"VXB_vx\", this.vx);\n"
+                            "  return r;\n"
+                            "}\n";
+                        if (SQ_SUCCEEDED(sq_compilebuffer(v, WRAP, (SQInteger)(sizeof(WRAP) - 1), _SC("vxb_wrap"), SQTrue))) {
+                            sq_pushobject(v, root);
+                            if (SQ_FAILED(sq_call(v, 1, SQFalse, SQTrue)))
+                                log_printf("[nuttrace] VX_Brake wrap FAILED to apply\n");
+                            else
+                                log_printf("[nuttrace] VX_Brake wrapped (actor_game.nut)\n");
+                            sq_pop(v, 1);   // pop the compiled closure
+                        } else {
+                            log_printf("[nuttrace] VX_Brake wrap COMPILE error\n");
+                        }
+                    }
                     return 0;
 
                 }, 0);

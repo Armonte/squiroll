@@ -116,27 +116,6 @@ function Move( env )
 
 function Update()
 {
-	// [nuttrace] one-time monkey-patch of the LIVE Actor2D.VX_Brake. We wrap
-	// (call the original via _vxb) so behaviour is identical; the C++
-	// ::__gekko_trace native gates on SQUIROLL_NUT_TRACE + a frame window, so
-	// this is inert unless tracing. Patched here -- in squiroll's faithful
-	// loop.nut -- because the decompiled actor_game.nut is NOT the live version
-	// (missing functions e.g. C_Vec_BrakeLimited), so replacing the game file
-	// is impossible; wrapping the live class method is.
-	if (("VX_Brake" in ::manbow.Actor2D) && !("__nuttrace_patched" in ::manbow.Actor2D)) {
-		::manbow.Actor2D.__nuttrace_patched <- true;
-		local _vxb = ::manbow.Actor2D.VX_Brake;
-		::manbow.Actor2D.VX_Brake <- function (x_, min_ = null) {
-			::__gekko_trace("VXB_in_vax", this.va.x);
-			::__gekko_trace("VXB_x", x_);
-			::__gekko_trace("VXB_min", min_ == null ? -99999.0 : min_);
-			local r = _vxb.call(this, x_, min_);
-			::__gekko_trace("VXB_vx", this.vx);
-			return r;
-		};
-		::print("[nuttrace] VX_Brake monkey-patched\n");
-	}
-
 	::input_all.Update();
 
 	// Gekko rollback: once the gekko session owns the frame loop, the
