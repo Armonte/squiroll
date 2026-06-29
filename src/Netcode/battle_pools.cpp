@@ -282,6 +282,113 @@ uint32_t save(uint8_t* out, uint32_t cap) {
     return (uint32_t)(p - out);
 }
 
+// --- math-object boost::pools (Sqrat::PoolAllocator) -----------------------
+// SqVector3 (this.va / this.vf / this.vfBaria), SqMatrix and SqIndexVector3
+// are drawn from Manbow Sqrat boost::pools whose blocks come from the TF4
+// dlmalloc mspace g_tf4_mspace at ~0x19Dxxxxx -- OUTSIDE every snapshot arena
+// and NOT TF4 TPoolAllocators, so they are not in g_pool_rva[] above and were
+// never captured. That left this.va.x (the player's active velocity)
+// un-snapshotted: ConvertTotalSpeed recomputes vx = va.x+vf.x+vfBaria.x every
+// frame, and a depth-1 rollback (loads save(N), skips re-running frame N) read
+// the stale LIVE va.x and WALKED where forward STOOD -- the f=15 divergence.
+// See IDB g_Manbow_SqVector3_pool @0x4DCCC0 + [getcmp] proof in actor2d_log.
+//
+// The pool STRUCT (free_head/block_list/sizes) sits in .data and is already
+// captured by engine_snap, so we only need the BLOCK CONTENTS. We snapshot
+// WHOLE BLOCKS (not live-slots like save() above): the blocks hold only these
+// fixed-size objects plus the boost::pool free-list links -- all deterministic
+// sim state -- and whole-block restore keeps the free chunks consistent with
+// engine_snap's restored free_head for allocation determinism, with far less
+// code and no dependence on the boost::pool's (differently-encoded) slot
+// stride. boost::pool never frees a block mid-match, so block addresses are
+// match-stable -> restore in place by address. A block grown AFTER a save is
+// simply absent from the blob; engine_snap restores the pool struct to exclude
+// it (it orphans in the mspace, harmless). If we ever need these to survive
+// block reallocation, switch to a live-slot serialize like save() -- but that
+// must ALSO capture the free list, which whole-block gives for free.
+static const uint32_t g_mathpool_rva[] = {
+    0x4DCCC0,  // g_Manbow_SqVector3_pool       (this.va / vf / vfBaria)
+    0x4DCCE0,  // g_Manbow_SqIndexVector3_pool
+    0x4DCD00,  // g_Manbow_SqMatrix_pool
+};
+static constexpr int NMATHPOOL =
+    (int)(sizeof(g_mathpool_rva) / sizeof(g_mathpool_rva[0]));
+static constexpr uint32_t MATHPOOL_MAGIC = 0x4C4F4F4D;  // 'MOOL'
+
+uint32_t mathpool_save(uint8_t* out, uint32_t cap) {
+    uint8_t* p = out;
+    uint8_t* end = out + cap;
+    auto put = [&](const void* s, uint32_t n) -> bool {
+        if (p + n > end) return false;
+        memcpy(p, s, n);
+        p += n;
+        return true;
+    };
+
+    uint32_t magic = MATHPOOL_MAGIC, npool = (uint32_t)NMATHPOOL;
+    if (!put(&magic, 4) || !put(&npool, 4)) return 0;
+
+    for (int i = 0; i < NMATHPOOL; ++i) {
+        const Pool* pl = (const Pool*)(g_mathpool_rva[i] + base_address);
+        // Count blocks first (single-threaded save: the set is stable between
+        // the two walks) so the reader knows how many block records follow.
+        uint32_t nblk = 0;
+        for_each_block(pl, [&](uint32_t, uint32_t) { ++nblk; });
+        if (!put(&nblk, 4)) return 0;
+        bool ok = true;
+        for_each_block(pl, [&](uint32_t b, uint32_t s) {
+            if (!ok) return;
+            // [addr][size][size bytes] -- the whole block, including its
+            // 8-byte block-list trailer (next-ptr/next-size, stable pointers).
+            if (!put(&b, 4) || !put(&s, 4) ||
+                !put((const void*)(uintptr_t)b, s)) ok = false;
+        });
+        if (!ok) return 0;
+    }
+    return (uint32_t)(p - out);
+}
+
+void mathpool_load(const uint8_t* blob, uint32_t len) {
+    if (len < 8) return;
+    const uint8_t* p   = blob;
+    const uint8_t* end = blob + len;
+    auto get = [&](void* d, uint32_t n) -> bool {
+        if (p + n > end) return false;
+        memcpy(d, p, n);
+        p += n;
+        return true;
+    };
+
+    uint32_t magic = 0, npool = 0;
+    if (!get(&magic, 4) || !get(&npool, 4)) return;
+    if (magic != MATHPOOL_MAGIC || npool != (uint32_t)NMATHPOOL) {
+        log_printf("[battle_pools] mathpool_load: bad header magic=%08x "
+                   "npool=%u\n", magic, npool);
+        return;
+    }
+
+    for (uint32_t i = 0; i < npool && i < (uint32_t)NMATHPOOL; ++i) {
+        const Pool* pl = (const Pool*)(g_mathpool_rva[i] + base_address);
+        uint32_t nblk = 0;
+        if (!get(&nblk, 4)) return;
+        for (uint32_t b = 0; b < nblk; ++b) {
+            uint32_t addr = 0, size = 0;
+            if (!get(&addr, 4) || !get(&size, 4)) return;
+            if (p + size > end) return;  // truncated blob guard
+            // Restore only to a CURRENTLY-VALID block of THIS pool (match-
+            // stable, but guard against a malformed blob writing arbitrary
+            // memory). Blocks are never freed mid-match, so a saved block is
+            // always still present; growth only adds blocks (absent here).
+            bool valid = false;
+            for_each_block(pl, [&](uint32_t cb, uint32_t cs) {
+                if (cb == addr && cs == size) valid = true;
+            });
+            if (valid) memcpy((void*)(uintptr_t)addr, p, size);
+            p += size;
+        }
+    }
+}
+
 void log_fingerprint(const char* tag) {
     for (int i = 0; i < NPOOL; ++i) {
         const Pool* p = pool_at(i);

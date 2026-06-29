@@ -750,6 +750,7 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         };
         LARGE_INTEGER _c0; QueryPerformanceCounter(&_c0);
         sect(&battle_pools::save);
+        sect(&battle_pools::mathpool_save);   // Sqrat math boost::pools (this.va/vf/vfBaria)
         // cpp_arena is now dirty-page-snapshotted by snapshot_ring, not full-copied in the small blob.
         sect(&engine_snap::save);
         sect(&input_rec_save);
@@ -765,9 +766,9 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         // diverged. Sections are [u32 len][data], in sect() order.
         {
             const uint8_t* q = smb;
-            const char* nm[4] = { "bp", "eng", "irec", "ihist" };
+            const char* nm[5] = { "bp", "mp", "eng", "irec", "ihist" };
             char comps[160]; int cn = 0;
-            for (int s = 0; s < 4 && q + 4 <= sp; ++s) {
+            for (int s = 0; s < 5 && q + 4 <= sp; ++s) {
                 uint32_t L = *(const uint32_t*)q; q += 4;
                 if (q + L > sp) break;
                 uint32_t h = 2166136261u;
@@ -870,6 +871,7 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         };
         bool ok = put_section("sq_arena",  &sq_arena::save)
                && put_section("pools",     &battle_pools::save)
+               && put_section("mathpools", &battle_pools::mathpool_save)
                && put_section("engine",    &engine_snap::save)
                && put_section("cpp_arena", &cpp_arena::save)
                && put_section("bullet",    &bullet_arena::save)
@@ -938,6 +940,7 @@ void load_state_from_buf(const void* buf, uint32_t len) {
                 sp += w;
             };
             sect(&battle_pools::load);
+            sect(&battle_pools::mathpool_load);   // Sqrat math boost::pools (this.va/vf/vfBaria)
             // cpp_arena is now dirty-page-snapshotted by snapshot_ring, not full-copied in the small blob.
             sect(&engine_snap::load);
             sect(&input_rec_load);
@@ -1098,7 +1101,8 @@ void load_state_from_buf(const void* buf, uint32_t len) {
             return true;
         };
         if (get_section("sq_arena", &sq_arena::load) &&
-            get_section("pools",    &battle_pools::load)) {
+            get_section("pools",    &battle_pools::load) &&
+            get_section("mathpools", &battle_pools::mathpool_load)) {
             if (get_section("engine", &engine_snap::load) &&
                 get_section("cpp_arena", &cpp_arena::load) &&
                 get_section("bullet", &bullet_arena::load))
@@ -1429,7 +1433,35 @@ static void input_rec_load(const uint8_t* blob, uint32_t len) {
     }
 }
 
+// SAFE X-FINDER (dump only, no restore): at advance-ENTRY for f=15 (so the state
+// is f=14: loaded-from-save(14) on the depth-1 re-sim, live on the forward),
+// checksum every committed writable region. The saved regions (arenas/.data) will
+// match fwd vs depth-1; the region whose cs DIFFERS is where the un-saved carry-
+// over X lives -> snapshot just that next.
+static void log_region_checksums() {
+    if (g_trace_frame != 15) return;
+    uintptr_t p = 0x00400000; int n = 0;
+    while (p < 0x40000000 && n < 600) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((void*)p, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
+        uintptr_t rend = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE)) &&
+            !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+            uint32_t sz = mbi.RegionSize > 0x10000u ? 0x10000u : (uint32_t)mbi.RegionSize;
+            uint32_t cs = fletcher32((const uint8_t*)mbi.BaseAddress, sz);
+            log_printf("[rgncs] f=15 rb=%d d=%d base=%08X size=%08X cs=%08X\n",
+                       g_trace_rb, g_trace_depth, (uint32_t)(uintptr_t)mbi.BaseAddress,
+                       (uint32_t)mbi.RegionSize, cs);
+            ++n;
+        }
+        if (rend <= p) break;
+        p = rend;
+    }
+}
+
 void advance_one_frame() {
+    // log_region_checksums();   // X-finder probe (done: X is real-heap, not .data)
     // Drive one full logic tick WITHOUT rendering.
     //
     // The vanilla engine advances the game across TWO threads:

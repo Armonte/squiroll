@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <intrin.h>        // _ReturnAddress
 
+#include <stdlib.h>        // malloc/free for the arming-thread request
 #include "patch_utils.h"   // _R address literal, base_address
 #include "util.h"          // thiscall
 #include "log.h"
@@ -146,9 +147,78 @@ static int thiscall hook(int this_ptr) {
 // allocate xmm registers. Read the velocity fields back as uint32 (bit
 // pattern) and log them as hex; the consumer recovers floats by reading
 // them as IEEE-754.
+// --- velocity-writer watchpoint (DR0) -------------------------------------
+// X-NAMING: the f=15 velocity (actor+0x2C) is 0 at f=14 (all depths) and 11.5
+// only in the d=1 re-sim. We arm a Dr0 write-watch on the moving actor's +0x2C
+// at f=14 (before the f=15 divergence) and a VEH logs only NON-ZERO writes
+// (skips Stand's 0-writes so the hit budget catches the 11.5 write) with the
+// th155 stack return-chain -> the .nut/native path that read the un-saved X and
+// produced 11.5. Dr0 is per-thread; arming on the sim thread catches the
+// sim-thread script write. Confirmed free (battle_pools' user is dormant).
+static void*    g_vw_veh  = nullptr;
+static uint32_t g_vw_addr = 0;
+static int      g_vw_hits = 0;
+
+static LONG CALLBACK vw_veh(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP)
+        return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = ep->ContextRecord;
+    if (!(c->Dr6 & 0xF)) return EXCEPTION_CONTINUE_SEARCH;
+    c->Dr6 = 0;
+    uint32_t now = *(const uint32_t*)(uintptr_t)g_vw_addr;
+    if (now != 0 && g_vw_hits < 12) {
+        ++g_vw_hits;
+        log_printf("[velwatch] %08X <- val=%08X EIP=%08X rva=%08X f=%d rb=%d d=%d\n",
+                   g_vw_addr, now, (uint32_t)c->Eip,
+                   (uint32_t)(c->Eip - base_address),
+                   gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
+                   gekko_bridge::g_trace_depth);
+        const uint32_t* sp = (const uint32_t*)(uintptr_t)c->Esp;
+        for (int k = 0; k < 64; ++k) {
+            uint32_t rva = sp[k] - (uint32_t)base_address;
+            if (rva >= 0x1000 && rva < 0x300000)
+                log_printf("[velwatch]   stack[+0x%02X] ret rva=%08X\n", k * 4, rva);
+        }
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+struct VwArm { HANDLE thread; uint32_t addr; };
+static unsigned long __stdcall vw_arm_thread(void* p) {
+    VwArm* r = (VwArm*)p;
+    SuspendThread(r->thread);
+    CONTEXT c; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (GetThreadContext(r->thread, &c)) {
+        c.Dr0 = r->addr;
+        c.Dr7 = (c.Dr7 & ~0xF0001u) | 1u | (1u << 16) | (3u << 18);
+        c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        SetThreadContext(r->thread, &c);
+    }
+    ResumeThread(r->thread); CloseHandle(r->thread); free(r);
+    return 0;
+}
+
+static void vw_arm(uint32_t addr) {
+    if (g_vw_addr) return;  // arm once
+    g_vw_addr = addr;
+    g_vw_veh = AddVectoredExceptionHandler(1, vw_veh);
+    HANDLE self = nullptr;
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                    GetCurrentProcess(), &self, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    VwArm* r = (VwArm*)malloc(sizeof(VwArm));
+    r->thread = self; r->addr = addr;
+    CloseHandle(CreateThread(nullptr, 0, vw_arm_thread, r, 0, nullptr));
+    log_printf("[velwatch] armed Dr0 write-watch on %08X (actor+0x2C)\n", addr);
+}
+
 static int thiscall hook_step(int actor, int stack_arg) {
     int f  = gekko_bridge::g_trace_frame;
     int rb = gekko_bridge::g_trace_rb;
+
+    // Arm the velocity watch on the FIRST actor seen at f=14 (the player at the
+    // lowest pool address = the confirmed 11.5 mover). Before f=15's write.
+    if (f == 14 && !g_vw_addr && actor)
+        vw_arm((uint32_t)actor + 0x2C);
 
     if (f >= F_LO && f <= F_HI) {
         // gate (a): actor+228 — the "task vector head" pointer. If non-null
@@ -201,6 +271,175 @@ static int thiscall hook_step(int actor, int stack_arg) {
     return g_h_step.unsafe_thiscall<int>(actor, stack_arg);
 }
 
+// --- velocity-SET closure-stack walk (names the .nut walk function = X) -----
+// Sqrat__SetMemberVar_float @ 0x46A50 is the generic float member SETTER that
+// writes this.va.x (actor velocity +0x2C). [velwatch] proved the f=15 d=1 write
+// of 11.5 comes from here, but the setter only STORES its arg -- the walk-vs-
+// stand decision is UPSTREAM in the .nut. When the setter writes the WATCHED
+// actor's +0x2C (== g_vw_addr, armed by velwatch at f=14), we walk the live
+// SQVM CallInfo stack and log every .nut closure frame by name. Comparing the
+// d=1 chain (writes 11.5 -> walks) against the d=2/forward chain (writes
+// brake/0 -> stands) at f=15 names the exact .nut function whose branch
+// diverged -> that function's source reveals the un-saved engine value (X) it
+// read. Same closure-name walk the working [objid] dump uses.
+//
+// SQVM layout (from SQVM__CallNative @ 0x18DA80 / SQVM__EnterFrame @ 0x18E530):
+//   VM+0x60 (dword[24]) = _callsstack base
+//   VM+0x64 (dword[25]) = _callsstacksize (frame count)
+//   CallInfo stride     = 44 (0x2C) bytes; top frame (_ci) = base+44*(size-1)
+//   ci+0x08 = _closure._type   ci+0x0C = _closure._unVal (the closure object)
+//   OT_CLOSURE = 0x08000100 (.nut), OT_NATIVECLOSURE = 0x08000200 (C++)
+// SQClosure: +0x20 = _function (SQFunctionProto); FP+0x24 = _name (SQString*);
+//   SQString chars at +0x1C.
+#define SQRAT_SET_MEMBER_VAR_FLOAT (0x46A50_R)
+
+// Clean cdecl SQ stack readers (default x86 conv == cdecl). We mirror the exact
+// reads the setter itself does so this can't disturb the VM (pure reads).
+typedef int (*sq_getfloat_t)(int vm, int idx, float* out);
+typedef int (*sq_getinstanceup_t)(int vm, int idx, void** out, int tag);
+typedef int (*sq_getuserdata_t)(int vm, int idx, void** out, int tag);
+
+static SafetyHookInline g_h_set{};
+static int g_setwalk_budget = 80;   // hard cap so the f=15 re-sims can't spam
+
+// True if [a, a+n) is committed & readable. VirtualQuery-based so a stale
+// pointer in the SQVM walk can't fault the sim thread (no SEH under 32-bit
+// MinGW; the proven [objid] walk relies on a range check instead -- this is the
+// same idea but checks the actual page state so it works outside sq_arena too).
+static bool rd_ok(uint32_t a, uint32_t n) {
+    if (!a || n == 0) return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((void*)(uintptr_t)a, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    uint32_t rbase = (uint32_t)(uintptr_t)mbi.BaseAddress;
+    return (uint64_t)a + n <= (uint64_t)rbase + mbi.RegionSize;
+}
+
+static void decode_closure_name(uint32_t cobj, char* nm, int cap) {
+    nm[0] = '?'; nm[1] = 0;
+    if (!rd_ok(cobj + 0x20, 4)) return;
+    uint32_t fp = *(uint32_t*)(uintptr_t)(cobj + 0x20);   // _function
+    if (!rd_ok(fp + 0x24, 4)) return;
+    uint32_t snm = *(uint32_t*)(uintptr_t)(fp + 0x24);    // _name SQString*
+    if (!rd_ok(snm + 0x1C, 1)) return;
+    const char* s = (const char*)(uintptr_t)(snm + 0x1C);
+    int i = 0;
+    for (; i < cap - 1 && rd_ok((uint32_t)(uintptr_t)(s + i), 1) && s[i]; ++i)
+        nm[i] = s[i];
+    nm[i] = 0;
+}
+
+// Walk every CallInfo frame from the top (_ci) down to the stack base, printing
+// each closure frame's kind + .nut name. The topmost OT_CLOSURE frames are the
+// .nut functions executing the member set; the chain root-to-tip IS the
+// decision path (e.g. player_input -> MoveFront -> SetSpeed -> [native setter]).
+static void log_nut_stack(uint32_t vm, int f, int rb, int d,
+                          uint32_t tgt, uint32_t valbits) {
+    if (!rd_ok(vm + 0x64, 4)) return;
+    uint32_t cs_base = *(uint32_t*)(uintptr_t)(vm + 0x60);
+    uint32_t cs_size = *(uint32_t*)(uintptr_t)(vm + 0x64);
+    if (!cs_base || cs_size == 0 || cs_size > 256) return;
+    log_printf("[setwalk] f=%d rb=%d d=%d tgt=%08X val=%08X nframes=%u\n",
+               f, rb, d, tgt, valbits, cs_size);
+    for (int i = (int)cs_size - 1; i >= 0; --i) {
+        uint32_t c = cs_base + 44u * (uint32_t)i;
+        if (!rd_ok(c + 8, 8)) continue;
+        uint32_t ctype = *(uint32_t*)(uintptr_t)(c + 8);
+        uint32_t cobj  = *(uint32_t*)(uintptr_t)(c + 12);
+        const char* kind = (ctype == 0x08000100) ? "nut"
+                         : (ctype == 0x08000200) ? "native" : "?";
+        char nm[48];
+        if (ctype == 0x08000100) decode_closure_name(cobj, nm, sizeof(nm));
+        else { nm[0] = '-'; nm[1] = 0; }
+        log_printf("[setwalk]   #%-2d ci=%08X ty=%08X %-6s '%s'\n",
+                   i, c, ctype, kind, nm);
+    }
+}
+
+// __cdecl detour on the float member setter. We re-read slots 1/-1/2 exactly as
+// the original does (instance up, member offset userdata, value) to recover the
+// write target; if it matches the watched actor's +0x2C we dump the .nut stack.
+static int cdecl hook_set(int vm) {
+    int f = gekko_bridge::g_trace_frame;
+    if (f >= 14 && f <= 15 && g_vw_addr && g_setwalk_budget > 0 && vm) {
+        sq_getinstanceup_t p_giu = (sq_getinstanceup_t)(0x182d60_R);
+        sq_getuserdata_t   p_gud = (sq_getuserdata_t)(0x1834f0_R);
+        sq_getfloat_t      p_gf  = (sq_getfloat_t)(0x182bf0_R);
+        void* obj = nullptr; void* udp = nullptr; float val = 0.0f;
+        p_giu(vm, 1, &obj, 0);
+        p_gud(vm, -1, &udp, 0);
+        p_gf(vm, 2, &val);
+        uint32_t off = udp ? *(uint32_t*)udp : 0xFFFFFFFFu;
+        uint32_t tgt = (uint32_t)(uintptr_t)obj + off;
+        if (tgt == g_vw_addr) {
+            --g_setwalk_budget;
+            uint32_t vb; __builtin_memcpy(&vb, &val, 4);
+            log_nut_stack((uint32_t)vm, f, gekko_bridge::g_trace_rb,
+                          gekko_bridge::g_trace_depth, tgt, vb);
+        }
+    }
+    return g_h_set.unsafe_ccall<int>(vm);
+}
+
+// --- component COMPARE: which of va.x/vf.x/vfBaria.x is the stale X ---------
+// player_game.nut ConvertTotalSpeed() does:
+//   this.vx = this.va.x + this.vf.x + this.vfBaria.x;
+// i.e. the engine vx (actor+0x2C, the value [setwalk]/[velwatch] caught) is
+// RECOMPUTED every frame from three Vector3() sub-objects (va, vf, vfBaria).
+// Control flow at f=15 is byte-identical d=0 vs d=1, so the divergence is pure
+// DATA: one of those three component reads returns a stale value in the d=1
+// re-sim (which loaded save(14) and SKIPPED re-running frame 14, so a field
+// frame-14 wrote but save(14) didn't capture is wrong). Sqrat__GetMemberVar_
+// float @ 0x469F0 is the float GETTER ConvertTotalSpeed uses; we log each read
+// (obj+offset+value) at f=15 whose immediate .nut caller is ConvertTotalSpeed.
+// Group by (obj,off) and compare val across depth -> the obj whose .x differs
+// d=0 vs d=1 IS the un-saved component == X.
+#define SQRAT_GET_MEMBER_VAR_FLOAT (0x469F0_R)
+
+static SafetyHookInline g_h_get{};
+static int g_getcmp_budget = 600;
+
+// Name of the topmost OT_CLOSURE (.nut) frame -- the immediate script caller of
+// the native getter.
+static void topmost_nut_name(uint32_t vm, char* out, int cap) {
+    out[0] = '?'; out[1] = 0;
+    if (!rd_ok(vm + 0x64, 4)) return;
+    uint32_t cs_base = *(uint32_t*)(uintptr_t)(vm + 0x60);
+    uint32_t cs_size = *(uint32_t*)(uintptr_t)(vm + 0x64);
+    if (!cs_base || cs_size == 0 || cs_size > 256) return;
+    for (int i = (int)cs_size - 1; i >= 0; --i) {
+        uint32_t c = cs_base + 44u * (uint32_t)i;
+        if (!rd_ok(c + 8, 8)) continue;
+        uint32_t ty = *(uint32_t*)(uintptr_t)(c + 8);
+        uint32_t co = *(uint32_t*)(uintptr_t)(c + 12);
+        if (ty == 0x08000100) { decode_closure_name(co, out, cap); return; }
+    }
+}
+
+static int cdecl hook_get(int vm) {
+    int f = gekko_bridge::g_trace_frame;
+    if (f == 15 && g_getcmp_budget > 0 && vm) {
+        char caller[48];
+        topmost_nut_name((uint32_t)vm, caller, sizeof caller);
+        if (__builtin_strcmp(caller, "ConvertTotalSpeed") == 0) {
+            sq_getinstanceup_t p_giu = (sq_getinstanceup_t)(0x182d60_R);
+            sq_getuserdata_t   p_gud = (sq_getuserdata_t)(0x1834f0_R);
+            void* obj = nullptr; void* udp = nullptr;
+            p_giu(vm, 1, &obj, 0);
+            p_gud(vm, -1, &udp, 0);
+            uint32_t off  = udp ? *(uint32_t*)udp : 0xFFFFFFFFu;
+            uint32_t addr = (uint32_t)(uintptr_t)obj + off;
+            uint32_t vb   = rd_ok(addr, 4) ? *(uint32_t*)(uintptr_t)addr : 0xDEADBEEFu;
+            --g_getcmp_budget;
+            log_printf("[getcmp] f=%d rb=%d d=%d obj=%08X off=%X addr=%08X val=%08X\n",
+                       f, gekko_bridge::g_trace_rb, gekko_bridge::g_trace_depth,
+                       (uint32_t)(uintptr_t)obj, off, addr, vb);
+        }
+    }
+    return g_h_get.unsafe_ccall<int>(vm);
+}
+
 } // namespace
 
 void install() {
@@ -215,6 +454,18 @@ void install() {
     log_printf("[a2dlog] hook Actor2D::StepMovement @ 0x%X %s\n",
                (uint32_t)ACTOR2D_STEP_MOVEMENT,
                g_h_step.enabled() ? "OK" : "FAIL");
+
+    g_h_set = safetyhook::create_inline((void*)SQRAT_SET_MEMBER_VAR_FLOAT,
+                                        (void*)hook_set);
+    log_printf("[setwalk] hook Sqrat::SetMemberVar<float> @ 0x%X %s\n",
+               (uint32_t)SQRAT_SET_MEMBER_VAR_FLOAT,
+               g_h_set.enabled() ? "OK" : "FAIL");
+
+    g_h_get = safetyhook::create_inline((void*)SQRAT_GET_MEMBER_VAR_FLOAT,
+                                        (void*)hook_get);
+    log_printf("[getcmp] hook Sqrat::GetMemberVar<float> @ 0x%X %s\n",
+               (uint32_t)SQRAT_GET_MEMBER_VAR_FLOAT,
+               g_h_get.enabled() ? "OK" : "FAIL");
 }
 
 } // namespace actor2d_log
