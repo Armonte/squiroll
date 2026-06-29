@@ -443,6 +443,18 @@ static int cdecl hook_get(int vm) {
 } // namespace
 
 void install() {
+    // Investigation scaffolding — [a2dlog]/[a2dstep]/[a2dfld] divergence probes,
+    // the [setwalk]/[getcmp] SQVM closure-name walk and the [velwatch] Dr0
+    // write-watch that named X (= this.va.x, fixed by battle_pools::mathpool_*).
+    // Spent now, so OFF by default; set SQUIROLL_A2D_DIAG=1 to re-arm them (e.g.
+    // for a future per-actor divergence hunt). Keeping the install gated rather
+    // than deleted preserves the named-and-commented hook code for reuse.
+    if (!getenv("SQUIROLL_A2D_DIAG")) {
+        log_printf("[a2dlog] investigation hooks disabled "
+                   "(set SQUIROLL_A2D_DIAG=1 to enable)\n");
+        return;
+    }
+
     g_h = safetyhook::create_inline((void*)ACTOR2D_UPDATE_CHILD_MATRICES,
                                     (void*)hook);
     log_printf("[a2dlog] hook Actor2D::UpdateChildMatrices @ 0x%X %s\n",
