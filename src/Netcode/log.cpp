@@ -43,41 +43,77 @@ mbox_t* log_mbox = &normal_mbox;
 
 FILE* g_log_file = nullptr;
 
+// Pre-allocated fixed-slot ring (no per-line heap allocation, unlike the old
+// deque<string>). The game thread only: vsnprintf into a stack buffer, then
+// memcpy it into the next ring slot under a (uncontended, brief) lock — no
+// malloc, no string ctor. The worker thread drains slots to disk. Modeled on
+// the revolve_input_sdl3 ring_log: hot per-frame tracing must not stall the
+// frame. If the ring fills (worker behind), lines DROP (counted) rather than
+// block the sim thread. Sized for a heavy-trace burst between drains.
+static constexpr size_t LINE_MAX = 512;        // per-line cap; longer truncates
+static constexpr size_t RING_N   = 32768;      // 32768 * 512 = 16 MB, allocated once
+struct LogSlot { uint16_t len; char text[LINE_MAX]; };
+
 static std::mutex              g_log_mtx;
 static std::condition_variable g_log_cv;
-static std::deque<std::string> g_log_queue;
+static LogSlot*                g_ring     = nullptr;
+static uint64_t                g_write    = 0;   // total pushed   (under g_log_mtx)
+static uint64_t                g_read     = 0;   // total drained  (under g_log_mtx)
+static uint64_t                g_dropped  = 0;   // ring-full drops (under g_log_mtx)
 static std::atomic<bool>       g_log_running{false};
 
+static inline size_t ring_count() { return (size_t)(g_write - g_read); }
+
 static void log_worker() {
-    std::vector<std::string> batch;
+    static std::vector<char> batch;   // reused across drains, no per-drain alloc
     while (true) {
+        uint64_t dropped_snapshot = 0;
         {
             std::unique_lock<std::mutex> lk(g_log_mtx);
-            g_log_cv.wait(lk, [] { return !g_log_queue.empty() || !g_log_running.load(); });
-            if (!g_log_running.load() && g_log_queue.empty()) {
-                break;
+            g_log_cv.wait(lk, [] { return g_write != g_read || !g_log_running.load(); });
+            if (!g_log_running.load() && g_write == g_read) break;
+            batch.clear();
+            while (g_write != g_read) {
+                const LogSlot& s = g_ring[g_read % RING_N];
+                batch.insert(batch.end(), s.text, s.text + s.len);
+                ++g_read;
             }
-            while (!g_log_queue.empty()) {
-                batch.push_back(std::move(g_log_queue.front()));
-                g_log_queue.pop_front();
-            }
+            dropped_snapshot = g_dropped; g_dropped = 0;
         }
-        for (const std::string& s : batch) {
-            if (g_log_file) {
-                fwrite(s.data(), 1, s.size(), g_log_file);
-            }
-            fwrite(s.data(), 1, s.size(), stdout);
+        if (!batch.empty()) {
+            if (g_log_file) fwrite(batch.data(), 1, batch.size(), g_log_file);
+            fwrite(batch.data(), 1, batch.size(), stdout);
         }
-        if (g_log_file) {
-            fflush(g_log_file);
+        if (dropped_snapshot) {
+            char w[96];
+            int wn = snprintf(w, sizeof w, "[log] !! dropped %llu lines (ring full)\n",
+                              (unsigned long long)dropped_snapshot);
+            if (g_log_file) fwrite(w, 1, wn, g_log_file);
+            fwrite(w, 1, wn, stdout);
         }
+        if (g_log_file) fflush(g_log_file);
         fflush(stdout);
-        batch.clear();
     }
+}
+
+// Push a finished line into the ring. Drops (counts) if the ring is full so the
+// sim thread never blocks on a slow disk. Returns true if the worker should be
+// woken (ring was empty).
+static inline bool ring_push(const char* buf, size_t n) {
+    std::lock_guard<std::mutex> lk(g_log_mtx);
+    if (ring_count() >= RING_N) { ++g_dropped; return false; }
+    bool was_empty = (g_write == g_read);
+    LogSlot& s = g_ring[g_write % RING_N];
+    memcpy(s.text, buf, n);
+    s.len = (uint16_t)n;
+    ++g_write;
+    return was_empty;
 }
 
 void open_log_file(const char* path) {
     if (g_log_running.load()) return;
+
+    if (!g_ring) g_ring = (LogSlot*)malloc(sizeof(LogSlot) * RING_N);
 
     g_log_file = fopen(path, "w");
     if (g_log_file) {
@@ -90,11 +126,7 @@ void open_log_file(const char* path) {
     g_log_running.store(true);
     std::thread(&log_worker).detach();
 
-    {
-        std::lock_guard<std::mutex> lk(g_log_mtx);
-        g_log_queue.emplace_back("=== squiroll log start ===\n");
-    }
-    g_log_cv.notify_one();
+    if (ring_push("=== squiroll log start ===\n", 26)) g_log_cv.notify_one();
 }
 
 // No-op: the worker thread flushes after every batch on its own. Kept as
@@ -104,49 +136,29 @@ void log_flush() {
 
 // Crash-path synchronous drain. The worker thread owns all file I/O; on a
 // fatal fault it will not get another chance to run, so flush whatever is
-// still queued from the faulting thread. Safe to take g_log_mtx here: a
+// still in the ring from the faulting thread. Safe to take g_log_mtx here: a
 // fault in game code is not holding it. Called from the VEH crash handler.
 void log_crash_drain() {
-    std::deque<std::string> pending;
-    {
-        std::lock_guard<std::mutex> lk(g_log_mtx);
-        pending.swap(g_log_queue);
-    }
-    for (const std::string& s : pending) {
-        if (g_log_file) fwrite(s.data(), 1, s.size(), g_log_file);
-        fwrite(s.data(), 1, s.size(), stdout);
+    std::lock_guard<std::mutex> lk(g_log_mtx);
+    while (g_write != g_read) {
+        const LogSlot& s = g_ring[g_read % RING_N];
+        if (g_log_file) fwrite(s.text, 1, s.len, g_log_file);
+        fwrite(s.text, 1, s.len, stdout);
+        ++g_read;
     }
     if (g_log_file) fflush(g_log_file);
     fflush(stdout);
 }
 
-// Format on the calling thread, hand the finished line to the worker.
+// Format on the calling thread (stack buffer), hand the finished line to the
+// ring. No heap allocation; no string construction.
 static void emit_va(const char* format, va_list va) {
-    char stackbuf[2048];
-    char* buf = stackbuf;
-    char* heap = nullptr;
-
-    va_list va2;
-    va_copy(va2, va);
-    int n = vsnprintf(stackbuf, sizeof(stackbuf), format, va2);
-    va_end(va2);
+    if (!g_ring) return;
+    char buf[LINE_MAX];
+    int n = vsnprintf(buf, sizeof(buf), format, va);
     if (n < 0) return;
-
-    if ((size_t)n >= sizeof(stackbuf)) {
-        heap = (char*)malloc((size_t)n + 1);
-        if (heap) {
-            vsnprintf(heap, (size_t)n + 1, format, va);
-            buf = heap;
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(g_log_mtx);
-        g_log_queue.emplace_back(buf, strlen(buf));
-    }
-    g_log_cv.notify_one();
-
-    free(heap);
+    if ((size_t)n >= sizeof(buf)) n = sizeof(buf) - 1;  // truncate over-long lines
+    if (ring_push(buf, (size_t)n)) g_log_cv.notify_one();
 }
 
 extern "C" void cdecl tee_printf(const char* format, ...) {

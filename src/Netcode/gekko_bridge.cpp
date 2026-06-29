@@ -209,16 +209,24 @@ static void fake_input_init() {
 static uint16_t fake_input_gen(int p) {
     if (--g_fake_hold[p] <= 0) {
         uint32_t r = fake_xs32(g_fake_rng[p]);
-        static const uint16_t dirs[9] = {
-            0x0, 0x1, 0x2, 0x4, 0x8, 0x1|0x4, 0x1|0x8, 0x2|0x4, 0x2|0x8
+        // 0x1/0x2 = up/down, 0x4/0x8 = left/right (the originals' diagonals
+        // 0x1|0x4 etc. fix this mapping). Weight toward horizontal walking so
+        // movement is VISIBLE, with diagonals/verticals/neutral mixed in. Short
+        // holds (4-15 frames) so the direction CHANGES often -- a short run then
+        // shows P1 actually moving around instead of one held direction.
+        static const uint16_t dirs[16] = {
+            0x4, 0x8, 0x4, 0x8, 0x4, 0x8,         // left/right walk (weighted)
+            0x1, 0x2,                             // up (jump) / down (crouch)
+            0x1|0x4, 0x1|0x8, 0x2|0x4, 0x2|0x8,   // diagonals
+            0x0, 0x4, 0x8, 0x0                     // neutral + more walk
         };
-        g_fake_held[p] = dirs[r % 9];
-        g_fake_hold[p] = 8 + (int)((r >> 8) % 32);
+        g_fake_held[p] = dirs[r & 15];
+        g_fake_hold[p] = 4 + (int)((r >> 8) % 12);   // 4-15 frames
     }
     uint16_t in = g_fake_held[p];
     uint32_t r = fake_xs32(g_fake_rng[p]);
-    if ((r & 0xFF) < 96) {                       // ~38% of frames
-        in |= (uint16_t)(0x10u << ((r >> 8) & 3));  // one of A/B/C/D
+    if ((r & 0xFF) < 80) {                            // ~31% of frames: attack
+        in |= (uint16_t)(0x10u << ((r >> 8) & 3));    // one of A/B/C/D
     }
     return in;
 }
@@ -1982,13 +1990,33 @@ bool tick() {
                 // checksums disagree. Throttle to one line per 300 to
                 // keep the log readable while still showing the issue.
                 static uint32_t desync_counter = 0;
-                if ((desync_counter++ % 300) == 0) {
+                bool first = (desync_counter == 0);
+                if (first || (desync_counter % 300) == 0) {
                     log_printf("[gekko_bridge] !! DESYNC frame=%d local=0x%08x remote=0x%08x peer_handle=%d (desyncs_so_far=%u)\n",
                                e->data.desynced.frame,
                                e->data.desynced.local_checksum,
                                e->data.desynced.remote_checksum,
                                e->data.desynced.remote_handle,
-                               desync_counter);
+                               desync_counter + 1);
+                }
+                ++desync_counter;
+                // SQUIROLL_DESYNC_ABORT=1 -> stop dead on the FIRST desync, so a
+                // long run's log ends exactly at the diverging frame. Lets us push
+                // for 100% determinism: run long with random input seeds, and any
+                // run that aborts marks a frame+seed to trace.
+                if (first) {
+                    static int abort_on = -1;
+                    if (abort_on < 0) {
+                        char b[8] = {0};
+                        abort_on = (GetEnvironmentVariableA("SQUIROLL_DESYNC_ABORT", b, sizeof b) > 0
+                                    && b[0] != '0') ? 1 : 0;
+                    }
+                    if (abort_on) {
+                        log_printf("[gekko_bridge] SQUIROLL_DESYNC_ABORT: first desync at frame=%d "
+                                   "— exiting for trace\n", e->data.desynced.frame);
+                        Sleep(300);
+                        ExitProcess(0);
+                    }
                 }
                 break;
             }
