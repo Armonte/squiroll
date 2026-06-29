@@ -8,6 +8,10 @@
 #include "util.h"          // thiscall
 #include "log.h"
 
+// gekko_bridge publishes the per-advance frame/rb/depth (the boostpool va.x
+// probe tags its logs with these).
+namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; extern int g_trace_depth; }
+
 namespace battle_pools {
 namespace {
 
@@ -357,7 +361,7 @@ static constexpr uint32_t BOOSTPOOL_MAGIC = 0x4C4F4F4D;  // 'MOOL'
 // they process the containing block, so we can see exactly what va.x is SAVED vs
 // RESTORED at the f=24 divergence -- and whether the block is in the blob at all.
 uint32_t g_va_probe = 0;
-void set_va_probe(uint32_t a) { g_va_probe = a; }
+void set_va_probe(uint32_t a) { g_va_probe = a; log_printf("[bpprobe] set_va_probe(%08X)\n", a); }
 
 uint32_t boostpool_save(uint8_t* out, uint32_t cap) {
     uint8_t* p = out;
@@ -373,6 +377,27 @@ uint32_t boostpool_save(uint8_t* out, uint32_t cap) {
 
     uint32_t magic = BOOSTPOOL_MAGIC, npool = (uint32_t)NBOOSTPOOL;
     if (!put(&magic, 4) || !put(&npool, 4)) return 0;
+
+    { static int _dn = 0; if (_dn < 4) { _dn++; log_printf("[bpprobe] boostpool_save sees g_va_probe=%08X f=%d\n", g_va_probe, _pf); } }
+
+    // One-time coverage dump: does the player's va.x address fall inside ANY
+    // captured boostpool block? If not, va is in a pool absent from
+    // g_boostpool_rva (or a block the walk never reaches) -> uncaptured.
+    static bool _dumped = false;
+    if (g_va_probe && !_dumped) {
+        _dumped = true;
+        bool covered = false;
+        for (int i = 0; i < NBOOSTPOOL; ++i) {
+            const Pool* pl = (const Pool*)(g_boostpool_rva[i] + base_address);
+            for_each_block(pl, [&](uint32_t b, uint32_t s) {
+                bool hit = (g_va_probe >= b && g_va_probe < b + s);
+                if (hit) covered = true;
+                log_printf("[bpcover] pool#%d rva=%05X blk %08X..%08X%s\n",
+                           i, g_boostpool_rva[i], b, b + s, hit ? "  <== VA.X HERE" : "");
+            });
+        }
+        log_printf("[bpcover] va.x @%08X covered_by_boostpool=%d\n", g_va_probe, covered);
+    }
 
     for (int i = 0; i < NBOOSTPOOL; ++i) {
         const Pool* pl = (const Pool*)(g_boostpool_rva[i] + base_address);
