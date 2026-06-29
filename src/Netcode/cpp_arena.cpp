@@ -172,6 +172,32 @@ static void thiscall synclayer_hook(int task, int force_sync) {
     g_h_synclayer.unsafe_thiscall<int>(task, fs);
 }
 
+// DIAG: Ew_draw_effect_instance (0x10A080) = the per-effect GPU draw, called inside
+// the particle draw vtable[19] alongside SQVM__Call_3. Log frame/rb to settle whether
+// the HEADLESS re-sim runs the effect draw at all (rb>0 = it does -> divergence is
+// alloc churn; rb==0 only -> fwd/resim ASYMMETRY -> the draw's script side-effects
+// must be replayed or excluded).
+static SafetyHookInline g_h_draw{};
+static int thiscall draw_eff_hook(int self, int fb) {
+    static int n = 0;
+    if (n == 0) {
+        ++n;
+        // One-shot caller-chain dump — scan the stack for th155 return addresses so
+        // we find the DRAW ITERATION above vtable[19] (the correct replay point).
+        volatile uint32_t marker = 0;
+        const uint32_t* sp = (const uint32_t*)&marker;
+        log_printf("[drawchain] caller chain (rva):\n");
+        for (int k = 0, shown = 0; k < 80 && shown < 12; ++k) {
+            uint32_t rva = sp[k] - (uint32_t)base_address;
+            if (rva >= 0x1000 && rva < 0x300000) {
+                log_printf("[drawchain]   stk[+0x%02X] rva=%08X\n", k * 4, rva);
+                ++shown;
+            }
+        }
+    }
+    return g_h_draw.unsafe_thiscall<int>(self, fb);
+}
+
 // concurrent_list_erase_node (0x13D80) — __thiscall(container, out, key, node_ref).
 // RunOneFrame calls this to erase a disconnected boost::signals2 connection from
 // the ScriptAPI per-frame dispatch list. The list/cursor diverging across the
@@ -695,6 +721,7 @@ void install() {
                                               (void*)hook_beginthreadex);
     g_h_throw  = safetyhook::create_inline((void*)(0x2FB5DD_R), (void*)throw_log_hook);
     g_h_synclayer = safetyhook::create_inline((void*)(0xE5CD0_R), (void*)synclayer_hook);
+    g_h_draw      = safetyhook::create_inline((void*)(0x10A080_R), (void*)draw_eff_hook);
     // [erase] connection-lifecycle trace — DISABLED (root found; it read keys in the
     // divergent arena, a source of clguard null-deref noise). Re-enable to re-trace.
     // g_h_erase  = safetyhook::create_inline((void*)(0x13D80_R),  (void*)erase_log_hook);

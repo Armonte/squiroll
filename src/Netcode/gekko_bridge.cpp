@@ -2299,6 +2299,15 @@ bool tick() {
                 }
                 LARGE_INTEGER _ta0; QueryPerformanceCounter(&_ta0);
                 advance_one_frame();
+                // FINDING: the forward runs the particle draws (Ew_tEftParticle
+                // vtable[19] @0x10db30) but the headless re-sim never draws (verified:
+                // [draweff] is rb=0 only). Those draws run SQVM scripts whose
+                // sim-referenced boost::signals2 connections then diverge. Replaying via
+                // render_one_frame() here is WRONG — the effect draws are NOT in
+                // render_one_frame (calling it made cpp 24->37, eng broke). The draws
+                // are a SEPARATE sTask DRAW iteration (vtable[19]; StepLayerMember
+                // dispatches vtable[8]=update, not the draw). Correct replay/exclusion
+                // must target that draw iteration (and gate the GPU off).
                 LARGE_INTEGER _ta1; QueryPerformanceCounter(&_ta1);
                 g_perf_adv += (uint64_t)(_ta1.QuadPart - _ta0.QuadPart);
                 if (++g_perf_nadv >= 240) {
