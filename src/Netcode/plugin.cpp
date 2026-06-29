@@ -389,6 +389,23 @@ extern "C" {
                 if (f < 18 || f > 32) return 0;
                 const SQChar* tag = nullptr;
                 sq_getstring(v, 2, &tag);
+                // String value -> log as text (used for getstackinfos caller names);
+                // otherwise float bits / int.
+                if (sq_gettype(v, 3) == OT_STRING) {
+                    const SQChar* sv = nullptr;
+                    sq_getstring(v, 3, &sv);
+                    log_printf("[nuttrace] f=%d rb=%d d=%d %s='%s'\n",
+                               gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
+                               gekko_bridge::g_trace_depth, tag ? tag : "?", sv ? sv : "?");
+                    return 0;
+                }
+                if (sq_gettype(v, 3) == OT_INTEGER) {
+                    SQInteger iv = 0; sq_getinteger(v, 3, &iv);
+                    log_printf("[nuttrace] f=%d rb=%d d=%d %s=%d\n",
+                               gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
+                               gekko_bridge::g_trace_depth, tag ? tag : "?", (int)iv);
+                    return 0;
+                }
                 uint32_t vb = 0; SQFloat fv = 0; SQInteger iv = 0;
                 if (SQ_SUCCEEDED(sq_getfloat(v, 3, &fv)))        __builtin_memcpy(&vb, &fv, 4);
                 else if (SQ_SUCCEEDED(sq_getinteger(v, 3, &iv))) vb = (uint32_t)iv;
@@ -909,10 +926,27 @@ extern "C" {
                             "  ::__gekko_trace(\"VXB_in_vax\", this.va.x);\n"
                             "  ::__gekko_trace(\"VXB_x\", x_);\n"
                             "  ::__gekko_trace(\"VXB_min\", min_ == null ? -99999.0 : min_);\n"
+                            // Name the .nut call chain ABOVE VX_Brake (the move/state handler
+                            // that set the divergent pre-brake va.x). getstackinfos(N): N=1 is
+                            // this wrapper, N>=2 the callers. Log func+line (+src for L2).
+                            "  local s2 = ::getstackinfos(2); if (s2) { ::__gekko_trace(\"VXB_c2\", s2.func); ::__gekko_trace(\"VXB_c2_ln\", s2.line); ::__gekko_trace(\"VXB_c2_src\", s2.src); }\n"
+                            "  local s3 = ::getstackinfos(3); if (s3) { ::__gekko_trace(\"VXB_c3\", s3.func); ::__gekko_trace(\"VXB_c3_ln\", s3.line); }\n"
+                            "  local s4 = ::getstackinfos(4); if (s4) { ::__gekko_trace(\"VXB_c4\", s4.func); ::__gekko_trace(\"VXB_c4_ln\", s4.line); }\n"
                             "  local r = _vxb.call(this, x_, min_);\n"
                             "  ::__gekko_trace(\"VXB_vx\", this.vx);\n"
                             "  return r;\n"
-                            "}\n";
+                            "}\n"
+                            // Wrap the va.x setters too -- log va.x AFTER each, so the one whose
+                            // post-value is the divergent brake input (10.0 fwd / 5.0 d=1) is the
+                            // writer. If none diverge, va.x is a direct `this.va.x = ...` write.
+                            "local _ssxy = SetSpeed_XY;\n"
+                            "function SetSpeed_XY(a, b) { local r = _ssxy.call(this, a, b); ::__gekko_trace(\"SET_SSXY_vax\", this.va.x); return r; }\n"
+                            "local _ssv = SetSpeed_Vec;\n"
+                            "function SetSpeed_Vec(a, b, c = 1.0) { local r = _ssv.call(this, a, b, c); ::__gekko_trace(\"SET_SSV_vax\", this.va.x); return r; }\n"
+                            "local _asxy = AddSpeed_XY;\n"
+                            "function AddSpeed_XY(a, b, c = null, d = null) { local r = _asxy.call(this, a, b, c, d); ::__gekko_trace(\"SET_ASXY_vax\", this.va.x); return r; }\n"
+                            "local _asv = AddSpeed_Vec;\n"
+                            "function AddSpeed_Vec(a, b, c, d = 1.0) { local r = _asv.call(this, a, b, c, d); ::__gekko_trace(\"SET_ASV_vax\", this.va.x); return r; }\n";
                         if (SQ_SUCCEEDED(sq_compilebuffer(v, WRAP, (SQInteger)(sizeof(WRAP) - 1), _SC("vxb_wrap"), SQTrue))) {
                             sq_pushobject(v, root);
                             if (SQ_FAILED(sq_call(v, 1, SQFalse, SQTrue)))
@@ -922,6 +956,29 @@ extern "C" {
                             sq_pop(v, 1);   // pop the compiled closure
                         } else {
                             log_printf("[nuttrace] VX_Brake wrap COMPILE error\n");
+                        }
+                    }
+
+                    // [nuttrace] wrap player MainLoop (player_update.nut -> the player
+                    // class) to log va.x at f=24 ENTRY -- settles whether the divergent
+                    // pre-brake va.x (10.0 fwd / 5.0 d=1) is CARRIED from f=23 (identical
+                    // at entry => set during f=24) or already divergent at entry (=> an
+                    // un-captured carry-over the snapshot misses).
+                    if (strcmp(file, "data/actor/script/player_update.nut") == 0) {
+                        static const char WRAP2[] =
+                            "local _mlf = MainLoopFirst;\n"
+                            "function MainLoopFirst() { ::__gekko_trace(\"MLF_entry_vax\", this.va.x); local r = _mlf.call(this); ::__gekko_trace(\"MLF_exit_vax\", this.va.x); return r; }\n"
+                            "local _ml = MainLoop;\n"
+                            "function MainLoop() { ::__gekko_trace(\"ML_entry_vax\", this.va.x); return _ml.call(this); }\n"
+                            "local _mlc = MainLoopCount;\n"
+                            "function MainLoopCount() { ::__gekko_trace(\"MLC_entry_vax\", this.va.x); return _mlc.call(this); }\n";
+                        if (SQ_SUCCEEDED(sq_compilebuffer(v, WRAP2, (SQInteger)(sizeof(WRAP2) - 1), _SC("ml_wrap"), SQTrue))) {
+                            sq_pushobject(v, root);
+                            if (SQ_FAILED(sq_call(v, 1, SQFalse, SQTrue)))
+                                log_printf("[nuttrace] MainLoop wrap FAILED\n");
+                            else
+                                log_printf("[nuttrace] MainLoop wrapped (player_update.nut)\n");
+                            sq_pop(v, 1);
                         }
                     }
                     return 0;
