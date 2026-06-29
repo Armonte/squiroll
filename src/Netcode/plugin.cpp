@@ -285,6 +285,10 @@ SQInteger ignore_lobby_punch_ping(HSQUIRRELVM v) {
 #define SQPUSH_INT_FUNC(val) [](HSQUIRRELVM v) -> SQInteger { sq_pushinteger(v, (SQInteger)(val)); return 1; }
 #define SQPUSH_FLOAT_FUNC(val) [](HSQUIRRELVM v) -> SQInteger { sq_pushfloat(v, (SQFloat)(val)); return 1; }
 
+// gekko_bridge publishes the authoritative per-advance frame/rb/depth — the
+// [nuttrace] native tags script-side trace values with these.
+namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; extern int g_trace_depth; }
+
 extern "C" {
     dll_export int stdcall init_instance_v2(HostEnvironment* environment) {
         if (
@@ -366,6 +370,33 @@ extern "C" {
 
             sq_setfunc(v, _SC("print"), sq_print);
             sq_setfunc(v, _SC("fprint"), sq_fprint);
+
+            // [nuttrace] -- .nut-side divergence tracer. ::__gekko_trace(tag, val)
+            // logs the value (float bits, or int) tagged with the authoritative
+            // C++ gekko frame/rb/depth, so script state can be diffed fwd-vs-
+            // resim in ONE run. Gated by SQUIROLL_NUT_TRACE (off => the native
+            // returns immediately, so the .nut call sites cost ~nothing).
+            sq_setfunc(v, _SC("__gekko_trace"), [](HSQUIRRELVM v) -> SQInteger {
+                static int on = -1;
+                if (on < 0) {
+                    char b[8] = {0};
+                    on = (GetEnvironmentVariableA("SQUIROLL_NUT_TRACE", b, sizeof b) > 0
+                          && b[0] != '0') ? 1 : 0;
+                }
+                if (!on) return 0;
+                // Frame-window gate (the f=24 divergence) to bound the volume.
+                int f = gekko_bridge::g_trace_frame;
+                if (f < 18 || f > 32) return 0;
+                const SQChar* tag = nullptr;
+                sq_getstring(v, 2, &tag);
+                uint32_t vb = 0; SQFloat fv = 0; SQInteger iv = 0;
+                if (SQ_SUCCEEDED(sq_getfloat(v, 3, &fv)))        __builtin_memcpy(&vb, &fv, 4);
+                else if (SQ_SUCCEEDED(sq_getinteger(v, 3, &iv))) vb = (uint32_t)iv;
+                log_printf("[nuttrace] f=%d rb=%d d=%d %s=%08X\n",
+                           gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
+                           gekko_bridge::g_trace_depth, tag ? tag : "?", vb);
+                return 0;
+            });
 
             sq_setfunc(v, _SC("system"),[](HSQUIRRELVM v) -> SQInteger {return 0;});
             sq_setfunc(v, _SC("mkdir"),[](HSQUIRRELVM v) -> SQInteger {
