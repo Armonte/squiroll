@@ -487,21 +487,7 @@ static void* cdecl hook_op_new(size_t size) {
         bool admitted = sim || worker || pre_gate;
         if (admitted && !thread_excluded(tid) && !caller_excluded(caller)) {
             void* p = arena_alloc(size, is_render_caller(caller));
-            if (p) {
-                // TRACE f=2 arena allocs (fwd vs re-sim) to settle the cpp root:
-                // same caller+size at a DIFFERENT addr => free-list reuse diverged
-                // (worker churn); tid shows which thread allocates.
-                if (gekko_bridge::g_trace_frame == 2) {
-                    static int an = 0;
-                    if (an < 2000) { ++an;
-                        log_printf("[cppalloc] rb=%d tid=%u sz=%u addr=%p crva=%08X\n",
-                                   gekko_bridge::g_trace_rb, GetCurrentThreadId(),
-                                   (uint32_t)size, p,
-                                   (uint32_t)(caller - (uint32_t)base_address));
-                    }
-                }
-                return p;
-            }
+            if (p) return p;
         }
     }
     return g_h_opnew.unsafe_ccall<void*>(size);
@@ -645,7 +631,9 @@ void install() {
     g_h_bthreadex = safetyhook::create_inline((void*)BEGINTHREADEX,
                                               (void*)hook_beginthreadex);
     g_h_throw  = safetyhook::create_inline((void*)(0x2FB5DD_R), (void*)throw_log_hook);
-    g_h_erase  = safetyhook::create_inline((void*)(0x13D80_R),  (void*)erase_log_hook);
+    // [erase] connection-lifecycle trace — DISABLED (root found; it read keys in the
+    // divergent arena, a source of clguard null-deref noise). Re-enable to re-trace.
+    // g_h_erase  = safetyhook::create_inline((void*)(0x13D80_R),  (void*)erase_log_hook);
 
     int ok = g_h_free.enabled() + g_h_opnew.enabled();
     g_installed = (ok == 2);

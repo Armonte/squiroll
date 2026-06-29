@@ -422,12 +422,12 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             (void)first_dump_done;                 // kept for binary stability
             int totalp = 0;
             for (int a = 0; a < NARENA; ++a) {
-                // cpp_arena divf IS re-enabled (to trace the connection_body
-                // divergence) but the cpp_arena::attribute() walks below are kept
-                // OFF — that walk follows pointers in the divergent arena and was
-                // the f≈27 fault. The [divf] page hit + the [divword] dword diff
-                // (tracked page 23397 = connection_body) are pure byte compares and
-                // safe; they give the exact divergent dword without walking.
+                // cpp_arena (arena 2) is excluded from the desync checksum and is
+                // intentionally still-divergent (residual render churners). Skip
+                // diagnosing it — the [divf]/[divword] walk floods the log and the
+                // re-sim already reads the divergent arena (clguard null-deref
+                // noise). Re-enable (drop this continue) to re-trace cpp.
+                if (a == CPP_ARENA) continue;
                 int hits = 0;
                 for (uint32_t pg = 0; pg < g_ar[a].npages && hits < 6; ++pg) {
                     if (S.phash_snap[a][pg] != g_ar[a].phash[pg]) {
