@@ -15,6 +15,11 @@ namespace actor2d_log {
 
 void install();
 
+// Arm a Dr0 hardware write-watch on `addr` (the sim thread); the VEH logs each
+// write's value + EIP/rva + frame/rb/depth. Used to name the C++ writer of the
+// player's va.x at the f=24 divergence. Arms once.
+void watch_arm(uint32_t addr);
+
 } // namespace actor2d_log
 
 #endif // ACTOR2D_LOG_H

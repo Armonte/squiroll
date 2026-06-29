@@ -166,19 +166,16 @@ static LONG CALLBACK vw_veh(EXCEPTION_POINTERS* ep) {
     if (!(c->Dr6 & 0xF)) return EXCEPTION_CONTINUE_SEARCH;
     c->Dr6 = 0;
     uint32_t now = *(const uint32_t*)(uintptr_t)g_vw_addr;
-    if (now != 0 && g_vw_hits < 12) {
+    // Log EVERY touch (no frame gate) so we can see whether the rollback LOAD
+    // restores va.x at all -- if the boostpool_load memcpy never writes it during
+    // a rollback (rb=1), that block isn't being restored. Cap high; no stack dump
+    // (the rva is enough). Tag rb so save(read)/load(write)/script are separable.
+    if (now != 0 && g_vw_hits < 400) {
         ++g_vw_hits;
-        log_printf("[velwatch] %08X <- val=%08X EIP=%08X rva=%08X f=%d rb=%d d=%d\n",
-                   g_vw_addr, now, (uint32_t)c->Eip,
-                   (uint32_t)(c->Eip - base_address),
+        log_printf("[velwatch] %08X <- val=%08X rva=%08X f=%d rb=%d d=%d\n",
+                   g_vw_addr, now, (uint32_t)(c->Eip - base_address),
                    gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
                    gekko_bridge::g_trace_depth);
-        const uint32_t* sp = (const uint32_t*)(uintptr_t)c->Esp;
-        for (int k = 0; k < 64; ++k) {
-            uint32_t rva = sp[k] - (uint32_t)base_address;
-            if (rva >= 0x1000 && rva < 0x300000)
-                log_printf("[velwatch]   stack[+0x%02X] ret rva=%08X\n", k * 4, rva);
-        }
     }
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -190,6 +187,10 @@ static unsigned long __stdcall vw_arm_thread(void* p) {
     CONTEXT c; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     if (GetThreadContext(r->thread, &c)) {
         c.Dr0 = r->addr;
+        // Dr0 enabled (bit0); LEN=01 (2-byte, bits16-17); R/W=11 (read+write,
+        // bits18-19). 2-byte read/write is the config that works reliably here
+        // (4-byte/write-only hung the game). The 2-byte window at va.x's low
+        // half still catches every float write; the VEH logs the current value.
         c.Dr7 = (c.Dr7 & ~0xF0001u) | 1u | (1u << 16) | (3u << 18);
         c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         SetThreadContext(r->thread, &c);
@@ -461,6 +462,11 @@ static int cdecl hook_get(int vm) {
 }
 
 } // namespace
+
+// Public Dr0 write-watch arm, callable from elsewhere (the [nuttrace]
+// __gekko_watch_va native arms this on the player's va.x C++ address). Self-
+// contained: installs the VEH + sets Dr0 on the calling (sim) thread. Arms once.
+void watch_arm(uint32_t addr) { vw_arm(addr); }
 
 void install() {
     // Investigation scaffolding — [a2dlog]/[a2dstep]/[a2dfld] divergence probes,

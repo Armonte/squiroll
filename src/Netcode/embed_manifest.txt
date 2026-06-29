@@ -68,3 +68,4 @@ embed/UI/ui.nut=squiroll/UI/ui.nut=UI
 
 # Gekko rollback Squirrel state serializer (CompileFile'd from boot.nut)
 embed/gekko_state.nut=squiroll/gekko_state.nut
+

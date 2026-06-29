@@ -352,9 +352,18 @@ static constexpr int NBOOSTPOOL =
     (int)(sizeof(g_boostpool_rva) / sizeof(g_boostpool_rva[0]));
 static constexpr uint32_t BOOSTPOOL_MAGIC = 0x4C4F4F4D;  // 'MOOL'
 
+// Diagnostic probe: the player's va.x C++ address (set by the [nuttrace]
+// __gekko_watch_va native). boostpool_save/load log the value at this address as
+// they process the containing block, so we can see exactly what va.x is SAVED vs
+// RESTORED at the f=24 divergence -- and whether the block is in the blob at all.
+uint32_t g_va_probe = 0;
+void set_va_probe(uint32_t a) { g_va_probe = a; }
+
 uint32_t boostpool_save(uint8_t* out, uint32_t cap) {
     uint8_t* p = out;
     uint8_t* end = out + cap;
+    int _pf = gekko_bridge::g_trace_frame;
+    bool _plog = (g_va_probe != 0);
     auto put = [&](const void* s, uint32_t n) -> bool {
         if (p + n > end) return false;
         memcpy(p, s, n);
@@ -375,6 +384,11 @@ uint32_t boostpool_save(uint8_t* out, uint32_t cap) {
         bool ok = true;
         for_each_block(pl, [&](uint32_t b, uint32_t s) {
             if (!ok) return;
+            if (_plog && g_va_probe >= b && g_va_probe < b + s)
+                log_printf("[bpsave] f=%d rb=%d pool#%d SAVE block %08X..%08X "
+                           "va.x=%08X (probe in this block)\n", _pf,
+                           gekko_bridge::g_trace_rb, i, b, b + s,
+                           *(const uint32_t*)(uintptr_t)g_va_probe);
             // [addr][size][size bytes] -- the whole block, including its
             // 8-byte block-list trailer (next-ptr/next-size, stable pointers).
             if (!put(&b, 4) || !put(&s, 4) ||
@@ -404,6 +418,10 @@ void boostpool_load(const uint8_t* blob, uint32_t len) {
         return;
     }
 
+    int  _lf = gekko_bridge::g_trace_frame;
+    bool _llog = (g_va_probe != 0);
+    bool _probe_seen = false;
+
     for (uint32_t i = 0; i < npool && i < (uint32_t)NBOOSTPOOL; ++i) {
         const Pool* pl = (const Pool*)(g_boostpool_rva[i] + base_address);
         uint32_t nblk = 0;
@@ -420,10 +438,25 @@ void boostpool_load(const uint8_t* blob, uint32_t len) {
             for_each_block(pl, [&](uint32_t cb, uint32_t cs) {
                 if (cb == addr && cs == size) valid = true;
             });
+            bool probe_here = (g_va_probe >= addr && g_va_probe < addr + size);
+            uint32_t va_live  = probe_here ? *(const uint32_t*)(uintptr_t)g_va_probe : 0;
+            uint32_t va_blob  = probe_here ? *(const uint32_t*)(p + (g_va_probe - addr)) : 0;
             if (valid) memcpy((void*)(uintptr_t)addr, p, size);
+            if (probe_here && _llog) {
+                _probe_seen = true;
+                log_printf("[bpload] f=%d d=%d pool#%u block %08X valid=%d "
+                           "va.x: live=%08X blob=%08X -> now=%08X\n",
+                           _lf, gekko_bridge::g_trace_depth, i, addr, valid,
+                           va_live, va_blob, *(const uint32_t*)(uintptr_t)g_va_probe);
+            } else if (!valid && _llog)
+                log_printf("[bpskip] f=%d d=%d pool#%u SKIP saved block addr=%08X..%08X size=%X\n",
+                           _lf, gekko_bridge::g_trace_depth, i, addr, addr + size, size);
             p += size;
         }
     }
+    if (_llog && !_probe_seen)
+        log_printf("[bpload] f=%d d=%d va.x probe @%08X NOT in any saved block -> NOT restored\n",
+                   _lf, gekko_bridge::g_trace_depth, g_va_probe);
 }
 
 void log_fingerprint(const char* tag) {

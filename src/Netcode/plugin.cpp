@@ -288,6 +288,8 @@ SQInteger ignore_lobby_punch_ping(HSQUIRRELVM v) {
 // gekko_bridge publishes the authoritative per-advance frame/rb/depth — the
 // [nuttrace] native tags script-side trace values with these.
 namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; extern int g_trace_depth; }
+namespace actor2d_log { void watch_arm(uint32_t addr); }   // Dr0 write-watch (va.x)
+namespace battle_pools { void set_va_probe(uint32_t addr); } // boostpool save/load va.x probe
 
 extern "C" {
     dll_export int stdcall init_instance_v2(HostEnvironment* environment) {
@@ -401,9 +403,9 @@ extern "C" {
                 }
                 if (sq_gettype(v, 3) == OT_INTEGER) {
                     SQInteger iv = 0; sq_getinteger(v, 3, &iv);
-                    log_printf("[nuttrace] f=%d rb=%d d=%d %s=%d\n",
+                    log_printf("[nuttrace] f=%d rb=%d d=%d %s=%08X\n",
                                gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
-                               gekko_bridge::g_trace_depth, tag ? tag : "?", (int)iv);
+                               gekko_bridge::g_trace_depth, tag ? tag : "?", (uint32_t)iv);
                     return 0;
                 }
                 uint32_t vb = 0; SQFloat fv = 0; SQInteger iv = 0;
@@ -412,6 +414,40 @@ extern "C" {
                 log_printf("[nuttrace] f=%d rb=%d d=%d %s=%08X\n",
                            gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
                            gekko_bridge::g_trace_depth, tag ? tag : "?", vb);
+                return 0;
+            });
+
+            // [nuttrace] __gekko_addr(instance) -> the instance's C++ userpointer as
+            // an int. Lets .nut log the C++ address of a Sqrat-bound object (e.g.
+            // the player's `va` SqVector3) so we can tell a pointer-not-restored bug
+            // (address differs fwd vs resim) from a bytes-not-restored bug (same
+            // address, value differs).
+            sq_setfunc(v, _SC("__gekko_addr"), [](HSQUIRRELVM v) -> SQInteger {
+                void* up = nullptr;
+                if (SQ_FAILED(sq_getinstanceup(v, 2, &up, nullptr))) up = nullptr;
+                sq_pushinteger(v, (SQInteger)(uintptr_t)up);
+                return 1;
+            });
+
+            // [nuttrace] __gekko_watch_va(va_instance) -- arm a Dr0 hardware
+            // write-watch on the player's va.x (the SqVector3 +0), so the C++
+            // writer that sets va.x=5.0 (vs 10.0) at f=24 d=1 is named by EIP. Arms
+            // ONCE, on the fast decelerating player (va.x>9.0) at f in [20,23],
+            // before the f=24 divergence so the watch is live through it.
+            sq_setfunc(v, _SC("__gekko_watch_va"), [](HSQUIRRELVM v) -> SQInteger {
+                static bool armed = false;
+                if (armed) return 0;
+                int f = gekko_bridge::g_trace_frame;
+                if (f < 20 || f > 23) return 0;
+                void* up = nullptr;
+                if (SQ_FAILED(sq_getinstanceup(v, 2, &up, nullptr)) || !up) return 0;
+                float vax = *(float*)up;            // va.x at +0
+                if (vax < 9.0f) return 0;
+                armed = true;
+                actor2d_log::watch_arm((uint32_t)(uintptr_t)up);
+                battle_pools::set_va_probe((uint32_t)(uintptr_t)up);
+                log_printf("[nuttrace] armed va.x Dr0 watch @ %08X (va.x=%.3f f=%d)\n",
+                           (uint32_t)(uintptr_t)up, (double)vax, f);
                 return 0;
             });
 
@@ -923,6 +959,8 @@ extern "C" {
                             "local _vxb = VX_Brake;\n"
                             "function VX_Brake(x_, min_ = null) {\n"
                             "  if (::__vxbhit_n < 40) { ::__vxbhit_n = ::__vxbhit_n + 1; ::print(\"[vxbhit] VX_Brake invoked\\n\"); }\n"
+                            "  ::__gekko_trace(\"VXB_vaddr\", ::__gekko_addr(this.va));\n"
+                            "  ::__gekko_watch_va(this.va);\n"
                             "  ::__gekko_trace(\"VXB_in_vax\", this.va.x);\n"
                             "  ::__gekko_trace(\"VXB_x\", x_);\n"
                             "  ::__gekko_trace(\"VXB_min\", min_ == null ? -99999.0 : min_);\n"
