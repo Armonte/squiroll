@@ -142,6 +142,29 @@ static void stdcall throw_log_hook(void* obj, void* ti) {
     g_h_throw.unsafe_stdcall<void>(obj, ti);
 }
 
+// QUEUE-LEVEL FLATTEN (SQUIROLL_SYNC_WORKERS=1). Ew_sTask__SyncLayerWorkers(this,
+// force_sync) dispatches the per-frame job queue. Its SYNCHRONOUS path (taken when
+// force_sync!=0) calls DispatchWorkerTask() which DRAINS the global job queue INLINE
+// on the calling thread, in atomic-index order — instead of SetEvent'ing the 8
+// cJobThread workers to race it. Forcing force_sync=1 while armed makes every
+// per-frame worker job run in a single DETERMINISTIC order, killing the broad cpp
+// divergence from concurrent worker allocation interleave. Both the forward save and
+// its re-sim take this path, so the dispatch is identical. (Wall-clock perf counters
+// the sync path writes into sTask .data may then need an engine_snap exclusion.)
+static SafetyHookInline g_h_synclayer{};
+static bool g_sync_workers = false;
+// NOTE: routing the render-effect worker DISPATCH allocations to the render region
+// (a g_render_depth set around SyncLayerWorkers calls from render_effect_*) made cpp
+// WORSE (24->30 frames) and re-broke eng — those allocations include sim-referenced
+// state, the same coupling that dangled the DrawCommandSlot refs. The render-effect
+// connection nodes are forward-only render BUT live in the sim dispatch list; they
+// can't be cleanly separated by alloc-site. Left out.
+static thread_local int g_render_depth = 0;   // reserved; currently always 0
+static void thiscall synclayer_hook(int task, int force_sync) {
+    int fs = (g_sync_workers && g_armed) ? 1 : force_sync;
+    g_h_synclayer.unsafe_thiscall<int>(task, fs);
+}
+
 // concurrent_list_erase_node (0x13D80) — __thiscall(container, out, key, node_ref).
 // RunOneFrame calls this to erase a disconnected boost::signals2 connection from
 // the ScriptAPI per-frame dispatch list. The list/cursor diverging across the
@@ -486,7 +509,7 @@ static void* cdecl hook_op_new(size_t size) {
         bool pre_gate = (g_sim_tid == 0);
         bool admitted = sim || worker || pre_gate;
         if (admitted && !thread_excluded(tid) && !caller_excluded(caller)) {
-            void* p = arena_alloc(size, is_render_caller(caller));
+            void* p = arena_alloc(size, is_render_caller(caller) || g_render_depth > 0);
             if (p) return p;
         }
     }
@@ -623,6 +646,11 @@ void install() {
         g_flatten_jobs = (fn > 0 && fn < sizeof fb && atoi(fb) != 0);
         if (g_flatten_jobs)
             log_printf("[cpp_arena] SQUIROLL_FLATTEN_JOBS=1 — cJobThread jobs run INLINE\n");
+        char sb[8] = {0};
+        DWORD sn = GetEnvironmentVariableA("SQUIROLL_SYNC_WORKERS", sb, sizeof sb);
+        g_sync_workers = (sn > 0 && sn < sizeof sb && atoi(sb) != 0);
+        if (g_sync_workers)
+            log_printf("[cpp_arena] SQUIROLL_SYNC_WORKERS=1 — worker queue drained INLINE (force-sync)\n");
     }
 
     // Serialises arena_alloc/arena_free across th155's threads. Created
@@ -658,6 +686,7 @@ void install() {
     g_h_bthreadex = safetyhook::create_inline((void*)BEGINTHREADEX,
                                               (void*)hook_beginthreadex);
     g_h_throw  = safetyhook::create_inline((void*)(0x2FB5DD_R), (void*)throw_log_hook);
+    g_h_synclayer = safetyhook::create_inline((void*)(0xE5CD0_R), (void*)synclayer_hook);
     // [erase] connection-lifecycle trace — DISABLED (root found; it read keys in the
     // divergent arena, a source of clguard null-deref noise). Re-enable to re-trace.
     // g_h_erase  = safetyhook::create_inline((void*)(0x13D80_R),  (void*)erase_log_hook);
@@ -732,7 +761,7 @@ void* raw_alloc(uint32_t n, uint32_t caller_abs) {
     // shim. See Hdr::link / attribute().
     g_opnew_caller = caller_abs ? caller_abs
                    : (uint32_t)(uintptr_t)_ReturnAddress();
-    return arena_alloc(n, is_render_caller(g_opnew_caller));
+    return arena_alloc(n, is_render_caller(g_opnew_caller) || g_render_depth > 0);
 }
 
 // DIAGNOSTIC: attribute an arena byte offset to the block that owns it and

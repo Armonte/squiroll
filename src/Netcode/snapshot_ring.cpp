@@ -422,11 +422,8 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             (void)first_dump_done;                 // kept for binary stability
             int totalp = 0;
             for (int a = 0; a < NARENA; ++a) {
-                // cpp_arena (arena 2) is excluded from the desync checksum and is
-                // intentionally still-divergent (residual render churners). Skip
-                // diagnosing it — the [divf]/[divword] walk floods the log and the
-                // re-sim already reads the divergent arena (clguard null-deref
-                // noise). Re-enable (drop this continue) to re-trace cpp.
+                // cpp_arena divf OFF by default (residual render churners still make
+                // it noisy). Drop this continue to re-trace the residual cpp pages.
                 if (a == CPP_ARENA) continue;
                 int hits = 0;
                 for (uint32_t pg = 0; pg < g_ar[a].npages && hits < 6; ++pg) {

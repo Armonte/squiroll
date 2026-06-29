@@ -191,9 +191,10 @@ static int collect(Region* r) {
         //   [0x4DAD10,+4)  _Wndproc window/input state (async OS message handler)
         //                  — non-deterministic across the headless re-sim.
         const struct { uintptr_t lo, hi; } exr[] = {
-            { (uintptr_t)(0x4DAD10_R), (uintptr_t)(0x4DAD10_R) + 4  },
-            { (uintptr_t)(0x4DAEB8_R), (uintptr_t)(0x4DAEB8_R) + 20 },
-            { (uintptr_t)(0x4DB004_R), (uintptr_t)(0x4DB004_R) + 4  },
+            { (uintptr_t)(0x49AF04_R), (uintptr_t)(0x49AF04_R) + 8  }, // _Wndproc window/input state (more)
+            { (uintptr_t)(0x4DAD10_R), (uintptr_t)(0x4DAD10_R) + 4  }, // _Wndproc window/input state
+            { (uintptr_t)(0x4DAEB8_R), (uintptr_t)(0x4DAEB8_R) + 20 }, // DirectInput device buffer
+            { (uintptr_t)(0x4DB004_R), (uintptr_t)(0x4DB004_R) + 4  }, // g_engine_loop_tick
         };
 
         // Emit committed run [a,e) as snapshot region(s), carving out every exr[].
