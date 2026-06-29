@@ -153,6 +153,13 @@ static void stdcall throw_log_hook(void* obj, void* ti) {
 // the sync path writes into sTask .data may then need an engine_snap exclusion.)
 static SafetyHookInline g_h_synclayer{};
 static bool g_sync_workers = false;
+// Set true around render_one_frame() (the forward-only render pass — particle draws
+// run SQVM scripts whose transient boost::signals2 connections leak in the arena;
+// the headless re-sim skips render entirely). While set, arena allocs go to the
+// RENDER region so that leak can't move the sim bump. Render pass is single-threaded
+// on the main thread (and with SYNC_WORKERS the worker drain is inline too), so a
+// plain global is race-free.
+static bool g_render_pass = false;
 // NOTE: routing the render-effect worker DISPATCH allocations to the render region
 // (a g_render_depth set around SyncLayerWorkers calls from render_effect_*) made cpp
 // WORSE (24->30 frames) and re-broke eng — those allocations include sim-referenced
@@ -509,7 +516,8 @@ static void* cdecl hook_op_new(size_t size) {
         bool pre_gate = (g_sim_tid == 0);
         bool admitted = sim || worker || pre_gate;
         if (admitted && !thread_excluded(tid) && !caller_excluded(caller)) {
-            void* p = arena_alloc(size, is_render_caller(caller) || g_render_depth > 0);
+            void* p = arena_alloc(size, is_render_caller(caller) || g_render_depth > 0
+                                        || (g_sync_workers && g_render_pass));
             if (p) return p;
         }
     }
@@ -720,6 +728,7 @@ void trace_alloc(uint32_t addr) {
 
 void     set_armed(bool on) { g_armed = on; }
 bool     is_armed()         { return g_armed; }
+void     set_render_pass(bool on) { g_render_pass = on; }
 void     set_resim(bool on) { g_resim = on; }
 bool     is_resim()         { return g_resim; }
 
@@ -761,7 +770,8 @@ void* raw_alloc(uint32_t n, uint32_t caller_abs) {
     // shim. See Hdr::link / attribute().
     g_opnew_caller = caller_abs ? caller_abs
                    : (uint32_t)(uintptr_t)_ReturnAddress();
-    return arena_alloc(n, is_render_caller(g_opnew_caller) || g_render_depth > 0);
+    return arena_alloc(n, is_render_caller(g_opnew_caller) || g_render_depth > 0
+                          || (g_sync_workers && g_render_pass));
 }
 
 // DIAGNOSTIC: attribute an arena byte offset to the block that owns it and

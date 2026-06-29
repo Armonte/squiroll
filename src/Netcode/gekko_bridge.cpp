@@ -1673,6 +1673,14 @@ void advance_one_frame() {
 }
 
 void render_one_frame() {
+    // NOTE: bracketing this with cpp_arena::set_render_pass(true) to route render
+    // allocations to the render region made cpp WORSE (24->29) — drawing_related
+    // allocates SIM-referenced state too (the render-effect boost::signals2
+    // connections live in the dispatch list RunOneFrame walks). Every attempt to
+    // route the render allocs out by where/when they happen breaks the refs. The
+    // set_render_pass hook stays available but is not used here. The render-effect
+    // connections need to be separated by IDENTITY (which signal/list), or the
+    // re-sim must replay the draw's sim side-effects — not a location heuristic.
     drawing_related();
 }
 

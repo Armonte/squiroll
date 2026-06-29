@@ -64,6 +64,11 @@ bool is_sim_thread();
 // the Ew::sTask layer/effect dispatch synchronous during the rollback window.
 bool is_armed();
 
+// Bracket the forward-only render pass (render_one_frame) so its allocations go to
+// the arena's separate render region (with SQUIROLL_SYNC_WORKERS) — keeps the
+// render-effect connection-node leak out of the sim bump.
+void set_render_pass(bool on);
+
 // Mark a rollback re-simulation advance in progress. While set, a free of a
 // real-heap (non-arena) block is suppressed — the real Win32 heap is not
 // snapshotted, so the forward run already freed it and re-freeing would

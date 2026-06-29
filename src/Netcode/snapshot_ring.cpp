@@ -57,12 +57,12 @@ struct TrackedPage {
 };
 static TrackedPage g_tracked[] = {
     {23397, {}, false},   // boost::signals2 connection_body
-    {23396, {}, false},   // World2D__Init  4-byte flag
+    {23404, {}, false},   // RESIDUAL divergent (post sync_workers+render-region)
+    {23744, {}, false},   // RESIDUAL divergent
+    {23749, {}, false},   // RESIDUAL divergent
     {8873,  {}, false},   // Ew::sTask per-worker stats
     {10234, {}, false},   // boost::log shared_count
     {10235, {}, false},   // boost::log shared_count slot
-    {23424, {}, false},   // sub_E0F00? freed neighbour
-    {23706, {}, false},   // UDPInnerD 256KB buffer (first page)
 };
 static constexpr int N_TRACKED =
     sizeof(g_tracked) / sizeof(g_tracked[0]);
@@ -422,9 +422,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             (void)first_dump_done;                 // kept for binary stability
             int totalp = 0;
             for (int a = 0; a < NARENA; ++a) {
-                // cpp_arena divf OFF by default (residual render churners still make
-                // it noisy). Drop this continue to re-trace the residual cpp pages.
-                if (a == CPP_ARENA) continue;
+                if (a == CPP_ARENA) continue;   // cpp divf off (use [comp] cpp instead)
                 int hits = 0;
                 for (uint32_t pg = 0; pg < g_ar[a].npages && hits < 6; ++pg) {
                     if (S.phash_snap[a][pg] != g_ar[a].phash[pg]) {
