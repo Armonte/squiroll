@@ -10,8 +10,9 @@
 #include "patch_utils.h"   // _R address literal
 #include "util.h"          // thiscall, base_address
 #include "log.h"
+#include "sq_arena.h"      // base() — range-check the closure->name decode
 
-namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; }
+namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; extern int g_trace_depth; }
 
 namespace sqfun_log {
 
@@ -64,10 +65,24 @@ static int thiscall hook(int* sqrat_fn) {
         // non-captured state). If not, the Sqrat::Function field on the
         // Actor2DGroup at +0x74 (=this+29 in the IDA decompile) is the
         // divergent state.
-        log_printf("[sqfun] f=%d rb=%d by=%05X vm=%08X "
-                   "ft=%08X fv=%08X et=%08X ev=%08X\n",
-                   f, rb, caller_rva, vm,
-                   f_type, f_val, e_type, e_val);
+        // Decode the closure NAME: SQClosure[8] = _function (SQFunctionProto),
+        // funcproto[9] = _name (SQString*), chars at +0x1C. Shows WHICH .nut
+        // function runs -> the divergent f=15 call (MoveBack vs Stand etc).
+        char nm[48]; nm[0] = '?'; nm[1] = 0;
+        uint32_t lo = (uint32_t)(uintptr_t)sq_arena::base();
+        uint32_t hi = lo + 0x4000000u;   // 64MB window — closures live in here
+        if (f_val >= lo && f_val + 0x24 < hi) {
+            uint32_t fp = ((uint32_t*)(uintptr_t)f_val)[8];       // _function
+            if (fp >= lo && fp + 0x28 < hi) {
+                uint32_t sname = ((uint32_t*)(uintptr_t)fp)[9];   // _name SQString*
+                if (sname >= lo && sname + 0x40 < hi) {
+                    const char* s = (const char*)(uintptr_t)(sname + 0x1C);
+                    int i = 0; for (; i < 46 && s[i]; ++i) nm[i] = s[i]; nm[i] = 0;
+                }
+            }
+        }
+        log_printf("[sqfun] f=%d rb=%d d=%d by=%05X ft=%08X name='%s' fv=%08X ev=%08X\n",
+                   f, rb, gekko_bridge::g_trace_depth, caller_rva, f_type, nm, f_val, e_val);
     }
 
     return g_h.unsafe_thiscall<int>(sqrat_fn);

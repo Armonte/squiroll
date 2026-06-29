@@ -15,7 +15,7 @@
 //   g_trace_frame: the gekko frame currently being advanced (-1 outside an
 //                  advance, e.g. when the engine is updating the menu).
 //   g_trace_rb:    non-zero when the current advance is a rollback re-sim.
-namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; }
+namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; extern int g_trace_depth; }
 
 namespace actor2d_log {
 
@@ -178,10 +178,24 @@ static int thiscall hook_step(int actor, int stack_arg) {
         uint32_t caller_rva =
             (uint32_t)((uintptr_t)_ReturnAddress() - base_address);
 
-        log_printf("[a2dstep] f=%d rb=%d this=%08X by=%05X "
+        log_printf("[a2dstep] f=%d rb=%d d=%d this=%08X by=%05X "
                    "th=%08X th0=%08X vx=%08X vy=%08X %s\n",
-                   f, rb, (uint32_t)actor, caller_rva,
+                   f, rb, gekko_bridge::g_trace_depth, (uint32_t)actor, caller_rva,
                    task_head, task_head_0, vx_bits, vy_bits, ucm_branch);
+        // Dump the actor position/state region [0x18..0x40] so the FIRST
+        // divergent actor field (fwd vs deepest re-sim) at f=14/15 shows up --
+        // the value the move-selection read (position fed to GetFront, etc).
+        if (f >= 14 && f <= 15) {
+            log_printf("[a2dfld] f=%d rb=%d d=%d this=%08X "
+                       "18=%08X 1C=%08X 20=%08X 24=%08X 28=%08X 2C=%08X "
+                       "30=%08X 34=%08X 38=%08X 3C=%08X\n",
+                       f, rb, gekko_bridge::g_trace_depth, (uint32_t)actor,
+                       *(uint32_t*)(actor + 0x18), *(uint32_t*)(actor + 0x1C),
+                       *(uint32_t*)(actor + 0x20), *(uint32_t*)(actor + 0x24),
+                       *(uint32_t*)(actor + 0x28), *(uint32_t*)(actor + 0x2C),
+                       *(uint32_t*)(actor + 0x30), *(uint32_t*)(actor + 0x34),
+                       *(uint32_t*)(actor + 0x38), *(uint32_t*)(actor + 0x3C));
+        }
     }
 
     return g_h_step.unsafe_thiscall<int>(actor, stack_arg);

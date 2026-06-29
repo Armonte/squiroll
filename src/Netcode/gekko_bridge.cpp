@@ -121,6 +121,12 @@ uint16_t forced_inputs[2] = {0, 0};
 // Squirrel VM be attributed to a specific frame / forward-vs-rollback.
 int g_trace_frame = -1;
 int g_trace_rb    = 0;
+// Rollback DEPTH = how many frames the current re-sim advance is past its load
+// target (g_trace_frame - last GekkoLoad frame). 0 on the forward. Lets the
+// diagnostics isolate the ONE divergent (DEEPEST, depth=8) re-sim of a frame
+// from the 7 matching shallower re-sims that aggregate under rb=1.
+int g_trace_depth = 0;
+static int g_last_load_frame = -1;
 bool     forced_inputs_active = false;
 
 // ----------------------------------------------------------------- helpers --
@@ -2088,6 +2094,7 @@ bool tick() {
                                    e->data.load.state_len, blobcs);
                     }
                 }
+                g_last_load_frame = (int)e->data.load.frame;  // rollback target
                 {
                     LARGE_INTEGER _tl0; QueryPerformanceCounter(&_tl0);
                     load_state_from_buf(e->data.load.state,
@@ -2113,6 +2120,8 @@ bool tick() {
                 }
                 g_trace_frame = (int)e->data.adv.frame;
                 g_trace_rb    = (int)e->data.adv.rolling_back;
+                g_trace_depth = (g_trace_rb && g_last_load_frame >= 0)
+                                  ? ((int)e->data.adv.frame - g_last_load_frame) : 0;
                 log_state_fingerprint((int)e->data.adv.frame,
                                       (int)e->data.adv.rolling_back, "adv-top");
                 if (rb_diag_enabled()) {

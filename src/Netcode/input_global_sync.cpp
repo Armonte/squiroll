@@ -13,7 +13,7 @@
 #include "log.h"
 
 // gekko_bridge.cpp publishes these (sq_trace pattern).
-namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; }
+namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; extern int g_trace_depth; }
 
 namespace input_global_sync {
 
@@ -208,6 +208,22 @@ static int thiscall hook_multi(int* this_ptr) {
         } else {
             Slot* s = find_slot(f, this_ptr, /*allocate=*/false);
             if (s) memcpy(state, s->bytes, STATE_BYTES);
+        }
+        // DEPTH PROBE: dump the WHOLE InputMulti (0x128) at f=15 with rollback
+        // depth -- find the dword that diverges depth-1(divergent) vs depth-0
+        // (forward). The capture covers +4..+0x84; +0 and the +0x84..+0x128 tail
+        // are NOT captured -> if X (the un-saved carry-over the move reads) is in
+        // InputMulti, it's there. Logged AFTER capture/replay (so +4..+0x84 is
+        // identical; any diff is in +0 or the tail).
+        if (f == 15) {
+            uint32_t* o = (uint32_t*)(uintptr_t)this_ptr;
+            for (uint32_t b = 0; b < 0x128; b += 0x20) {
+                log_printf("[imdump] f=15 rb=%d d=%d ip=%08X +%03X: "
+                           "%08X %08X %08X %08X %08X %08X %08X %08X\n",
+                           rb, gekko_bridge::g_trace_depth, (uint32_t)(uintptr_t)this_ptr, b,
+                           o[b/4+0], o[b/4+1], o[b/4+2], o[b/4+3],
+                           o[b/4+4], o[b/4+5], o[b/4+6], o[b/4+7]);
+            }
         }
     }
     return r;
