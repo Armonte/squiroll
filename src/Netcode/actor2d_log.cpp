@@ -300,7 +300,7 @@ typedef int (*sq_getinstanceup_t)(int vm, int idx, void** out, int tag);
 typedef int (*sq_getuserdata_t)(int vm, int idx, void** out, int tag);
 
 static SafetyHookInline g_h_set{};
-static int g_setwalk_budget = 80;   // hard cap so the f=15 re-sims can't spam
+static int g_setwalk_budget = 2000;   // hard cap so the f=15 re-sims can't spam
 
 // True if [a, a+n) is committed & readable. VirtualQuery-based so a stale
 // pointer in the SQVM walk can't fault the sim thread (no SEH under 32-bit
@@ -316,18 +316,33 @@ static bool rd_ok(uint32_t a, uint32_t n) {
     return (uint64_t)a + n <= (uint64_t)rbase + mbi.RegionSize;
 }
 
-static void decode_closure_name(uint32_t cobj, char* nm, int cap) {
-    nm[0] = '?'; nm[1] = 0;
-    if (!rd_ok(cobj + 0x20, 4)) return;
-    uint32_t fp = *(uint32_t*)(uintptr_t)(cobj + 0x20);   // _function
-    if (!rd_ok(fp + 0x24, 4)) return;
-    uint32_t snm = *(uint32_t*)(uintptr_t)(fp + 0x24);    // _name SQString*
-    if (!rd_ok(snm + 0x1C, 1)) return;
-    const char* s = (const char*)(uintptr_t)(snm + 0x1C);
+// Copy a SQString (chars at +0x1C) into out, range-checked.
+static void decode_sqstring(uint32_t sstr, char* out, int cap) {
+    out[0] = '?'; out[1] = 0;
+    if (!rd_ok(sstr + 0x1C, 1)) return;
+    const char* s = (const char*)(uintptr_t)(sstr + 0x1C);
     int i = 0;
     for (; i < cap - 1 && rd_ok((uint32_t)(uintptr_t)(s + i), 1) && s[i]; ++i)
-        nm[i] = s[i];
-    nm[i] = 0;
+        out[i] = s[i];
+    out[i] = 0;
+}
+
+// Decode a closure's _function -> name (FP+0x24), source file (FP+0x1C) and
+// the function's defining line (FP+0x28 = SQFunctionProto::_lineinfos[0].line,
+// the first line-info entry). The source+line locate even anonymous functions
+// (no _name) -- which is exactly the VX_Brake caller (#9) that prints '?'.
+static void decode_closure(uint32_t cobj, char* nm, char* src, int cap, uint32_t* line) {
+    nm[0] = '?'; nm[1] = 0; src[0] = '?'; src[1] = 0; if (line) *line = 0;
+    if (!rd_ok(cobj + 0x20, 4)) return;
+    uint32_t fp = *(uint32_t*)(uintptr_t)(cobj + 0x20);   // _function (SQFunctionProto)
+    if (rd_ok(fp + 0x24, 4)) decode_sqstring(*(uint32_t*)(uintptr_t)(fp + 0x24), nm, cap);
+    if (rd_ok(fp + 0x1C, 4)) decode_sqstring(*(uint32_t*)(uintptr_t)(fp + 0x1C), src, cap);
+    // _lineinfos pointer + first line. Layout (SQ 3.0.x): FP+0x28 _lineinfos*,
+    // each SQLineInfo = {SQInteger _line; SQInteger _op} (8 bytes), _line@+0.
+    if (line && rd_ok(fp + 0x28, 4)) {
+        uint32_t li = *(uint32_t*)(uintptr_t)(fp + 0x28);
+        if (rd_ok(li, 4)) *line = *(uint32_t*)(uintptr_t)li;
+    }
 }
 
 // Walk every CallInfo frame from the top (_ci) down to the stack base, printing
@@ -349,11 +364,11 @@ static void log_nut_stack(uint32_t vm, int f, int rb, int d,
         uint32_t cobj  = *(uint32_t*)(uintptr_t)(c + 12);
         const char* kind = (ctype == 0x08000100) ? "nut"
                          : (ctype == 0x08000200) ? "native" : "?";
-        char nm[48];
-        if (ctype == 0x08000100) decode_closure_name(cobj, nm, sizeof(nm));
-        else { nm[0] = '-'; nm[1] = 0; }
-        log_printf("[setwalk]   #%-2d ci=%08X ty=%08X %-6s '%s'\n",
-                   i, c, ctype, kind, nm);
+        char nm[48], src[64]; uint32_t line = 0;
+        if (ctype == 0x08000100) decode_closure(cobj, nm, src, sizeof(nm), &line);
+        else { nm[0] = '-'; nm[1] = 0; src[0] = '-'; src[1] = 0; }
+        log_printf("[setwalk]   #%-2d %-6s '%s'  @ %s:%u\n",
+                   i, kind, nm, src, line);
     }
 }
 
@@ -362,7 +377,12 @@ static void log_nut_stack(uint32_t vm, int f, int rb, int d,
 // write target; if it matches the watched actor's +0x2C we dump the .nut stack.
 static int cdecl hook_set(int vm) {
     int f = gekko_bridge::g_trace_frame;
-    if (f >= 14 && f <= 15 && g_vw_addr && g_setwalk_budget > 0 && vm) {
+    // f=24 vx divergence: log the .nut stack of EVERY vx write (member off 0x2C
+    // = Actor2D vx) so the divergent-value write (8.75 vs 3.75, val=410C0000 vs
+    // 40700000) is attributed to the exact .nut function setting it directly
+    // (ConvertTotalSpeed's components are identical across depths, so this is a
+    // direct `this.vx = ...` from some other path).
+    if (f == 24 && g_setwalk_budget > 0 && vm) {
         sq_getinstanceup_t p_giu = (sq_getinstanceup_t)(0x182d60_R);
         sq_getuserdata_t   p_gud = (sq_getuserdata_t)(0x1834f0_R);
         sq_getfloat_t      p_gf  = (sq_getfloat_t)(0x182bf0_R);
@@ -372,7 +392,7 @@ static int cdecl hook_set(int vm) {
         p_gf(vm, 2, &val);
         uint32_t off = udp ? *(uint32_t*)udp : 0xFFFFFFFFu;
         uint32_t tgt = (uint32_t)(uintptr_t)obj + off;
-        if (tgt == g_vw_addr) {
+        if (off == 0x2C) {   // Actor2D.vx
             --g_setwalk_budget;
             uint32_t vb; __builtin_memcpy(&vb, &val, 4);
             log_nut_stack((uint32_t)vm, f, gekko_bridge::g_trace_rb,
@@ -398,7 +418,7 @@ static int cdecl hook_set(int vm) {
 #define SQRAT_GET_MEMBER_VAR_FLOAT (0x469F0_R)
 
 static SafetyHookInline g_h_get{};
-static int g_getcmp_budget = 600;
+static int g_getcmp_budget = 4000;
 
 // Name of the topmost OT_CLOSURE (.nut) frame -- the immediate script caller of
 // the native getter.
@@ -413,13 +433,13 @@ static void topmost_nut_name(uint32_t vm, char* out, int cap) {
         if (!rd_ok(c + 8, 8)) continue;
         uint32_t ty = *(uint32_t*)(uintptr_t)(c + 8);
         uint32_t co = *(uint32_t*)(uintptr_t)(c + 12);
-        if (ty == 0x08000100) { decode_closure_name(co, out, cap); return; }
+        if (ty == 0x08000100) { char src[64]; decode_closure(co, out, src, cap < 64 ? cap : 64, nullptr); return; }
     }
 }
 
 static int cdecl hook_get(int vm) {
     int f = gekko_bridge::g_trace_frame;
-    if (f >= 23 && f <= 25 && g_getcmp_budget > 0 && vm) {   // f=24 attack-velocity divergence window
+    if (f == 24 && g_getcmp_budget > 0 && vm) {   // f=24 attack-velocity divergence (all depths)
         char caller[48];
         topmost_nut_name((uint32_t)vm, caller, sizeof caller);
         if (__builtin_strcmp(caller, "ConvertTotalSpeed") == 0) {
