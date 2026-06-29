@@ -102,6 +102,31 @@ static SafetyHookInline g_h_opnew{};
 static SafetyHookInline g_h_free{};
 static SafetyHookInline g_h_malloc{};
 static SafetyHookInline g_h_bthreadex{};
+static SafetyHookInline g_h_throw{};
+
+// _CxxThrowException(pObject, pThrowInfo) — the central MSVC C++ throw. Log every
+// exception's TYPE NAME so the unhandled throw that aborts the re-sim (FASTFAIL via
+// abort in RunOneFrame) is identifiable. The last [cxxthrow] before the abort is
+// the culprit. 32-bit _ThrowInfo: +12 -> CatchableTypeArray; [+0]=count, [+4]=
+// CatchableType*; CatchableType+4 -> TypeDescriptor; TypeDescriptor+8 -> name.
+static void stdcall throw_log_hook(void* obj, void* ti) {
+    static int g_throw_n = 0;
+    if (ti && g_throw_n < 600) {
+        const char* name = "?";
+        uint32_t cta = *(uint32_t*)((char*)ti + 12);
+        if (cta && *(const int*)cta > 0) {
+            uint32_t ct = *(uint32_t*)(cta + 4);
+            if (ct) {
+                uint32_t td = *(uint32_t*)((char*)ct + 4);
+                if (td) name = (const char*)(td + 8);
+            }
+        }
+        ++g_throw_n;
+        log_printf("[cxxthrow] #%d resim=%d type='%s'\n",
+                   g_throw_n, (int)g_resim, name);
+    }
+    g_h_throw.unsafe_stdcall<void>(obj, ti);
+}
 
 // Threads whose operator new must NEVER reach the arena — the audio thread
 // above all. Populated by the _beginthreadex hook from each thread's start
@@ -540,12 +565,13 @@ void install() {
     g_h_malloc = safetyhook::create_inline((void*)MALLOC_FN,    (void*)hook_malloc);
     g_h_bthreadex = safetyhook::create_inline((void*)BEGINTHREADEX,
                                               (void*)hook_beginthreadex);
+    g_h_throw  = safetyhook::create_inline((void*)(0x2FB5DD_R), (void*)throw_log_hook);
 
     int ok = g_h_free.enabled() + g_h_opnew.enabled();
     g_installed = (ok == 2);
-    log_printf("[cpp_arena] install: arena=%p %uMB hooks=%d/2 mallocwatch=%d\n",
+    log_printf("[cpp_arena] install: arena=%p %uMB hooks=%d/2 mallocwatch=%d throwlog=%d\n",
                g_base, ARENA_SIZE / (1024u * 1024u), ok,
-               (int)g_h_malloc.enabled());
+               (int)g_h_malloc.enabled(), (int)g_h_throw.enabled());
 }
 
 void trace_alloc(uint32_t addr) {
