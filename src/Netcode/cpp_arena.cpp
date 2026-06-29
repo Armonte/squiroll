@@ -35,6 +35,10 @@
 // arena from boot, before it allocates anything.
 #define BEGINTHREADEX (0x3105AC_R)
 
+// Frame/rollback counters owned by gekko_bridge — used to tag connection-lifecycle
+// trace lines so a forward save can be diffed against its rollback re-sim.
+namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; }
+
 namespace cpp_arena {
 namespace {
 
@@ -126,6 +130,31 @@ static void stdcall throw_log_hook(void* obj, void* ti) {
                    g_throw_n, (int)g_resim, name);
     }
     g_h_throw.unsafe_stdcall<void>(obj, ti);
+}
+
+// concurrent_list_erase_node (0x13D80) — __thiscall(container, out, key, node_ref).
+// RunOneFrame calls this to erase a disconnected boost::signals2 connection from
+// the ScriptAPI per-frame dispatch list. The list/cursor diverging across the
+// rollback re-sim is the cpp root. Log every erase tagged with frame/rb/thread +
+// the string key + node addr, so a forward run can be diffed against its re-sim to
+// find the connection that erases on a DIFFERENT frame (and whether a worker thread
+// is doing it).
+static SafetyHookInline g_h_erase{};
+static uint32_t* thiscall erase_log_hook(int* self, uint32_t* out, int* key, int** node) {
+    void* nodeaddr = node ? (void*)*node : nullptr;
+    // MSVC std::string key: size at +16; SSO buffer at +0, else heap ptr at +0.
+    const char* ks = (const char*)key;
+    if (key && ((const uint32_t*)key)[4] >= 16) ks = *(const char**)key;
+    uint32_t* r = g_h_erase.unsafe_thiscall<uint32_t*>(self, out, key, node);
+    static int n = 0;
+    if (n < 5000) {
+        ++n;
+        log_printf("[erase] f=%d rb=%d tid=%u node=%p cnt=%d key='%.24s'\n",
+                   gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
+                   GetCurrentThreadId(), nodeaddr, self ? self[1] : -1,
+                   ks ? ks : "?");
+    }
+    return r;
 }
 
 // Threads whose operator new must NEVER reach the arena — the audio thread
@@ -337,6 +366,17 @@ static const ExclRange g_excl[] = {
     // tf4_ogg_alloc_shared — operator new shared_ptr<TF4::Ogg>, the Ogg/Vorbis
     // audio decoder object; the audio thread mutates it every frame.
     { 0x16B380u, 0x16B400u },
+    // NOTE: routing the RENDER allocators (DrawCommandSlot create_and_bind
+    // 0x56A90-0x56AD0, reset 0x57DC0) to the real heap DID make f=2 deterministic
+    // (the free-list churn that pushed the sim's connection nodes to different
+    // slots — object B at re-sim offset 0x27FAA70 vs forward 0x5B5C670, [divword]),
+    // and sq/bt stayed clean. BUT the arena's boost::signals2 connection nodes
+    // REFERENCE those render objects, so excluding them leaves dangling refs: the
+    // re-sim's RunOneFrame cleanup then frees the (real-heap) render objects, which
+    // the re-sim free-suppressor swallows -> they leak (618k frees) -> OOM. So the
+    // render objects MUST stay in the arena; the real fix is a SEPARATE arena
+    // sub-region/free-list for render allocs so their churn can't move the sim's
+    // nodes. Left out until that's built.
 };
 static bool caller_excluded(uint32_t abs_caller) {
     uint32_t rva = abs_caller - (uint32_t)base_address;
@@ -423,7 +463,21 @@ static void* cdecl hook_op_new(size_t size) {
         bool admitted = sim || worker || pre_gate;
         if (admitted && !thread_excluded(tid) && !caller_excluded(caller)) {
             void* p = arena_alloc(size);
-            if (p) return p;
+            if (p) {
+                // TRACE f=2 arena allocs (fwd vs re-sim) to settle the cpp root:
+                // same caller+size at a DIFFERENT addr => free-list reuse diverged
+                // (worker churn); tid shows which thread allocates.
+                if (gekko_bridge::g_trace_frame == 2) {
+                    static int an = 0;
+                    if (an < 2000) { ++an;
+                        log_printf("[cppalloc] rb=%d tid=%u sz=%u addr=%p crva=%08X\n",
+                                   gekko_bridge::g_trace_rb, GetCurrentThreadId(),
+                                   (uint32_t)size, p,
+                                   (uint32_t)(caller - (uint32_t)base_address));
+                    }
+                }
+                return p;
+            }
         }
     }
     return g_h_opnew.unsafe_ccall<void*>(size);
@@ -566,6 +620,7 @@ void install() {
     g_h_bthreadex = safetyhook::create_inline((void*)BEGINTHREADEX,
                                               (void*)hook_beginthreadex);
     g_h_throw  = safetyhook::create_inline((void*)(0x2FB5DD_R), (void*)throw_log_hook);
+    g_h_erase  = safetyhook::create_inline((void*)(0x13D80_R),  (void*)erase_log_hook);
 
     int ok = g_h_free.enabled() + g_h_opnew.enabled();
     g_installed = (ok == 2);

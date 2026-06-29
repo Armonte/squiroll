@@ -422,13 +422,12 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             (void)first_dump_done;                 // kept for binary stability
             int totalp = 0;
             for (int a = 0; a < NARENA; ++a) {
-                // cpp_arena (arena 2) is intentionally excluded from the desync
-                // checksum (render state — see fold_checksum). It diverges every
-                // frame by design, so do NOT diagnose/attribute it: the attribute
-                // walk follows pointers in the divergent arena and can fault, and
-                // it floods the log (the ~10 fps + the f≈27 crash). Only sq/bt
-                // divergence is a real desync worth surfacing.
-                if (a == CPP_ARENA) continue;
+                // cpp_arena divf IS re-enabled (to trace the connection_body
+                // divergence) but the cpp_arena::attribute() walks below are kept
+                // OFF — that walk follows pointers in the divergent arena and was
+                // the f≈27 fault. The [divf] page hit + the [divword] dword diff
+                // (tracked page 23397 = connection_body) are pure byte compares and
+                // safe; they give the exact divergent dword without walking.
                 int hits = 0;
                 for (uint32_t pg = 0; pg < g_ar[a].npages && hits < 6; ++pg) {
                     if (S.phash_snap[a][pg] != g_ar[a].phash[pg]) {
@@ -444,10 +443,6 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                         // via a small bitset so the log doesn't spam the
                         // same RVA every frame for the same offset.
                         if (a == 2) {
-                            extern bool divf_attr_seen(uint32_t);
-                            if (!divf_attr_seen(pg)) {
-                                cpp_arena::attribute(pg * PAGE);
-                            }
                             extern bool divword_seen(uint32_t);
                             // Per-page dword diff against the save-time
                             // latch — only for tracked pages, only once
@@ -474,15 +469,8 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                                         // are cpp_arena pointers — what each
                                         // side points at (the per-frame object
                                         // whose address swaps).
-                                        if (diffs == 0) {
-                                            uint32_t b = (uint32_t)(uintptr_t)g_ar[a].base;
-                                            uint32_t c = g_ar[a].size;
-                                            cpp_arena::attribute(pg * PAGE + i * 4);
-                                            if (saved[i] > b && saved[i] < b + c)
-                                                cpp_arena::attribute(saved[i] - b);
-                                            if (live[i] > b && live[i] < b + c)
-                                                cpp_arena::attribute(live[i] - b);
-                                        }
+                                        // (cpp_arena::attribute walks disabled —
+                                        // they faulted on the divergent arena.)
                                         ++diffs;
                                     }
                                 }
