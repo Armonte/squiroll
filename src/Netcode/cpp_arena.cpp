@@ -14,6 +14,7 @@
 #include "util.h"
 #include "log.h"
 #include "sq_arena.h"      // sq_arena::base/capacity  (for the [arenas] dump)
+#include "snapshot_ring.h" // snapshot_ring::gl_capture (game-loop render-dispatch pin)
 #include "bullet_arena.h"  // bullet_arena::base/capacity
 
 namespace actor2d_log { void watch_arm(uint32_t addr); }  // Dr0 write-watch (VEH logs writer rva)
@@ -295,6 +296,10 @@ static void thiscall runone_hook(int self) {
     // connection list referencing freed objects). But the SIM references render objects,
     // so excluding the region broke sq/eng. Render/sim aren't page-separable. Reverted.
     g_h_runone.unsafe_thiscall<int>(self);
+    // After the game-loop ScriptAPI's RunOneFrame completes, its render-dispatch slot-list
+    // is at a STABLE refcount — snapshot the reachable graph here as the forward-pin source
+    // (snapshot_ring re-applies it after each rollback restore so render state never reverts).
+    if ((uint32_t)self == *(uint32_t*)(0x49AFBC_R)) snapshot_ring::gl_capture();
 }
 
 // DIAG: confirm the slot-list shared_count divergence. signal_lock_slot_list (0x304F0)

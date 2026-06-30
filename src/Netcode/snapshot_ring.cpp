@@ -295,83 +295,41 @@ static uint32_t fold_checksum(const uint8_t* sblob, uint32_t sblob_len) {
 }
 } // namespace
 
-// ---- Forward-state pin of the game-loop (render-dispatch) ScriptAPI object ----
-// The game-loop ScriptAPI (cpp_arena::gameloop_addr, *0x49AFBC) is FORWARD-ONLY: the
-// re-sim never runs it, so rolling its bytes back reverts the embedded boost::signals2
-// slot-list shared_count's use_count to a dead state -> HasPendingFrame's release decrement
-// hits 0 -> spurious dispose -> heap-corruption abort (~f60-70). Pin it: snapshot the object
-// on each FORWARD capture, and after every restore re-apply the live forward copy so the
-// render-dispatch signal state never rolls back. Object-level (the object's bytes restored
-// individually) NOT page-level — avoids the sim/render page entanglement that broke sq/eng.
-static constexpr uint32_t GL_PIN_SIZE = 0x200;     // covers the signal: list head +0x40 .. sc +0x1C0
-static constexpr uint32_t GL_NODE_SZ  = 0x10;      // boost::signals2 list node: +0 next +4 prev +8 conn_body
-static constexpr uint32_t GL_CB_SZ    = 0x80;      // connection_body: +0xC disconnect flag, refcounts, slot
-static constexpr int      GL_MAX_NODE = 512;
-struct GLNode { uint32_t addr, cbody; bool cb_valid; uint8_t node[GL_NODE_SZ]; uint8_t cb[GL_CB_SZ]; };
-static constexpr uint32_t GL_CONT_SZ = 0x100;      // connection container header (count, map root, list)
-static uint8_t  g_gl_pin[GL_PIN_SIZE];
-static GLNode   g_gl_nodes[GL_MAX_NODE];
-static int      g_gl_nnodes = 0;
-static uint8_t  g_gl_cont[GL_CONT_SZ];
-static uint32_t g_gl_cont_addr = 0;
-static uint32_t g_gl_off   = 0xFFFFFFFFu;          // byte offset of the object within cpp arena
+// ---- COMPLETE forward-state pin of the game-loop (render-dispatch) ScriptAPI graph ----
+// The game-loop ScriptAPI (cpp_arena::gameloop_addr, *0x49AFBC) is FORWARD-ONLY render
+// dispatch: the re-sim never runs it, so rolling its memory back leaves its boost::signals2
+// connection graph at N-k while the forward main-loop RunOneFrame expects N -> stale slot-list
+// -> shared_count use_count hits 0 -> spurious dispose -> heap-corruption abort. The graph is
+// a small, BOUNDED set of arena blocks (object + container + shared_count + connection
+// nodes/bodies; measured ~20 blocks / <1 KB — does NOT explode into sim). Pin it COMPLETELY:
+// on each forward capture, BFS EVERY block transitively reachable from the object through the
+// arena (validated by the 16-byte Hdr magic) and snapshot each; after every restore re-apply
+// them all. Complete capture is the key: earlier object+node-walk pins were INCOMPLETE (missed
+// blocks past +0x200, over-captured adjacent memory) -> left an inconsistency that still
+// aborted. Because the graph is bounded and self-contained, the forward bytes are internally
+// consistent and the cross-pointers reference deterministic (re-simmed-identical) sim
+// addresses. SQUIROLL_GL_PIN=1 to enable.
+static bool g_gl_pin_on = (getenv("SQUIROLL_GL_PIN") != nullptr);
+static constexpr uint32_t GL_BUF_SZ  = 4u * 1024 * 1024;     // forward bytes of the reachable graph
+static constexpr int      GL_MAX_BLK = 32768;
+struct GlBlk { uint32_t off, pos, len; };
+static uint8_t  g_gl_buf[GL_BUF_SZ];
+static GlBlk    g_gl_blks[GL_MAX_BLK];
+static int      g_gl_nblks = 0;
 static bool     g_gl_valid = false;
-// The forward-state pin of the game-loop render-dispatch graph is EXPERIMENTAL + default
-// OFF: pinning the object + walked list nodes helps most seeds reach end-of-test, but the
-// full graph (object + connection container's std::map + list + connection_bodies) is
-// bidirectionally entangled with the rolled-back sim, so any partial pin leaves an
-// inconsistency that still aborts on some seeds. SQUIROLL_GL_PIN=1 to enable for research.
-static bool     g_gl_pin_on = (getenv("SQUIROLL_GL_PIN") != nullptr);
+static int      g_gl_cap_use = -1;          // slot-list use_count at the last capture
 
-// Snapshot the FULL render-dispatch slot-list graph (object incl. embedded list+shared_count,
-// plus every connection node and its connection_body) as the live forward copy. The re-sim
-// never touches this graph, so without re-applying it the nodes stay rolled-back to N-k while
-// the forward RunOneFrame expects N -> it processes a stale node chain and drives the
-// shared_count use_count to 0 -> spurious dispose abort.
-static void gl_pin_save() {
-    uint32_t gla = cpp_arena::gameloop_addr();
-    uint32_t cb  = (uint32_t)(uintptr_t)cpp_arena::base();
-    uint32_t sz  = g_ar[CPP_ARENA].size;
-    if (!gla || gla < cb || (gla - cb) + GL_PIN_SIZE > sz) { g_gl_valid = false; return; }
-    g_gl_off = gla - cb;
-    memcpy(g_gl_pin, g_ar[CPP_ARENA].base + g_gl_off, GL_PIN_SIZE);
-    // The list: this+0 -> headp (the embedded list head, *gla); *headp = first real node.
-    // Nodes are doubly-linked (+0 next, +4 prev, +8 connection_body) and circular back to
-    // the head. Walk from the first node, pin each node validated by the doubly-linked
-    // invariant (prev->next == node), and STOP on cycle return (node revisits start/headp),
-    // a broken link (left the real list -> never pin adjacent sim state), or the cap.
-    g_gl_nnodes = 0;
-    uint32_t headp = *(uint32_t*)(uintptr_t)gla;
-    if (headp >= cb && headp + 4 <= cb + sz) {
-        uint32_t node = *(uint32_t*)(uintptr_t)headp;   // first node
-        while (node >= cb && node + GL_NODE_SZ <= cb + sz && g_gl_nnodes < GL_MAX_NODE) {
-            // Cycle detection: stop as soon as a node address repeats. The +0 chain is
-            // circular, so this terminates at exactly the distinct reachable nodes — no
-            // overshoot into adjacent sim state (which crashed at higher fixed caps).
-            bool seen = false;
-            for (int j = 0; j < g_gl_nnodes; ++j) if (g_gl_nodes[j].addr == node) { seen = true; break; }
-            if (seen) break;
-            GLNode& g = g_gl_nodes[g_gl_nnodes++];
-            g.addr = node;
-            memcpy(g.node, (const void*)(uintptr_t)node, GL_NODE_SZ);
-            uint32_t bd = *(uint32_t*)(uintptr_t)(node + 8);
-            g.cbody = bd;
-            g.cb_valid = (bd >= cb && bd + GL_CB_SZ <= cb + sz);
-            if (g.cb_valid) memcpy(g.cb, (const void*)(uintptr_t)bd, GL_CB_SZ);
-            node = *(uint32_t*)(uintptr_t)node;       // next
-        }
-        // pin the connection CONTAINER header (count, std::map root, list head — what the
-        // shared_count use_count tracks). H = *headp = container; RunOneFrame uses **this.
-        uint32_t H = *(uint32_t*)(uintptr_t)headp;
-        if (H >= cb && H + GL_CONT_SZ <= cb + sz) { g_gl_cont_addr = H; memcpy(g_gl_cont, (const void*)(uintptr_t)H, GL_CONT_SZ); }
-        else g_gl_cont_addr = 0;
-    }
-    g_gl_valid = true;
-    static int ns = 0;
-    if (ns < 12) { ++ns; log_printf("[glpin] SAVE off=%X use=%d headp=%08X nodes=%d\n",
-                                    g_gl_off, *(int*)(g_ar[CPP_ARENA].base + g_gl_off + 0x1C4),
-                                    headp, g_gl_nnodes); }
+// Validate that an arena offset is the payload of a live block (16-byte Hdr at off-16,
+// magic 'CAPB' at off-4, cls in [4,24]); returns the block's alloc size or 0.
+static uint32_t gl_block_size(const uint8_t* base, uint32_t sz, uint32_t off) {
+    if (off < 16 || off >= sz || (off & 15)) return 0;
+    if (*(const uint32_t*)(base + off - 4) != 0x42504143u) return 0;
+    uint32_t cls = *(const uint32_t*)(base + off - 16);
+    if (cls < 4 || cls > 24) return 0;
+    return 1u << cls;
 }
+static uint8_t  g_bfs_bits[(128u * 1024 * 1024 / 16) / 8];   // 1 MB: seen-bit per 16-byte slot
+
 static void gl_apply(uint32_t off, const uint8_t* src, uint32_t len) {
     Arena& A = g_ar[CPP_ARENA];
     memcpy(A.base + off, src, len);
@@ -379,23 +337,125 @@ static void gl_apply(uint32_t off, const uint8_t* src, uint32_t len) {
     for (uint32_t o = off & ~(PAGE - 1); o < off + len; o += PAGE)
         A.phash[o / PAGE] = hash_page(A.base + (o & ~(PAGE - 1)));
 }
-static void gl_pin_restore() {                        // re-apply the forward graph after a rollback
-    if (!g_gl_valid || g_gl_off == 0xFFFFFFFFu) return;
-    uint32_t cb = (uint32_t)(uintptr_t)g_ar[CPP_ARENA].base;
-    gl_apply(g_gl_off, g_gl_pin, GL_PIN_SIZE);        // object (list head + shared_count)
-    // NB: pinning the container header (count + std::map root) made it WORSE — the map's
-    // tree nodes stay rolled-back, so a forward root/count over a rolled-back tree is more
-    // inconsistent. The render-dispatch graph isn't safely pinnable in pieces. (kept off)
-    (void)g_gl_cont_addr;
-    for (int i = 0; i < g_gl_nnodes; ++i) {
-        GLNode& g = g_gl_nodes[i];
-        gl_apply(g.addr - cb, g.node, GL_NODE_SZ);    // the list node
-        if (g.cb_valid) gl_apply(g.cbody - cb, g.cb, GL_CB_SZ);   // its connection_body
+
+// FORWARD save: BFS every block reachable from the game-loop object and copy its payload.
+static void gl_pin_save() {
+    g_gl_valid = false; g_gl_nblks = 0;
+    const uint8_t* base = g_ar[CPP_ARENA].base;
+    uint32_t cb = (uint32_t)(uintptr_t)base, sz = g_ar[CPP_ARENA].size;
+    uint32_t gla = cpp_arena::gameloop_addr();
+    if (!gla || gla < cb) return;
+    uint32_t seed = gla - cb;
+    if (!gl_block_size(base, sz, seed)) return;
+    // Only refresh the snapshot from a KNOWN-GOOD slot-list (use_count == 1 = just the
+    // signal's ref). A prior rollback can leave the use_count corrupted at 0 even at the
+    // RunOneFrame-end; capturing that 0 and re-applying it perpetuates the dispose crash.
+    // At this (stable) capture point the count is 1 the vast majority of frames, so keeping
+    // the last good snapshot over a rare corrupt one is fresh, not stale.
+    {
+        uint32_t scv0 = *(const uint32_t*)(base + seed + 4);
+        int u0 = (scv0 >= cb && scv0 + 8 <= cb + sz) ? *(const int*)(base + (scv0 - cb) + 4) : -9;
+        if (u0 != 1 && g_gl_valid) return;        // keep last good capture
     }
-    static int nr = 0;
-    if (nr < 12) { ++nr; log_printf("[glpin] RESTORE off=%X use=%d nodes=%d\n",
-                                    g_gl_off, *(int*)(g_gl_pin + 0x1C4), g_gl_nnodes); }
+    memset(g_bfs_bits, 0, sizeof g_bfs_bits);
+    uint32_t pos = 0; int head = 0;
+    g_gl_blks[g_gl_nblks++] = { seed, 0, 0 };
+    g_bfs_bits[(seed / 16) >> 3] |= (uint8_t)(1u << ((seed / 16) & 7));
+    while (head < g_gl_nblks && g_gl_nblks < GL_MAX_BLK) {
+        uint32_t off = g_gl_blks[head].off;
+        uint32_t paylen = gl_block_size(base, sz, off) - 16;
+        if (pos + paylen > GL_BUF_SZ) break;          // out of buffer — stop (logged below)
+        g_gl_blks[head].pos = pos; g_gl_blks[head].len = paylen;
+        memcpy(g_gl_buf + pos, base + off, paylen);
+        pos += paylen;
+        const uint32_t* dw = (const uint32_t*)(base + off);
+        for (uint32_t i = 0; i < paylen / 4; ++i) {
+            uint32_t d = dw[i];
+            if (d < cb || d >= cb + sz) continue;
+            uint32_t toff = d - cb;
+            if (!gl_block_size(base, sz, toff)) continue;
+            uint32_t bit = toff / 16;
+            if (g_bfs_bits[bit >> 3] & (1u << (bit & 7))) continue;
+            g_bfs_bits[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+            if (g_gl_nblks < GL_MAX_BLK) g_gl_blks[g_gl_nblks++] = { toff, 0, 0 };
+        }
+        ++head;
+    }
+    g_gl_valid = true;
+    // diag: the game-loop slot-list use_count being captured (sc = *(gla+4), use at sc+4)
+    uint32_t scv = *(const uint32_t*)(base + seed + 4); int u = -9; bool insc = (scv >= cb && scv + 8 <= cb + sz);
+    if (insc) u = *(const int*)(base + (scv - cb) + 4);
+    g_gl_cap_use = u;
+    static int ns = 0;
+    if (ns < 40 && (u != 1 || ns < 8)) { ++ns; log_printf("[glpin] SAVE blocks=%d bytes=%u use=%d capped=%d\n",
+                                   g_gl_nblks, pos, u, g_gl_nblks >= GL_MAX_BLK); }
 }
+// After a rollback restore, re-apply every captured forward block.
+static int gl_live_use() {   // current game-loop slot-list use_count (or sentinel)
+    const uint8_t* base = g_ar[CPP_ARENA].base;
+    uint32_t cb = (uint32_t)(uintptr_t)base, sz = g_ar[CPP_ARENA].size;
+    uint32_t gla = cpp_arena::gameloop_addr();
+    if (!gla || gla < cb + 4 || gla >= cb + sz) return -9;
+    uint32_t scv = *(const uint32_t*)(base + (gla - cb) + 4);
+    if (scv < cb || scv + 8 > cb + sz) return -8;
+    return *(const int*)(base + (scv - cb) + 4);
+}
+static void gl_pin_restore() {
+    if (!g_gl_valid) return;
+    int before = gl_live_use();
+    for (int i = 0; i < g_gl_nblks; ++i)
+        if (g_gl_blks[i].len) gl_apply(g_gl_blks[i].off, g_gl_buf + g_gl_blks[i].pos, g_gl_blks[i].len);
+    int after = gl_live_use();
+    static int nr = 0;
+    if (nr < 30 && (before <= 0 || after != 1)) { ++nr;
+        log_printf("[glpin] RESTORE use before=%d after=%d (cap_use=%d) blocks=%d\n",
+                   before, after, g_gl_cap_use, g_gl_nblks); }
+}
+
+// kept for the one-shot reachability log
+static uint32_t g_bfs_q[1u << 16];
+static void gl_bfs_measure() {
+    static bool done = false;
+    if (done) return;
+    const uint8_t* base = g_ar[CPP_ARENA].base;
+    uint32_t cb = (uint32_t)(uintptr_t)base, sz = g_ar[CPP_ARENA].size;
+    uint32_t gla = cpp_arena::gameloop_addr();
+    if (!gla || gla < cb) return;
+    uint32_t seed = gla - cb;
+    if (!gl_block_size(base, sz, seed)) { return; }
+    done = true;
+    memset(g_bfs_bits, 0, sizeof g_bfs_bits);
+    int qn = 0, head = 0; uint64_t total = 0;
+    g_bfs_q[qn++] = seed; g_bfs_bits[(seed / 16) >> 3] |= (uint8_t)(1u << ((seed / 16) & 7));
+    while (head < qn && qn < (int)(1u << 16)) {
+        uint32_t off = g_bfs_q[head++];
+        uint32_t blk = gl_block_size(base, sz, off);
+        if (!blk) continue;
+        uint32_t paylen = blk - 16;
+        total += paylen;
+        const uint32_t* dw = (const uint32_t*)(base + off);
+        for (uint32_t i = 0; i < paylen / 4; ++i) {
+            uint32_t d = dw[i];
+            if (d < cb || d >= cb + sz) continue;
+            uint32_t toff = d - cb;
+            if (!gl_block_size(base, sz, toff)) continue;
+            uint32_t bit = toff / 16;
+            if (g_bfs_bits[bit >> 3] & (1u << (bit & 7))) continue;
+            g_bfs_bits[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+            if (qn < (int)(1u << 16)) g_bfs_q[qn++] = toff;
+        }
+    }
+    uint32_t seedblk = gl_block_size(base, sz, seed);
+    log_printf("[bfs] game-loop graph: seed_off=%X seed_blk=%u blocks=%d total_bytes=%llu capped=%d\n",
+               seed, seedblk, qn, (unsigned long long)total, qn >= (int)(1u << 16));
+    for (int k = 0; k < qn && k < 10; ++k)
+        log_printf("[bfs]   blk[%d] off=%X size=%u\n", k, g_bfs_q[k], gl_block_size(base, sz, g_bfs_q[k]));
+}
+
+// Capture the game-loop render-dispatch graph at a STABLE point (called from the game-loop
+// ScriptAPI's RunOneFrame end, where its slot-list refcount is balanced). Re-applied after
+// every rollback restore so the forward-only render state never rolls back.
+void gl_capture() { if (g_gl_pin_on && g_armed) gl_pin_save(); }
 
 uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
     if (!g_armed) return 0;
@@ -405,8 +465,9 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
     // a re-sim re-capture from a fresh forward save of frame N.
     const bool re_capture_diag = (S.frame == (int32_t)frame);
     S.frame = (int32_t)frame;
-    // FORWARD save only: record the live game-loop ScriptAPI object as the pin source.
-    if (!re_capture_diag && g_gl_pin_on) gl_pin_save();
+    // NB: the game-loop graph snapshot is NOT taken here (capture() can fire mid-RunOneFrame,
+    // an unbalanced lock state). It's taken at the stable RunOneFrame end via gl_capture().
+    if (!re_capture_diag && g_gl_pin_on) gl_bfs_measure();
 
     LARGE_INTEGER pt0; QueryPerformanceCounter(&pt0);
     uint64_t t_ww = 0, t_dirty = 0;

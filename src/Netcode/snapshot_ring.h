@@ -46,6 +46,13 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len);
 // window (a hard error — logged).
 const uint8_t* restore(uint32_t frame, uint32_t* sblob_len);
 
+// Snapshot the game-loop (forward-only render-dispatch) ScriptAPI's reachable arena graph
+// as the live forward copy. Call at the STABLE end of that ScriptAPI's RunOneFrame (balanced
+// slot-list refcount). The graph is re-applied after every rollback restore so this render
+// state never rolls back into an inconsistent state (the ~f40-70 shared_count abort).
+// No-op unless SQUIROLL_GL_PIN is set and the session is armed.
+void gl_capture();
+
 } // namespace snapshot_ring
 
 #endif // SNAPSHOT_RING_H
