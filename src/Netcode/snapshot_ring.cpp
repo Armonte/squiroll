@@ -326,6 +326,10 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
         for (ULONG_PTR i = 0; i < count; ++i) {
             uint32_t off = (uint32_t)((uint8_t*)g_pgbuf[i] - A.base);
             if (off + PAGE > A.size) continue;
+            // NB: tried skipping the cpp render region [112MB,end) from capture to take
+            // forward-only render state out of rollback — but the SIM holds references
+            // INTO render objects, so dangling them broke sq/eng. Render and sim are not
+            // cleanly separable at the page level. Reverted.
             // NB: we do NOT skip TF4_Number HUD pages from CAPTURE — the small digit
             // buffers share 4KB pages with rollback-critical data, so dropping whole
             // pages from the snapshot loses that data (divergence + crash). The pages

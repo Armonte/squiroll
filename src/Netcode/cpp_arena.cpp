@@ -282,6 +282,15 @@ static void thiscall runone_hook(int self) {
         ::actor2d_log::watch_arm(gb + 0x5B6C19C);
     }
     static int n = 0;
+    // One-shot: are the main game-loop ScriptAPI (g_gameloop_scriptapi @0x49AFBC) and
+    // the sim ScriptAPI (advance_one_frame drives *0x49B01C) the SAME object? Decides
+    // whether the crash's render-connection list can be excluded as a whole ScriptAPI.
+    static bool dumped_api = false;
+    if (!dumped_api) {
+        dumped_api = true;
+        log_printf("[api] gameloop_api=%08X sim_api=%08X this=%08X\n",
+                   *(uint32_t*)(0x49AFBC_R), *(uint32_t*)(0x49B01C_R), (uint32_t)self);
+    }
     // Log a few of EACH: forward (rb==0) and re-sim (rb>0). The ScriptAPI `this`
     // that appears under rb==0 but NEVER under rb>0 is the forward-only draw path.
     static int nf = 0, nr = 0;
@@ -290,6 +299,12 @@ static void thiscall runone_hook(int self) {
         log_printf("[runone] this=%08X rb=%d\n", (uint32_t)self, rb);
     }
     (void)n;
+    // NB: tried routing the game-loop ScriptAPI's (g_gameloop_scriptapi @0x49AFBC, the
+    // FORWARD-ONLY render dispatch — separate from the re-sim's sim ScriptAPI @0x49B01C)
+    // RunOneFrame allocations to the render region + skipping that region from the
+    // snapshot, to take render-dispatch state out of rollback (the crash = its restored
+    // connection list referencing freed objects). But the SIM references render objects,
+    // so excluding the region broke sq/eng. Render/sim aren't page-separable. Reverted.
     g_h_runone.unsafe_thiscall<int>(self);
 }
 
