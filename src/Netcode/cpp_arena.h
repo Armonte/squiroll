@@ -69,6 +69,13 @@ bool is_armed();
 // render-effect connection-node leak out of the sim bump.
 void set_render_pass(bool on);
 
+// Runtime address of the game-loop (forward-only render-dispatch) ScriptAPI object
+// (*0x49AFBC). Its boost::signals2 slot-list shared_count is embedded in the object; the
+// re-sim never runs this ScriptAPI, so rolling it back reverts the use_count to a dead
+// state -> spurious dispose -> HasPendingFrame abort. snapshot_ring forward-state-pins
+// this object across rollback (save on forward capture, re-apply after each restore).
+uint32_t gameloop_addr();
+
 // True if this cpp-arena page holds TF4_Number HUD digit geometry (render-derived
 // display, excluded from rollback). snapshot_ring skips these in capture/restore and
 // in the divergence diagnostic. Pages are registered as numbers update each frame.

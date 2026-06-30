@@ -270,17 +270,6 @@ static void thiscall numdigit_hook(int self, int value) {
 // ScriptAPI the re-sim skips (advance_one_frame's main+bg run on both rb=0 and rb>0).
 static SafetyHookInline g_h_runone{};
 static void thiscall runone_hook(int self) {
-    // Arm a Dr0 write-watch on the diverging trail U field (cpp off 0x5B6C19C) on the
-    // main thread at f>=3, so the VEH names the EXACT writer rva + side (rb). Settles
-    // who really writes the trail vertex buffer (generate_trail_mesh is never called).
-    static bool t_armed = false;
-    if (!t_armed && gekko_bridge::g_trace_frame >= 3) {
-        t_armed = true;
-        uint32_t gb = (uint32_t)(uintptr_t)g_base;
-        log_printf("[trailarm] f=%d gbase=%08X -> arm %08X\n",
-                   gekko_bridge::g_trace_frame, gb, gb + 0x5B6C19C);
-        ::actor2d_log::watch_arm(gb + 0x5B6C19C);
-    }
     static int n = 0;
     // One-shot: are the main game-loop ScriptAPI (g_gameloop_scriptapi @0x49AFBC) and
     // the sim ScriptAPI (advance_one_frame drives *0x49B01C) the SAME object? Decides
@@ -306,6 +295,35 @@ static void thiscall runone_hook(int self) {
     // connection list referencing freed objects). But the SIM references render objects,
     // so excluding the region broke sq/eng. Render/sim aren't page-separable. Reverted.
     g_h_runone.unsafe_thiscall<int>(self);
+}
+
+// DIAG: confirm the slot-list shared_count divergence. signal_lock_slot_list (0x304F0)
+// reads the signal's slot-list shared_ptr from the ScriptAPI object: this+0 = list head,
+// this+4 = shared_count control block (sc+4 = use_count, sc+8 = weak_count). The crash
+// (HasPendingFrame 0x2FA7E) fires only if use_count is driven to 0 by the rollback. Log
+// the game-loop ScriptAPI's signal state at HasPendingFrame entry, tagged frame/rb, to
+// catch use_count dropping to 0 (and the exact sc address to decouple).
+static SafetyHookInline g_h_haspend{};
+static char thiscall haspend_hook(int self) {
+    uint32_t head = *(uint32_t*)(self + 0);
+    uint32_t sc   = *(uint32_t*)(self + 4);
+    uint32_t gb = (uint32_t)(uintptr_t)g_base;
+    bool in_arena = (sc >= gb && sc < gb + ARENA_SIZE);
+    int use = -2, weak = -2;
+    if (in_arena) { use = *(int*)(sc + 4); weak = *(int*)(sc + 8); }
+    bool gl = ((uint32_t)self == *(uint32_t*)(0x49AFBC_R));
+    // DANGER = the release decrement will hit 0 (use<=0 going in) or sc is a bad ptr.
+    // use==1 is HEALTHY (signal holds 1 ref). Log every danger (any ScriptAPI).
+    bool danger = (!in_arena) || (use <= 0);
+    static int n = 0;
+    if (n < 600 && danger) {
+        ++n;
+        log_printf("[haspend] f=%d rb=%d self=%08X%s head=%08X sc=%08X(%s) use=%d weak=%d  <-DANGER\n",
+                   gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb, (uint32_t)self,
+                   gl ? "*GL" : "", head, sc, in_arena ? "arena" : "OUT", use, weak);
+    }
+    (void)head;
+    return g_h_haspend.unsafe_thiscall<char>(self);
 }
 
 // concurrent_list_erase_node (0x13D80) — __thiscall(container, out, key, node_ref).
@@ -835,6 +853,7 @@ void install() {
     g_h_runone    = safetyhook::create_inline((void*)(0x2FAD0_R),  (void*)runone_hook);
     g_h_pendframes= safetyhook::create_inline((void*)(0x591D0_R),  (void*)pendframes_hook);
     g_h_numdigit  = safetyhook::create_inline((void*)(0x158A40_R), (void*)numdigit_hook);
+    g_h_haspend   = safetyhook::create_inline((void*)(0x2FA00_R),  (void*)haspend_hook);
     // numdispose hook NOT installed: proven not the crash (0x64D80 Number-dispose is never
     // called during the rollback). The ~f60-70 abort is the game-loop ScriptAPI's slot-list
     // shared_count release in HasPendingFrame (0x2FA7E) / RunOneFrame, not a Number free.
@@ -894,6 +913,9 @@ bool     is_armed()         { return g_armed; }
 void     set_render_pass(bool on) { g_render_pass = on; }
 bool     is_excluded_page(uint32_t pg) {           // TF4_Number HUD digit-geometry pages
     return pg < ARENA_PAGES && (g_num_pages[pg >> 5] & (1u << (pg & 31)));
+}
+uint32_t gameloop_addr() {                         // *0x49AFBC = game-loop render-dispatch ScriptAPI
+    return *(uint32_t*)(0x49AFBC_R);
 }
 
 // ------------------------------------------------------------ trail determinism --

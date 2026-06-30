@@ -295,6 +295,108 @@ static uint32_t fold_checksum(const uint8_t* sblob, uint32_t sblob_len) {
 }
 } // namespace
 
+// ---- Forward-state pin of the game-loop (render-dispatch) ScriptAPI object ----
+// The game-loop ScriptAPI (cpp_arena::gameloop_addr, *0x49AFBC) is FORWARD-ONLY: the
+// re-sim never runs it, so rolling its bytes back reverts the embedded boost::signals2
+// slot-list shared_count's use_count to a dead state -> HasPendingFrame's release decrement
+// hits 0 -> spurious dispose -> heap-corruption abort (~f60-70). Pin it: snapshot the object
+// on each FORWARD capture, and after every restore re-apply the live forward copy so the
+// render-dispatch signal state never rolls back. Object-level (the object's bytes restored
+// individually) NOT page-level — avoids the sim/render page entanglement that broke sq/eng.
+static constexpr uint32_t GL_PIN_SIZE = 0x200;     // covers the signal: list head +0x40 .. sc +0x1C0
+static constexpr uint32_t GL_NODE_SZ  = 0x10;      // boost::signals2 list node: +0 next +4 prev +8 conn_body
+static constexpr uint32_t GL_CB_SZ    = 0x80;      // connection_body: +0xC disconnect flag, refcounts, slot
+static constexpr int      GL_MAX_NODE = 512;
+struct GLNode { uint32_t addr, cbody; bool cb_valid; uint8_t node[GL_NODE_SZ]; uint8_t cb[GL_CB_SZ]; };
+static constexpr uint32_t GL_CONT_SZ = 0x100;      // connection container header (count, map root, list)
+static uint8_t  g_gl_pin[GL_PIN_SIZE];
+static GLNode   g_gl_nodes[GL_MAX_NODE];
+static int      g_gl_nnodes = 0;
+static uint8_t  g_gl_cont[GL_CONT_SZ];
+static uint32_t g_gl_cont_addr = 0;
+static uint32_t g_gl_off   = 0xFFFFFFFFu;          // byte offset of the object within cpp arena
+static bool     g_gl_valid = false;
+// The forward-state pin of the game-loop render-dispatch graph is EXPERIMENTAL + default
+// OFF: pinning the object + walked list nodes helps most seeds reach end-of-test, but the
+// full graph (object + connection container's std::map + list + connection_bodies) is
+// bidirectionally entangled with the rolled-back sim, so any partial pin leaves an
+// inconsistency that still aborts on some seeds. SQUIROLL_GL_PIN=1 to enable for research.
+static bool     g_gl_pin_on = (getenv("SQUIROLL_GL_PIN") != nullptr);
+
+// Snapshot the FULL render-dispatch slot-list graph (object incl. embedded list+shared_count,
+// plus every connection node and its connection_body) as the live forward copy. The re-sim
+// never touches this graph, so without re-applying it the nodes stay rolled-back to N-k while
+// the forward RunOneFrame expects N -> it processes a stale node chain and drives the
+// shared_count use_count to 0 -> spurious dispose abort.
+static void gl_pin_save() {
+    uint32_t gla = cpp_arena::gameloop_addr();
+    uint32_t cb  = (uint32_t)(uintptr_t)cpp_arena::base();
+    uint32_t sz  = g_ar[CPP_ARENA].size;
+    if (!gla || gla < cb || (gla - cb) + GL_PIN_SIZE > sz) { g_gl_valid = false; return; }
+    g_gl_off = gla - cb;
+    memcpy(g_gl_pin, g_ar[CPP_ARENA].base + g_gl_off, GL_PIN_SIZE);
+    // The list: this+0 -> headp (the embedded list head, *gla); *headp = first real node.
+    // Nodes are doubly-linked (+0 next, +4 prev, +8 connection_body) and circular back to
+    // the head. Walk from the first node, pin each node validated by the doubly-linked
+    // invariant (prev->next == node), and STOP on cycle return (node revisits start/headp),
+    // a broken link (left the real list -> never pin adjacent sim state), or the cap.
+    g_gl_nnodes = 0;
+    uint32_t headp = *(uint32_t*)(uintptr_t)gla;
+    if (headp >= cb && headp + 4 <= cb + sz) {
+        uint32_t node = *(uint32_t*)(uintptr_t)headp;   // first node
+        while (node >= cb && node + GL_NODE_SZ <= cb + sz && g_gl_nnodes < GL_MAX_NODE) {
+            // Cycle detection: stop as soon as a node address repeats. The +0 chain is
+            // circular, so this terminates at exactly the distinct reachable nodes — no
+            // overshoot into adjacent sim state (which crashed at higher fixed caps).
+            bool seen = false;
+            for (int j = 0; j < g_gl_nnodes; ++j) if (g_gl_nodes[j].addr == node) { seen = true; break; }
+            if (seen) break;
+            GLNode& g = g_gl_nodes[g_gl_nnodes++];
+            g.addr = node;
+            memcpy(g.node, (const void*)(uintptr_t)node, GL_NODE_SZ);
+            uint32_t bd = *(uint32_t*)(uintptr_t)(node + 8);
+            g.cbody = bd;
+            g.cb_valid = (bd >= cb && bd + GL_CB_SZ <= cb + sz);
+            if (g.cb_valid) memcpy(g.cb, (const void*)(uintptr_t)bd, GL_CB_SZ);
+            node = *(uint32_t*)(uintptr_t)node;       // next
+        }
+        // pin the connection CONTAINER header (count, std::map root, list head — what the
+        // shared_count use_count tracks). H = *headp = container; RunOneFrame uses **this.
+        uint32_t H = *(uint32_t*)(uintptr_t)headp;
+        if (H >= cb && H + GL_CONT_SZ <= cb + sz) { g_gl_cont_addr = H; memcpy(g_gl_cont, (const void*)(uintptr_t)H, GL_CONT_SZ); }
+        else g_gl_cont_addr = 0;
+    }
+    g_gl_valid = true;
+    static int ns = 0;
+    if (ns < 12) { ++ns; log_printf("[glpin] SAVE off=%X use=%d headp=%08X nodes=%d\n",
+                                    g_gl_off, *(int*)(g_ar[CPP_ARENA].base + g_gl_off + 0x1C4),
+                                    headp, g_gl_nnodes); }
+}
+static void gl_apply(uint32_t off, const uint8_t* src, uint32_t len) {
+    Arena& A = g_ar[CPP_ARENA];
+    memcpy(A.base + off, src, len);
+    memcpy(A.mirror + off, src, len);                 // keep mirror in sync (no spurious delta)
+    for (uint32_t o = off & ~(PAGE - 1); o < off + len; o += PAGE)
+        A.phash[o / PAGE] = hash_page(A.base + (o & ~(PAGE - 1)));
+}
+static void gl_pin_restore() {                        // re-apply the forward graph after a rollback
+    if (!g_gl_valid || g_gl_off == 0xFFFFFFFFu) return;
+    uint32_t cb = (uint32_t)(uintptr_t)g_ar[CPP_ARENA].base;
+    gl_apply(g_gl_off, g_gl_pin, GL_PIN_SIZE);        // object (list head + shared_count)
+    // NB: pinning the container header (count + std::map root) made it WORSE — the map's
+    // tree nodes stay rolled-back, so a forward root/count over a rolled-back tree is more
+    // inconsistent. The render-dispatch graph isn't safely pinnable in pieces. (kept off)
+    (void)g_gl_cont_addr;
+    for (int i = 0; i < g_gl_nnodes; ++i) {
+        GLNode& g = g_gl_nodes[i];
+        gl_apply(g.addr - cb, g.node, GL_NODE_SZ);    // the list node
+        if (g.cb_valid) gl_apply(g.cbody - cb, g.cb, GL_CB_SZ);   // its connection_body
+    }
+    static int nr = 0;
+    if (nr < 12) { ++nr; log_printf("[glpin] RESTORE off=%X use=%d nodes=%d\n",
+                                    g_gl_off, *(int*)(g_gl_pin + 0x1C4), g_gl_nnodes); }
+}
+
 uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
     if (!g_armed) return 0;
     Slot& S = g_ring[frame % RING];
@@ -303,6 +405,8 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
     // a re-sim re-capture from a fresh forward save of frame N.
     const bool re_capture_diag = (S.frame == (int32_t)frame);
     S.frame = (int32_t)frame;
+    // FORWARD save only: record the live game-loop ScriptAPI object as the pin source.
+    if (!re_capture_diag && g_gl_pin_on) gl_pin_save();
 
     LARGE_INTEGER pt0; QueryPerformanceCounter(&pt0);
     uint64_t t_ww = 0, t_dirty = 0;
@@ -776,6 +880,13 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
         }
     }
     g_cur = target;
+
+    // Forward-state pin: the reverse-apply above rolled the game-loop ScriptAPI object
+    // (render-dispatch, forward-only) back to `target`, reverting its slot-list shared_count
+    // use_count to a dead state. Re-apply the live forward copy so HasPendingFrame/RunOneFrame
+    // see a valid refcount instead of disposing a live signal. Done BEFORE ResetWriteWatch so
+    // these writes don't show up as the re-sim's dirty pages.
+    if (g_gl_pin_on) gl_pin_restore();
 
     // Discard the write-watch entries our own restore writes just produced,
     // so the next capture sees only the re-sim advance's dirty pages.
