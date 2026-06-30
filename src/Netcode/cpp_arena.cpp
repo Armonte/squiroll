@@ -241,12 +241,27 @@ static void thiscall pendframes_hook(int self) {
 // re-sim (reading the live, non-rolled-back counter at varying real-times) writes
 // different digits -> the residual cpp divergence (proven via Dr0 -> set_number_digit_
 // display -> gauge_vs.nut FPS). Force GetFPS deterministic; the overlay just freezes.
-// set_number_digit_display passthrough (kept as an anchor for the TF4_Number digit
-// determinism investigation). The FPS overlay — the dominant residual cpp divergence —
-// is fixed by the GetFPS patch in install(); the combo/damage numbers' render-built
-// geometry (game-loop, post-save) is a smaller residual (f=27+) still being chased.
+// HUD-number geometry exclusion. Every TF4_Number's per-digit quad buffer (this+84,
+// up to this+108 digits * 80 bytes) is render-derived display geometry living in the
+// cpp arena. The number OBJECT (incl. value/refcounts) lives in a non-rolled-back
+// real-heap NetworkNode pool, so rolling back only the geometry makes them inconsistent
+// -> residual cpp divergence (combo/damage at f=27+) + likely the shared_ptr-deleter
+// crash. Record these pages here (set_number_digit_display sees every number each frame)
+// and EXCLUDE them from snapshot capture/restore + the divergence diagnostic, so the
+// numbers are fully out of rollback (re-rendered each frame from the live value).
+static constexpr uint32_t ARENA_PAGES = ARENA_SIZE / 4096u;
+static uint32_t g_num_pages[ARENA_PAGES / 32];   // bitset of excluded cpp pages
 static SafetyHookInline g_h_numdigit{};
 static void thiscall numdigit_hook(int self, int value) {
+    uint32_t buf  = *(uint32_t*)(self + 84);
+    uint32_t base = (uint32_t)(uintptr_t)g_base;
+    if (base && buf >= base && buf < base + ARENA_SIZE) {
+        uint32_t bytes = (*(uint32_t*)(self + 108) + 2u) * 80u;   // digits*80 + slack
+        uint32_t p0 = (buf - base) / 4096u;
+        uint32_t p1 = (buf - base + bytes) / 4096u;
+        for (uint32_t pg = p0; pg <= p1 && pg < ARENA_PAGES; ++pg)
+            g_num_pages[pg >> 5] |= (1u << (pg & 31));
+    }
     g_h_numdigit.unsafe_thiscall<void>(self, value);
 }
 
@@ -857,6 +872,9 @@ void trace_alloc(uint32_t addr) {
 void     set_armed(bool on) { g_armed = on; }
 bool     is_armed()         { return g_armed; }
 void     set_render_pass(bool on) { g_render_pass = on; }
+bool     is_excluded_page(uint32_t pg) {           // TF4_Number HUD digit-geometry pages
+    return pg < ARENA_PAGES && (g_num_pages[pg >> 5] & (1u << (pg & 31)));
+}
 
 // ------------------------------------------------------------ trail determinism --
 // B1: the motion-trail (Manbow::TrailLayer) ribbon VERTEX BUFFER is the sole real

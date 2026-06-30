@@ -69,6 +69,11 @@ bool is_armed();
 // render-effect connection-node leak out of the sim bump.
 void set_render_pass(bool on);
 
+// True if this cpp-arena page holds TF4_Number HUD digit geometry (render-derived
+// display, excluded from rollback). snapshot_ring skips these in capture/restore and
+// in the divergence diagnostic. Pages are registered as numbers update each frame.
+bool is_excluded_page(uint32_t pg);
+
 // B1 trail determinism: rebuild every active Manbow::TrailLayer ribbon mesh from its
 // (deterministic) circular-buffer positions into its persistent cpp-arena vertex
 // buffer. Call at the end of each advance (fwd AND re-sim) so the snapshot captures

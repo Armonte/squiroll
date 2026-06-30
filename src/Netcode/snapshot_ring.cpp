@@ -56,11 +56,11 @@ struct TrackedPage {
     bool     captured;
 };
 static TrackedPage g_tracked[] = {
-    {23396, {}, false},   // REAL divergent (below bump, in checksum) 0x5B64000
-    {23404, {}, false},   // REAL divergent (below bump, in checksum) 0x5B6C000
+    {23739, {}, false},   // RESIDUAL (post FPS-fix + HUD-geom exclude) — the combo's ptr target
+    {23396, {}, false},   // combo digit geometry (now excluded from diagnostic)
+    {23404, {}, false},   // FPS digit geometry (fixed by GetFPS patch)
     {23397, {}, false},   // boost::signals2 connection_body
-    {23744, {}, false},   // (above bump — harmless leftover)
-    {23749, {}, false},   // (above bump — harmless leftover)
+    {8222,  {}, false},   // residual
     {10234, {}, false},   // boost::log shared_count
 };
 static constexpr int N_TRACKED =
@@ -326,6 +326,11 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
         for (ULONG_PTR i = 0; i < count; ++i) {
             uint32_t off = (uint32_t)((uint8_t*)g_pgbuf[i] - A.base);
             if (off + PAGE > A.size) continue;
+            // NB: we do NOT skip TF4_Number HUD pages from CAPTURE — the small digit
+            // buffers share 4KB pages with rollback-critical data, so dropping whole
+            // pages from the snapshot loses that data (divergence + crash). The pages
+            // still roll back; they're only excluded from the divergence DIAGNOSTIC
+            // (cppb/[comp]/divf below) so the HUD-number render geometry doesn't flag.
             if (dp + REC > dend) {
                 log_printf("[snapshot_ring] !! delta overflow arena=%d f=%u "
                            "(%u pages) — raise DELTA_CAP\n", a, frame,
@@ -452,7 +457,10 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             uint32_t upg  = (bump + PAGE - 1) / PAGE;
             if (upg > g_ar[a].npages) upg = g_ar[a].npages;
             uint32_t h = 2166136261u;
-            for (uint32_t pg = 0; pg < upg; ++pg) { h ^= g_ar[a].phash[pg]; h *= 16777619u; }
+            for (uint32_t pg = 0; pg < upg; ++pg) {
+                if (a == CPP_ARENA && cpp_arena::is_excluded_page(pg)) continue;  // HUD numbers
+                h ^= g_ar[a].phash[pg]; h *= 16777619u;
+            }
             hc[a] = h;
         }
         // DEFINITIVE: real dword-hash of cpp bytes [0, bump) — independent of the
@@ -464,7 +472,10 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             cppb = 2166136261u;
             const uint32_t* dw = (const uint32_t*)g_ar[CPP_ARENA].base;
             uint32_t ndw = bc[CPP_ARENA] / 4;
-            for (uint32_t i = 0; i < ndw; ++i) { cppb ^= dw[i]; cppb *= 16777619u; }
+            for (uint32_t i = 0; i < ndw; ++i) {
+                if (cpp_arena::is_excluded_page((i * 4) / PAGE)) continue;  // HUD numbers
+                cppb ^= dw[i]; cppb *= 16777619u;
+            }
         }
         log_printf("[comp] f=%u sq=%08x/%u bt=%08x/%u cpp=%08x/%u cppb=%08x %s\n",
                    frame, hc[0], bc[0], hc[1], bc[1], hc[2], bc[2], cppb,
@@ -490,6 +501,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                 // a CONTENT write at a stable address — trace which pages/dwords.
                 int hits = 0;
                 for (uint32_t pg = 0; pg < g_ar[a].npages && hits < 6; ++pg) {
+                    if (a == CPP_ARENA && cpp_arena::is_excluded_page(pg)) continue;  // HUD numbers
                     if (S.phash_snap[a][pg] != g_ar[a].phash[pg]) {
                         log_printf("[divf] %s f=%u pg=%u off=0x%X "
                                    "fwd_hash=%08x now=%08x\n",
