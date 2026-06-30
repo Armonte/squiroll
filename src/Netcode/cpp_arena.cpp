@@ -803,6 +803,47 @@ static uintptr_t cdecl hook_beginthreadex(void* sec, unsigned stk, void* start,
     return h;
 }
 
+// DETERMINISM: the render-only scripts (HUD/effect) that build the boost::signals2
+// render-dispatch list read real-time via two Squirrel bindings — sq_push_current_time_ms
+// (0x49450 -> timeGetTime) and script_get_async_key_state (0x129D40 -> GetAsyncKeyState).
+// With identical inputs the SIM is deterministic, but these make the RENDER (and thus the
+// dispatch list it builds/tears-down) vary with wall-clock, so the rollback corrupts a
+// different list each run and the crash frame jumps f10..f70. Hook both to frame-deterministic
+// values so the whole render is reproducible — required to debug the residual rollback crash.
+static SafetyHookInline g_h_scripttime{};
+static SafetyHookInline g_h_scriptkey{};
+typedef void (cdecl* sq_pushint_t)(void* vm, int i);
+static int cdecl scripttime_hook(void* vm) {
+    ((sq_pushint_t)(0x184370_R))(vm, gekko_bridge::g_trace_frame * 16);   // 16 ms/frame, deterministic
+    return 1;
+}
+static int cdecl scriptkey_hook(void* vm) {
+    ((sq_pushint_t)(0x184370_R))(vm, 0);   // no key held — deterministic render input
+    return 1;
+}
+// Neutralize GetAsyncKeyState process-wide (return 0 = no key). The harness drives inputs via
+// the fake-input generator, NOT real keys, so this is safe and removes every real-time input
+// read (PrtScn poll in update_logic, debug camera, movement, script_get_async_key_state).
+static short __stdcall det_getasynckeystate(int /*vKey*/) { return 0; }
+// Frame-deterministic clocks: th155's animation/timer reads of timeGetTime/GetTickCount must
+// advance with the LOGICAL frame (identical forward vs re-sim), not wall-clock, or the render
+// dispatch the rollback corrupts varies per run. squiroll's own perf/exit timing uses
+// Netcode.dll's IAT (not patched), so the wall-clock harness exit still works.
+static unsigned long __stdcall det_timegettime() {
+    int f = gekko_bridge::g_trace_frame; return (unsigned long)((f < 0 ? 0 : f) * 16);
+}
+static unsigned long __stdcall det_gettickcount() {
+    int f = gekko_bridge::g_trace_frame; return (unsigned long)((f < 0 ? 0 : f) * 16);
+}
+// The Ew::sTask scheduler AND every effect (Ew_tEftShine/Orb/Spark/Particle/...) time their
+// animations off QueryPerformanceCounter — the dominant render-dispatch nondeterminism. Make
+// QPC advance with the logical frame and pin the frequency so elapsed/frame == 1/60 s exactly,
+// identical forward vs re-sim. (long long* = LARGE_INTEGER::QuadPart.)
+static int __stdcall det_qpc(long long* p) {
+    int f = gekko_bridge::g_trace_frame; if (p) *p = (long long)(f < 0 ? 0 : f) * 100000; return 1;
+}
+static int __stdcall det_qpf(long long* p) { if (p) *p = 6000000; return 1; }   // 100000*60
+
 } // namespace
 
 void install() {
@@ -859,6 +900,38 @@ void install() {
     g_h_runone    = safetyhook::create_inline((void*)(0x2FAD0_R),  (void*)runone_hook);
     g_h_pendframes= safetyhook::create_inline((void*)(0x591D0_R),  (void*)pendframes_hook);
     g_h_numdigit  = safetyhook::create_inline((void*)(0x158A40_R), (void*)numdigit_hook);
+    (void)g_h_scripttime; (void)scripttime_hook; (void)g_h_scriptkey; (void)scriptkey_hook;
+    (void)det_getasynckeystate; (void)det_timegettime; (void)det_gettickcount;
+    // Render-clock determinism is TEST infrastructure (SQUIROLL_DET=1): frame-based clocks
+    // freeze pre-match wall-clock, so it's for reproducing/diagnosing the render-dispatch
+    // rollback crash, not a default-on fix. It reduces but doesn't eliminate the crash (the
+    // residual nondeterminism source is still being chased).
+    if (getenv("SQUIROLL_DET"))
+    {   // Patch th155's real-time IATs to frame-deterministic stubs (render determinism).
+    g_h_scripttime = safetyhook::create_inline((void*)(0x49450_R),  (void*)scripttime_hook);
+    {
+        struct { uint32_t iat; void* fn; const char* nm; } pat[] = {
+            { 0x3883CC_R, (void*)&det_getasynckeystate, "GetAsyncKeyState" },
+            { 0x3884BC_R, (void*)&det_timegettime,      "timeGetTime"      },
+            { 0x3880A4_R, (void*)&det_gettickcount,     "GetTickCount"     },
+            // QPC NOT hooked: it's pure PROFILING (effect vftable_19 stores it into a
+            // perf-stats struct for UpdateLayerPerfCounter), not animation. Our small
+            // frame value vs the real pre-hook baseline made elapsed negative -> worse.
+            // { 0x3880D8_R, (void*)&det_qpc, "QueryPerfCounter" },
+            // { 0x3880DC_R, (void*)&det_qpf, "QueryPerfFreq" },
+        };
+        (void)det_qpc; (void)det_qpf;
+        for (auto& p : pat) {
+            void** iat = (void**)(uintptr_t)p.iat;
+            DWORD old = 0;
+            if (VirtualProtect(iat, sizeof(void*), PAGE_READWRITE, &old)) {
+                *iat = p.fn;
+                VirtualProtect(iat, sizeof(void*), old, &old);
+                log_printf("[det] %s IAT -> frame-deterministic\n", p.nm);
+            }
+        }
+    }
+    }   // end if (SQUIROLL_DET)
     g_h_haspend   = safetyhook::create_inline((void*)(0x2FA00_R),  (void*)haspend_hook);
     // numdispose hook NOT installed: proven not the crash (0x64D80 Number-dispose is never
     // called during the rollback). The ~f60-70 abort is the game-loop ScriptAPI's slot-list
