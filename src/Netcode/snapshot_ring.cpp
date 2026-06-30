@@ -56,13 +56,12 @@ struct TrackedPage {
     bool     captured;
 };
 static TrackedPage g_tracked[] = {
+    {23396, {}, false},   // REAL divergent (below bump, in checksum) 0x5B64000
+    {23404, {}, false},   // REAL divergent (below bump, in checksum) 0x5B6C000
     {23397, {}, false},   // boost::signals2 connection_body
-    {23404, {}, false},   // RESIDUAL divergent (post sync_workers+render-region)
-    {23744, {}, false},   // RESIDUAL divergent
-    {23749, {}, false},   // RESIDUAL divergent
-    {8873,  {}, false},   // Ew::sTask per-worker stats
+    {23744, {}, false},   // (above bump — harmless leftover)
+    {23749, {}, false},   // (above bump — harmless leftover)
     {10234, {}, false},   // boost::log shared_count
-    {10235, {}, false},   // boost::log shared_count slot
 };
 static constexpr int N_TRACKED =
     sizeof(g_tracked) / sizeof(g_tracked[0]);
@@ -357,6 +356,59 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
         t_dirty += (uint64_t)(d1.QuadPart - d0.QuadPart);
     }
 
+    // ACCURATE cpp phash: recompute ALL pages [0, bump), not just dirty ones, so the
+    // divf/[comp]/phash_snap reflect real content (the dirty-only update leaves stale
+    // hashes on pages that the write-watch reset stopped flagging -> false divergence).
+    // Gated to early frames (cost ~one cppb pass) — enough to localize the race.
+    if (frame <= 12) {
+        Arena& Ac = g_ar[CPP_ARENA];
+        uint32_t bump = *(const uint32_t*)(Ac.base + BUMP_OFF[CPP_ARENA]);
+        uint32_t upg = (bump + PAGE - 1) / PAGE;
+        if (upg > Ac.npages) upg = Ac.npages;
+        for (uint32_t pg = 0; pg < upg; ++pg)
+            Ac.phash[pg] = hash_page(Ac.base + pg * PAGE);
+    }
+
+    // FULL latch of tracked cpp pages on every forward save (not just dirty), so the
+    // divword can compare forward-frame-N vs resim-frame-N even for pages whose
+    // forward-only write happened on an EARLIER frame (so they're not dirty now).
+    // NB: gate on !re_capture_diag (the reliable "first save of this frame = forward"
+    // signal), NOT is_resim() — set_resim(false) runs BEFORE the save (gekko:1603),
+    // so is_resim() is already false here and would let the re-sim clobber the latch.
+    if (!re_capture_diag) {
+        for (int i = 0; i < N_TRACKED; ++i) {
+            TrackedPage& t = g_tracked[i];
+            if (t.pg < g_ar[CPP_ARENA].npages) {
+                memcpy(t.bytes, g_ar[CPP_ARENA].base + (size_t)t.pg * PAGE, PAGE);
+                t.captured = true;
+            }
+        }
+        // One-shot dump of page 23404 header + the diverging array context, to ID the
+        // object (vtable ptr at the block start, struct stride around dw 103).
+        static bool dumped = false;
+        if (!dumped && frame >= 5) {
+            dumped = true;
+            const uint32_t* p = (const uint32_t*)(g_ar[CPP_ARENA].base + (size_t)23404 * PAGE);
+            for (int i = 0; i < 16; ++i)
+                log_printf("[pgdump] dw%02d 0x%X = %08X %08X %08X %08X\n",
+                           i*4, 0x5B6C000 + i*16,
+                           p[i*4], p[i*4+1], p[i*4+2], p[i*4+3]);
+            for (int i = 24; i < 40; ++i)   // around the diverging array (dw 96-160)
+                log_printf("[pgdump] dw%02d 0x%X = %08X %08X %08X %08X\n",
+                           i*4, 0x5B6C000 + i*16,
+                           p[i*4], p[i*4+1], p[i*4+2], p[i*4+3]);
+            // Scan for the arena block header(s) covering this region (HDR_MAGIC
+            // 0x42504143 at +12) to get the allocating caller rva (h->link at +8).
+            const uint8_t* abase = g_ar[CPP_ARENA].base;
+            for (uint32_t o = 0x5B6A000; o < 0x5B6D000; o += 16) {
+                const uint32_t* hh = (const uint32_t*)(abase + o);
+                if (hh[3] == 0x42504143u)
+                    log_printf("[blkhdr] off=0x%X cls=%u reqsize=%u link_rva=%08X\n",
+                               o, hh[0], hh[1], hh[2]);
+            }
+        }
+    }
+
     if (sblob_len > SMALL_CAP) {
         log_printf("[snapshot_ring] !! sblob blob too big (%u > %u)\n",
                    sblob_len, SMALL_CAP);
@@ -403,8 +455,20 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             for (uint32_t pg = 0; pg < upg; ++pg) { h ^= g_ar[a].phash[pg]; h *= 16777619u; }
             hc[a] = h;
         }
-        log_printf("[comp] f=%u sq=%08x/%u bt=%08x/%u cpp=%08x/%u\n",
-                   frame, hc[0], bc[0], hc[1], bc[1], hc[2], bc[2]);
+        // DEFINITIVE: real dword-hash of cpp bytes [0, bump) — independent of the
+        // phash machinery. If this is identical fwd-vs-resim while [comp] cpp= (phash
+        // fold) differs, the phash divergence is a stale-hash artifact and the cpp
+        // arena is actually byte-deterministic. Gated to early frames (cost).
+        uint32_t cppb = 0;
+        if (frame <= 6) {
+            cppb = 2166136261u;
+            const uint32_t* dw = (const uint32_t*)g_ar[CPP_ARENA].base;
+            uint32_t ndw = bc[CPP_ARENA] / 4;
+            for (uint32_t i = 0; i < ndw; ++i) { cppb ^= dw[i]; cppb *= 16777619u; }
+        }
+        log_printf("[comp] f=%u sq=%08x/%u bt=%08x/%u cpp=%08x/%u cppb=%08x %s\n",
+                   frame, hc[0], bc[0], hc[1], bc[1], hc[2], bc[2], cppb,
+                   re_capture_diag ? "RESIM" : "fwd");
     }
 
     // DIAGNOSTIC: every-frame divergence detection via per-page hash. At the
@@ -422,7 +486,8 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
             (void)first_dump_done;                 // kept for binary stability
             int totalp = 0;
             for (int a = 0; a < NARENA; ++a) {
-                if (a == CPP_ARENA) continue;   // cpp divf off (use [comp] cpp instead)
+                // cpp divf ON: bump is consistent fwd-vs-resim, so the divergence is
+                // a CONTENT write at a stable address — trace which pages/dwords.
                 int hits = 0;
                 for (uint32_t pg = 0; pg < g_ar[a].npages && hits < 6; ++pg) {
                     if (S.phash_snap[a][pg] != g_ar[a].phash[pg]) {
@@ -445,7 +510,9 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                             // are flipping for the persistent divergent
                             // sources (connection_body refcount, etc).
                             TrackedPage* tp = find_tracked(pg);
-                            if (tp && tp->captured && !divword_seen(pg)) {
+                            static int g_dwcount = 0;
+                            if (tp && tp->captured && g_dwcount < 80) {
+                                ++g_dwcount;
                                 const uint32_t* live =
                                     (const uint32_t*)(g_ar[a].base + pg * PAGE);
                                 const uint32_t* saved =

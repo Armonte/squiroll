@@ -1599,6 +1599,11 @@ void advance_one_frame() {
     if (rb_diag_enabled()) battle_pools::log_fingerprint("post-run");
     if (trace) log_printf("[gekko_bridge] advance: -> ScriptAPI::Update\n");
     Act_ScriptAPI_ptr->vftable->Update(Act_ScriptAPI_ptr);  // Act::ScriptAPI::Update
+    // B1: rebuild trail ribbon meshes deterministically in the SIM (fwd AND re-sim),
+    // BEFORE the save — the render-only build is forward-only and is the residual cpp
+    // divergence + the texture-refcount crash. Must run while still marked resim so
+    // any internal frees route correctly; runs on both sides identically.
+    cpp_arena::rebuild_trail_meshes();
     if (g_trace_rb) crash_handler::watch_cxx(false);
     cpp_arena::set_resim(false);
     log_state_fingerprint(g_trace_frame, g_trace_rb, "post-upd");

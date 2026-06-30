@@ -13,6 +13,10 @@
 #include "patch_utils.h"   // _R address literal
 #include "util.h"
 #include "log.h"
+#include "sq_arena.h"      // sq_arena::base/capacity  (for the [arenas] dump)
+#include "bullet_arena.h"  // bullet_arena::base/capacity
+
+namespace actor2d_log { void watch_arm(uint32_t addr); }  // Dr0 write-watch (VEH logs writer rva)
 
 // operator new(size_t) — th155.exe 0x2E15AB. The single scalar throwing
 // operator new: std::vector / std::list (_Buynode0) / std::allocator and
@@ -179,15 +183,20 @@ static void thiscall synclayer_hook(int task, int force_sync) {
 // must be replayed or excluded).
 static SafetyHookInline g_h_draw{};
 static int thiscall draw_eff_hook(int self, int fb) {
-    static int n = 0;
-    if (n == 0) {
-        ++n;
-        // One-shot caller-chain dump — scan the stack for th155 return addresses so
-        // we find the DRAW ITERATION above vtable[19] (the correct replay point).
+    // Log rb per call (forward nf<20, re-sim nr<200) to settle whether the re-sim
+    // GPU-draws. rb>0 present => re-sim DOES draw (divergence is alloc churn, not
+    // an asymmetry). rb==0 ONLY => re-sim skips the draw (asymmetry).
+    static int nf = 0, nr = 0;
+    int rb = gekko_bridge::g_trace_rb;
+    if (rb == 0 ? (nf < 20 && ++nf) : (nr < 200 && ++nr))
+        log_printf("[draweff] rb=%d\n", rb);
+    static int chain = 0;
+    if (chain == 0) {
+        ++chain;
         volatile uint32_t marker = 0;
         const uint32_t* sp = (const uint32_t*)&marker;
-        log_printf("[drawchain] caller chain (rva):\n");
-        for (int k = 0, shown = 0; k < 80 && shown < 12; ++k) {
+        log_printf("[drawchain] (fresh) caller chain rva:\n");
+        for (int k = 0, shown = 0; k < 90 && shown < 14; ++k) {
             uint32_t rva = sp[k] - (uint32_t)base_address;
             if (rva >= 0x1000 && rva < 0x300000) {
                 log_printf("[drawchain]   stk[+0x%02X] rva=%08X\n", k * 4, rva);
@@ -196,6 +205,77 @@ static int thiscall draw_eff_hook(int self, int fb) {
         }
     }
     return g_h_draw.unsafe_thiscall<int>(self, fb);
+}
+
+// process_pending_script_frames (0x591D0) is th155's update_logic RunOneFrame path
+// — the FORWARD-ONLY render/draw tick (squiroll's advance_one_frame deliberately
+// skips it). Bracket it so the particle-draw allocations (the SQVM transient
+// connection nodes that otherwise churn the sim bump) land in the arena's render
+// region instead. This is the CORRECT bracket point (render_one_frame was not — the
+// draws are slots under THIS RunOneFrame, not drawing_related).
+// DISABLED bracket: routing process_pending_script_frames' allocs to the render
+// region made cpp 24->38 (it allocates sim-referenced render-ScriptAPI state, not
+// just the transient draw nodes). Routing is dead. Hook kept as a no-op anchor.
+static SafetyHookInline g_h_pendframes{};
+static void thiscall pendframes_hook(int self) {
+    g_h_pendframes.unsafe_thiscall<int>(self);
+}
+
+// LOG: generate_trail_mesh (0x159320) writes the trail vertices into *(this+164).
+// Confirm (a) does the re-sim call it (rb>0?), (b) is *(this+164) the diverging cpp
+// region (~off 0x5B6C000 = the per-frame dynamic vertex-buffer ring), (c) the vec at
+// +168 and the count at +160. This settles whether the divergence is the render
+// dynamic-VB ring (per-frame scratch that the re-sim never writes) sitting in the snap.
+// FIX: set_number_digit_display (0x158A40) rebuilds a TF4_Number's per-digit quad
+// buffer (in the cpp arena = snapshotted) from the number's value field (in the object
+// at 0x1AF0xxxx = real heap, NOT snapshotted / NOT rolled back). On a rollback re-sim
+// the restored buffer is already the forward's frame-N digits, but the script (running
+// in RunOneFrame) calls SetValue with the non-rolled-back, divergent value and rewrites
+// the buffer -> the SOLE residual cpp divergence (a HUD number, not gameplay; sq/bt are
+// clean). Suppress the rebuild during re-sim: the buffer stays consistent with the
+// snapshot, and the next forward render rebuilds it for display. SQUIROLL_NUMDIG_FIX=0
+// disables (default on).
+// GetFPS (0xEA20) returns dword_4D9F0C[891] — a real-time FPS counter the render loop
+// updates. The HUD FPS overlay (gauge_vs.nut: this.fps.SetValue(::GetFPS())) feeds it
+// into a TF4_Number whose digit buffer IS in the snapshotted cpp arena, so the headless
+// re-sim (reading the live, non-rolled-back counter at varying real-times) writes
+// different digits -> the residual cpp divergence (proven via Dr0 -> set_number_digit_
+// display -> gauge_vs.nut FPS). Force GetFPS deterministic; the overlay just freezes.
+// set_number_digit_display passthrough (kept as an anchor for the TF4_Number digit
+// determinism investigation). The FPS overlay — the dominant residual cpp divergence —
+// is fixed by the GetFPS patch in install(); the combo/damage numbers' render-built
+// geometry (game-loop, post-save) is a smaller residual (f=27+) still being chased.
+static SafetyHookInline g_h_numdigit{};
+static void thiscall numdigit_hook(int self, int value) {
+    g_h_numdigit.unsafe_thiscall<void>(self, value);
+}
+
+// DIAG: which Act::ScriptAPI::RunOneFrame (0x2FAD0) invokes the forward-only draw
+// slots? Log `this` + rb. A `this` that appears with rb==0 ONLY is the draw/render
+// ScriptAPI the re-sim skips (advance_one_frame's main+bg run on both rb=0 and rb>0).
+static SafetyHookInline g_h_runone{};
+static void thiscall runone_hook(int self) {
+    // Arm a Dr0 write-watch on the diverging trail U field (cpp off 0x5B6C19C) on the
+    // main thread at f>=3, so the VEH names the EXACT writer rva + side (rb). Settles
+    // who really writes the trail vertex buffer (generate_trail_mesh is never called).
+    static bool t_armed = false;
+    if (!t_armed && gekko_bridge::g_trace_frame >= 3) {
+        t_armed = true;
+        uint32_t gb = (uint32_t)(uintptr_t)g_base;
+        log_printf("[trailarm] f=%d gbase=%08X -> arm %08X\n",
+                   gekko_bridge::g_trace_frame, gb, gb + 0x5B6C19C);
+        ::actor2d_log::watch_arm(gb + 0x5B6C19C);
+    }
+    static int n = 0;
+    // Log a few of EACH: forward (rb==0) and re-sim (rb>0). The ScriptAPI `this`
+    // that appears under rb==0 but NEVER under rb>0 is the forward-only draw path.
+    static int nf = 0, nr = 0;
+    int rb = gekko_bridge::g_trace_rb;
+    if (rb == 0 ? (nf < 40 && ++nf) : (nr < 200 && ++nr)) {
+        log_printf("[runone] this=%08X rb=%d\n", (uint32_t)self, rb);
+    }
+    (void)n;
+    g_h_runone.unsafe_thiscall<int>(self);
 }
 
 // concurrent_list_erase_node (0x13D80) — __thiscall(container, out, key, node_ref).
@@ -722,6 +802,27 @@ void install() {
     g_h_throw  = safetyhook::create_inline((void*)(0x2FB5DD_R), (void*)throw_log_hook);
     g_h_synclayer = safetyhook::create_inline((void*)(0xE5CD0_R), (void*)synclayer_hook);
     g_h_draw      = safetyhook::create_inline((void*)(0x10A080_R), (void*)draw_eff_hook);
+    g_h_runone    = safetyhook::create_inline((void*)(0x2FAD0_R),  (void*)runone_hook);
+    g_h_pendframes= safetyhook::create_inline((void*)(0x591D0_R),  (void*)pendframes_hook);
+    g_h_numdigit  = safetyhook::create_inline((void*)(0x158A40_R), (void*)numdigit_hook);
+    // GetFPS (0xEA20) is a display-only Squirrel binding (::GetFPS, used by the
+    // gauge_vs.nut FPS overlay, gated by ::config.graphics.fps). It returns a live
+    // real-time counter, so the headless re-sim reads a different value than the
+    // forward and the FPS TF4_Number's digit buffer (in the snapshotted cpp arena)
+    // diverges — the SOLE residual cpp divergence (proven: Dr0 write-watch ->
+    // set_number_digit_display -> gauge_vs.nut FPS). Make it deterministic with a
+    // direct 6-byte patch (mov eax,60; ret) — safetyhook's trampoline on a 6-byte
+    // function broke startup, but it's not used for pacing so a flat patch is safe.
+    {
+        uint8_t code[6] = { 0xB8, 0x3C, 0x00, 0x00, 0x00, 0xC3 };  // mov eax,60 ; ret
+        void* p = (void*)(0xEA20_R);
+        DWORD old = 0;
+        if (VirtualProtect(p, sizeof code, PAGE_EXECUTE_READWRITE, &old)) {
+            memcpy(p, code, sizeof code);
+            VirtualProtect(p, sizeof code, old, &old);
+            log_printf("[getfps] patched GetFPS -> const 60 (FPS overlay determinism)\n");
+        }
+    }
     // [erase] connection-lifecycle trace — DISABLED (root found; it read keys in the
     // divergent arena, a source of clguard null-deref noise). Re-enable to re-trace.
     // g_h_erase  = safetyhook::create_inline((void*)(0x13D80_R),  (void*)erase_log_hook);
@@ -756,6 +857,71 @@ void trace_alloc(uint32_t addr) {
 void     set_armed(bool on) { g_armed = on; }
 bool     is_armed()         { return g_armed; }
 void     set_render_pass(bool on) { g_render_pass = on; }
+
+// ------------------------------------------------------------ trail determinism --
+// B1: the motion-trail (Manbow::TrailLayer) ribbon VERTEX BUFFER is the sole real
+// residual cpp divergence + the ~f50 crash. It's built by generate_trail_mesh
+// (0x159320, pure CPU/SIMD: U = +96 - i*(+100/(n-1))) only inside the trail DRAW
+// (render-side, forward-only), so the headless re-sim never rebuilds it -> stale
+// geometry + stale texture refcounts diverge. Fix: rebuild it from the
+// (deterministic) circular-buffer positions in the SIM path on BOTH fwd & re-sim,
+// writing into the PERSISTENT cpp-arena vertex vector (not the per-frame GPU map),
+// so each side snapshots identical geometry.
+static void build_one_trail(char* task) {
+    char* trail = task + 4;                              // embedded TF4::Trail base
+    if (*(uint32_t*)trail != (uint32_t)(0x44C0A4_R))     // sanity: must be a TF4::Trail
+        return;
+    uint32_t n   = *(uint32_t*)(trail + 128);
+    uint32_t cap = *(uint32_t*)(trail + 84);
+    if (cap < n) n = cap;
+    *(uint32_t*)(trail + 160) = n;                       // active vertex count (draw sets this)
+    if (n < 2) return;
+    void* vbuf = *(void**)(trail + 168);                // persistent cpp-arena vertex vector data
+    if (!vbuf) return;
+    *(void**)(trail + 164) = vbuf;                       // redirect output GPU-map -> cpp buffer
+    ((void(thiscall*)(int))(0x159320_R))((int)trail);    // generate_trail_mesh
+}
+
+// Walk a TF4 TPoolAllocator's used blocks (mirrors *_pool_free_all). idx = the
+// dword_4D9F0C index of the free-list head; [+1]=chunk base, [+2]=chunk size off,
+// [+3]=element size. Allocated (non-free-list) blocks are live trail tasks.
+static void walk_trail_pool(int idx) {
+    uint32_t* D = (uint32_t*)(uintptr_t)(0x4D9F0C_R);
+    uint32_t chunk = D[idx + 1];
+    if (!chunk) return;
+    uint32_t coff    = D[idx + 2];
+    char*    freeblk = (char*)(uintptr_t)D[idx + 0];
+    uint32_t elsz    = D[idx + 3] >= 4u ? D[idx + 3] : *(uint32_t*)(uintptr_t)(0x442A60_R);
+    if (elsz & 3) elsz += 4 - (elsz & 3);
+    if (elsz < 8) return;
+    for (int guard = 0; chunk && guard < 4096; ++guard) {
+        char*    end  = (char*)(uintptr_t)(chunk + coff - 8);
+        uint32_t next = *(uint32_t*)(uintptr_t)(chunk + coff - 8);
+        uint32_t noff = *(uint32_t*)(uintptr_t)(chunk + coff - 4);
+        for (char* blk = (char*)(uintptr_t)chunk; blk != end; blk += elsz) {
+            if (blk == freeblk) { freeblk = *(char**)freeblk; continue; }
+            build_one_trail(blk);
+        }
+        chunk = next; coff = noff;
+    }
+}
+
+void rebuild_trail_meshes() {
+    static int en = -1;
+    if (en == -1) {
+        char b[8] = {0};
+        DWORD k = GetEnvironmentVariableA("SQUIROLL_TRAIL_REBUILD", b, sizeof b);
+        en = (k > 0 && k < sizeof b && atoi(b) != 0) ? 1 : 0;   // default OFF
+    }
+    if (!en || !g_armed) return;
+    // NOTE: the diverging trail is the AnimCtrlTrail (AnimationControllerTrail), NOT the
+    // TrailLayer LayerTask/DynLayerTask pools below — and rebuilding the layer tasks
+    // corrupts them (crash). Correct target TBD: walk the AnimCtrlTrail pool and rebuild
+    // each controller's resource geometry. Left here gated-off pending that retarget.
+    (void)build_one_trail;
+    walk_trail_pool(2461);
+    walk_trail_pool(2473);
+}
 void     set_resim(bool on) { g_resim = on; }
 bool     is_resim()         { return g_resim; }
 

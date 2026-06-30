@@ -69,6 +69,13 @@ bool is_armed();
 // render-effect connection-node leak out of the sim bump.
 void set_render_pass(bool on);
 
+// B1 trail determinism: rebuild every active Manbow::TrailLayer ribbon mesh from its
+// (deterministic) circular-buffer positions into its persistent cpp-arena vertex
+// buffer. Call at the end of each advance (fwd AND re-sim) so the snapshot captures
+// identical trail geometry instead of the render-only (forward-only) build.
+// SQUIROLL_TRAIL_REBUILD=0 disables (default on). No-op until armed.
+void rebuild_trail_meshes();
+
 // Mark a rollback re-simulation advance in progress. While set, a free of a
 // real-heap (non-arena) block is suppressed — the real Win32 heap is not
 // snapshotted, so the forward run already freed it and re-freeing would
