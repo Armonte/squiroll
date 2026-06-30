@@ -323,7 +323,7 @@ static uint32_t* thiscall erase_log_hook(int* self, uint32_t* out, int* key, int
     if (key && ((const uint32_t*)key)[4] >= 16) ks = *(const char**)key;
     uint32_t* r = g_h_erase.unsafe_thiscall<uint32_t*>(self, out, key, node);
     static int n = 0;
-    if (n < 5000) {
+    if (n < 40000) {
         ++n;
         log_printf("[erase] f=%d rb=%d tid=%u node=%p cnt=%d key='%.24s'\n",
                    gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
@@ -835,6 +835,9 @@ void install() {
     g_h_runone    = safetyhook::create_inline((void*)(0x2FAD0_R),  (void*)runone_hook);
     g_h_pendframes= safetyhook::create_inline((void*)(0x591D0_R),  (void*)pendframes_hook);
     g_h_numdigit  = safetyhook::create_inline((void*)(0x158A40_R), (void*)numdigit_hook);
+    // numdispose hook NOT installed: proven not the crash (0x64D80 Number-dispose is never
+    // called during the rollback). The ~f60-70 abort is the game-loop ScriptAPI's slot-list
+    // shared_count release in HasPendingFrame (0x2FA7E) / RunOneFrame, not a Number free.
     // GetFPS (0xEA20) is a display-only Squirrel binding (::GetFPS, used by the
     // gauge_vs.nut FPS overlay, gated by ::config.graphics.fps). It returns a live
     // real-time counter, so the headless re-sim reads a different value than the
@@ -853,8 +856,10 @@ void install() {
             log_printf("[getfps] patched GetFPS -> const 60 (FPS overlay determinism)\n");
         }
     }
-    // [erase] connection-lifecycle trace — DISABLED (root found; it read keys in the
-    // divergent arena, a source of clguard null-deref noise). Re-enable to re-trace.
+    // [erase] connection-lifecycle trace — DISABLED again. Confirmed the slot-list count
+    // diverges fwd-vs-resim, but the connection keys are blank (anonymous render slots) so
+    // it can't name them; the crash is the slot-list shared_count release (HasPendingFrame
+    // 0x2FA7E), not an individual erase. Re-enable only to re-trace list-length divergence.
     // g_h_erase  = safetyhook::create_inline((void*)(0x13D80_R),  (void*)erase_log_hook);
 
     int ok = g_h_free.enabled() + g_h_opnew.enabled();
