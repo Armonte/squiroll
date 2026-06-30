@@ -312,7 +312,7 @@ static uint32_t fold_checksum(const uint8_t* sblob, uint32_t sblob_len) {
 static bool g_gl_pin_on = (getenv("SQUIROLL_GL_PIN") != nullptr);
 static constexpr uint32_t GL_BUF_SZ  = 4u * 1024 * 1024;     // forward bytes of the reachable graph
 static constexpr int      GL_MAX_BLK = 32768;
-struct GlBlk { uint32_t off, pos, len; };
+struct GlBlk { uint32_t off, pos, len, link, req; };  // link=caller rva, req=reqsize (block identity)
 static uint8_t  g_gl_buf[GL_BUF_SZ];
 static GlBlk    g_gl_blks[GL_MAX_BLK];
 static int      g_gl_nblks = 0;
@@ -359,13 +359,15 @@ static void gl_pin_save() {
     }
     memset(g_bfs_bits, 0, sizeof g_bfs_bits);
     uint32_t pos = 0; int head = 0;
-    g_gl_blks[g_gl_nblks++] = { seed, 0, 0 };
+    g_gl_blks[g_gl_nblks++] = { seed, 0, 0, 0, 0 };
     g_bfs_bits[(seed / 16) >> 3] |= (uint8_t)(1u << ((seed / 16) & 7));
     while (head < g_gl_nblks && g_gl_nblks < GL_MAX_BLK) {
         uint32_t off = g_gl_blks[head].off;
         uint32_t paylen = gl_block_size(base, sz, off) - 16;
         if (pos + paylen > GL_BUF_SZ) break;          // out of buffer — stop (logged below)
         g_gl_blks[head].pos = pos; g_gl_blks[head].len = paylen;
+        g_gl_blks[head].link = *(const uint32_t*)(base + off - 8);   // caller rva (block identity)
+        g_gl_blks[head].req  = *(const uint32_t*)(base + off - 12);  // reqsize
         memcpy(g_gl_buf + pos, base + off, paylen);
         pos += paylen;
         const uint32_t* dw = (const uint32_t*)(base + off);
@@ -377,7 +379,7 @@ static void gl_pin_save() {
             uint32_t bit = toff / 16;
             if (g_bfs_bits[bit >> 3] & (1u << (bit & 7))) continue;
             g_bfs_bits[bit >> 3] |= (uint8_t)(1u << (bit & 7));
-            if (g_gl_nblks < GL_MAX_BLK) g_gl_blks[g_gl_nblks++] = { toff, 0, 0 };
+            if (g_gl_nblks < GL_MAX_BLK) g_gl_blks[g_gl_nblks++] = { toff, 0, 0, 0, 0 };
         }
         ++head;
     }
@@ -402,14 +404,23 @@ static int gl_live_use() {   // current game-loop slot-list use_count (or sentin
 }
 static void gl_pin_restore() {
     if (!g_gl_valid) return;
-    int before = gl_live_use();
-    for (int i = 0; i < g_gl_nblks; ++i)
-        if (g_gl_blks[i].len) gl_apply(g_gl_blks[i].off, g_gl_buf + g_gl_blks[i].pos, g_gl_blks[i].len);
-    int after = gl_live_use();
+    const uint8_t* base = g_ar[CPP_ARENA].base;
+    uint32_t sz = g_ar[CPP_ARENA].size;
+    int skipped = 0;
+    for (int i = 0; i < g_gl_nblks; ++i) {
+        GlBlk& b = g_gl_blks[i];
+        if (!b.len) continue;
+        // Identity check: is the slot STILL the same allocation we captured (same caller-rva
+        // + reqsize)? After a rollback the re-sim may have freed+reused this slot for a SIM
+        // object — re-applying our render bytes there would corrupt it. Skip if it changed.
+        if (!gl_block_size(base, sz, b.off) ||
+            *(const uint32_t*)(base + b.off - 8)  != b.link ||
+            *(const uint32_t*)(base + b.off - 12) != b.req) { ++skipped; continue; }
+        gl_apply(b.off, g_gl_buf + b.pos, b.len);
+    }
     static int nr = 0;
-    if (nr < 30 && (before <= 0 || after != 1)) { ++nr;
-        log_printf("[glpin] RESTORE use before=%d after=%d (cap_use=%d) blocks=%d\n",
-                   before, after, g_gl_cap_use, g_gl_nblks); }
+    if (nr < 30 && skipped) { ++nr;
+        log_printf("[glpin] RESTORE blocks=%d skipped(reused)=%d\n", g_gl_nblks, skipped); }
 }
 
 // kept for the one-shot reachability log
@@ -911,6 +922,31 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
         }
     }
 
+    // NB: capture-before-restore here was WORSE (4/8 vs 2/8) — the graph snapshot isn't the
+    // residual; the alloc COLLISION is (forward copy-on-write render blocks land above the
+    // bump where the re-sim reuses the slots). Snapshot stays at the stable RunOneFrame-end.
+
+    // The game-loop slot-list shared_count (use/weak) is a LIVE boost::signals2 iteration
+    // refcount — it counts shared_ptr temporaries that live on the STACK/registers, which the
+    // rollback does NOT restore. Rolling the count back to a snapshot value desyncs it from the
+    // still-live shared_ptrs (a reverted lock whose release still fires -> use->0 -> dispose ->
+    // the ~f10-70 abort). Capture it now and re-apply after the reverse-apply, exactly like we
+    // never roll back the CRT stack. sc is stable (gla+0x1C0), confirmed via haspend.
+    uint32_t gl_sc_off = 0; int gl_use_b = 0, gl_weak_b = 0;
+    {
+        const uint8_t* B = g_ar[CPP_ARENA].base;
+        uint32_t CB = (uint32_t)(uintptr_t)B, SZ = g_ar[CPP_ARENA].size;
+        uint32_t gla = cpp_arena::gameloop_addr();
+        if (gla >= CB + 8 && gla < CB + SZ) {
+            uint32_t sc = *(const uint32_t*)(B + (gla - CB) + 4);
+            if (sc >= CB && sc + 12 <= CB + SZ) {
+                gl_sc_off = sc - CB;
+                gl_use_b  = *(const int*)(B + gl_sc_off + 4);
+                gl_weak_b = *(const int*)(B + gl_sc_off + 8);
+            }
+        }
+    }
+
     // Coalesced reverse-apply. A hot page (the VM operand stack) is dirtied
     // every frame, so it appears in every rolled-back frame's delta — the
     // naive newest-first apply would copy it once per frame. Instead walk
@@ -941,6 +977,16 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
         }
     }
     g_cur = target;
+
+    // Re-apply the live shared_count refcount the reverse-apply just rolled back (see above).
+    if (gl_sc_off) {
+        Arena& A = g_ar[CPP_ARENA];
+        *(int*)(A.base   + gl_sc_off + 4) = gl_use_b;
+        *(int*)(A.base   + gl_sc_off + 8) = gl_weak_b;
+        *(int*)(A.mirror + gl_sc_off + 4) = gl_use_b;     // keep mirror in sync (no spurious delta)
+        *(int*)(A.mirror + gl_sc_off + 8) = gl_weak_b;
+        A.phash[gl_sc_off / PAGE] = hash_page(A.base + (gl_sc_off & ~(PAGE - 1)));
+    }
 
     // Forward-state pin: the reverse-apply above rolled the game-loop ScriptAPI object
     // (render-dispatch, forward-only) back to `target`, reverting its slot-list shared_count

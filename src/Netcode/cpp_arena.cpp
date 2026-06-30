@@ -295,10 +295,11 @@ static void thiscall runone_hook(int self) {
     // snapshot, to take render-dispatch state out of rollback (the crash = its restored
     // connection list referencing freed objects). But the SIM references render objects,
     // so excluding the region broke sq/eng. Render/sim aren't page-separable. Reverted.
+    // NB: routing the game-loop's whole RunOneFrame to the render region broke the SIM
+    // (sqDIV) — it allocates sq-referenced state too, not just render-dispatch. Reverted.
+    // Snapshot the render-dispatch graph at the stable RunOneFrame-end; the collision with
+    // re-simmed sim objects is handled by an identity check in gl_pin_restore.
     g_h_runone.unsafe_thiscall<int>(self);
-    // After the game-loop ScriptAPI's RunOneFrame completes, its render-dispatch slot-list
-    // is at a STABLE refcount — snapshot the reachable graph here as the forward-pin source
-    // (snapshot_ring re-applies it after each rollback restore so render state never reverts).
     if ((uint32_t)self == *(uint32_t*)(0x49AFBC_R)) snapshot_ring::gl_capture();
 }
 

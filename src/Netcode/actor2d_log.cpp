@@ -166,10 +166,10 @@ static LONG CALLBACK vw_veh(EXCEPTION_POINTERS* ep) {
     if (!(c->Dr6 & 0xF)) return EXCEPTION_CONTINUE_SEARCH;
     c->Dr6 = 0;
     uint32_t now = *(const uint32_t*)(uintptr_t)g_vw_addr;
-    // Log EVERY touch (no frame gate) so we can see whether the rollback LOAD
-    // restores va.x at all -- if the boostpool_load memcpy never writes it during
-    // a rollback (rb=1), that block isn't being restored. Cap high; no stack dump
-    // (the rva is enough). Tag rb so save(read)/load(write)/script are separable.
+    // Repurposed for the game-loop slot-list use_count trace: log every write whose
+    // RESULT is small (<=2) — captures the lock(->2)/release(->1) and the critical drop
+    // to 0 — with the writer rva + frame + rb. This shows EXACTLY who decrements the
+    // use_count to 0 and on which side (forward vs rollback re-sim).
     if (now != 0 && g_vw_hits < 400) {
         ++g_vw_hits;
         log_printf("[velwatch] %08X <- val=%08X rva=%08X f=%d rb=%d d=%d\n",
