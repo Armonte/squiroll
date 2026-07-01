@@ -189,9 +189,14 @@ static void fake_input_init() {
     uint32_t seed;
     char sb[16] = {0};
     DWORD sn = GetEnvironmentVariableA("SQUIROLL_INPUT_SEED", sb, sizeof(sb));
-    bool explicit_seed = (sn > 0 && sn < sizeof(sb) && atoi(sb) != 0);
+    // NB: parse with strtoul(base 0) for BOTH the check and the value — atoi()
+    // returns 0 for "0x1111"-style hex, which silently rejected every hex seed
+    // the harness passed: all "seeded" DET runs played the SAME input stream
+    // (DET also freezes GetTickCount, so the fallback seed was near-constant).
+    uint32_t sv = (sn > 0 && sn < sizeof(sb)) ? (uint32_t)strtoul(sb, nullptr, 0) : 0;
+    bool explicit_seed = (sv != 0);
     if (explicit_seed) {
-        seed = (uint32_t)strtoul(sb, nullptr, 0);   // override -> reproduce a run
+        seed = sv;                                  // override -> reproduce a run
     } else {
         // The harness bat does NOT set SQUIROLL_INPUT_SEED, so a fixed default
         // made EVERY run play the identical input stream. Derive the seed from
