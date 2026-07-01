@@ -393,6 +393,22 @@ static char thiscall haspend_hook(int self) {
     int use = -2, weak = -2;
     if (in_arena) { use = *(int*)(sc + 4); weak = *(int*)(sc + 8); }
     bool gl = ((uint32_t)self == *(uint32_t*)(0x49AFBC_R));
+    // SELF-HEAL (2026-07-01): a dead control block (use<=0) on the PERSISTENT
+    // game-loop signal is always corruption — entering the original would lock
+    // (0->1), release (1->0) and dispose a live slot list, then spin forever in
+    // the catch-up loop (the 5/10 hang). The signal's rest state is use=1
+    // weak=1 by construction (it owns exactly one ref); restore it and let the
+    // dispatch proceed. Loud log so occurrences stay visible; with the restore
+    // step-0 fix + preservation removed this should fire rarely or never.
+    if (gl && in_arena && use <= 0) {
+        *(int*)(sc + 4) = 1;
+        *(int*)(sc + 8) = 1;
+        static int nheal = 0;
+        if (nheal < 60) { ++nheal;
+            log_printf("[haspend] SELF-HEAL gl sc=%08X use %d->1 weak %d->1 f=%d rb=%d\n",
+                       sc, use, weak, gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb); }
+        use = 1; weak = 1;
+    }
     // DANGER = the release decrement will hit 0 (use<=0 going in) or sc is a bad ptr.
     // use==1 is HEALTHY (signal holds 1 ref). Log every danger (any ScriptAPI).
     bool danger = (!in_arena) || (use <= 0);

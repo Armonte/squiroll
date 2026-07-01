@@ -1659,6 +1659,29 @@ void advance_one_frame() {
     if (g_trace_rb == 0) {
         static DWORD t_start = 0;
         if (t_start == 0) t_start = GetTickCount();
+        // HANG WATCHDOG: the residual failure mode is a silent stall (forward
+        // frame stops advancing, no exception). If f hasn't moved for 20s,
+        // dump every thread's stack and exit(3) — a diagnosed artifact instead
+        // of a harness timeout. Started lazily on the first forward advance.
+        static HANDLE wd = nullptr;
+        if (!wd) {
+            wd = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+                int last = -1; DWORD since = GetTickCount();
+                for (;;) {
+                    Sleep(3000);
+                    int f = g_trace_frame;
+                    if (f != last) { last = f; since = GetTickCount(); continue; }
+                    if (GetTickCount() - since >= 20000) {
+                        log_printf("[watchdog] forward frame STUCK at f=%d for "
+                                   "20s — dumping stacks\n", f);
+                        crash_handler::dump_all_thread_stacks("hang watchdog");
+                        log_flush();
+                        Sleep(600);
+                        ExitProcess(3);
+                    }
+                }
+            }, nullptr, 0, nullptr);
+        }
         // Ungated heartbeat — proves how far the forward sim actually got (the
         // [adv]/[save] logs are rate-gated and stop early). One line per 30 frames.
         if ((g_trace_frame % 30) == 0)

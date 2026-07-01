@@ -1,6 +1,7 @@
 #include <safetyhook.hpp>
 
 #include <windows.h>
+#include <tlhelp32.h>   // dump_all_thread_stacks (hang watchdog)
 #include <stdint.h>
 
 #include "crash_handler.h"
@@ -510,6 +511,56 @@ void register_thread(uint32_t tid) {
     // it's covered from the instant of its first instruction.
     if (g_wp_addr && (DWORD)tid != GetCurrentThreadId())
         wp_apply_other((DWORD)tid, g_wp_addr);
+}
+
+// HANG DIAGNOSIS: dump every thread's stack (toolhelp enumeration; suspend ->
+// context -> ebp walk -> resume). Called by the gekko_bridge hang watchdog when
+// the forward frame stops advancing, so a silent stall becomes a named loop.
+void dump_all_thread_stacks(const char* why) {
+    log_printf("[hangdump] === %s ===\n", why);
+    auto readable = [](uintptr_t p, size_t len) -> bool {
+        MEMORY_BASIC_INFORMATION m;
+        if (VirtualQuery((void*)p, &m, sizeof m) != sizeof m) return false;
+        if (m.State != MEM_COMMIT || (m.Protect & PAGE_GUARD) || m.Protect == PAGE_NOACCESS)
+            return false;
+        return p + len <= (uintptr_t)m.BaseAddress + m.RegionSize;
+    };
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te; te.dwSize = sizeof te;
+    DWORD pid = GetCurrentProcessId(), me = GetCurrentThreadId();
+    char loc[MAX_PATH + 32];
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE,
+                              te.th32ThreadID);
+        if (!h) continue;
+        if (SuspendThread(h) != (DWORD)-1) {
+            CONTEXT c; c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            if (GetThreadContext(h, &c)) {
+                describe_addr(c.Eip, loc);
+                log_printf("[hangdump] tid=%u eip=%08X %s\n",
+                           te.th32ThreadID, (unsigned)c.Eip, loc);
+                uintptr_t ebp = c.Ebp;
+                for (int i = 0; i < 24 && ebp; ++i) {
+                    if (!readable(ebp, 8)) break;
+                    uintptr_t ret  = *(uintptr_t*)(ebp + 4);
+                    uintptr_t next = *(uintptr_t*)ebp;
+                    if (ret) {
+                        describe_addr(ret, loc);
+                        log_printf("[hangdump]   [%2d] ret=%08X %s\n", i,
+                                   (unsigned)ret, loc);
+                    }
+                    if (next <= ebp) break;
+                    ebp = next;
+                }
+            }
+            ResumeThread(h);
+        }
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+    log_printf("[hangdump] === end ===\n");
 }
 
 void watchpoint_arm(void* addr) {

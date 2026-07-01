@@ -1094,8 +1094,17 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
     }
     g_cur = target;
 
-    // Re-apply the live shared_count refcount the reverse-apply just rolled back (see above).
-    if (gl_sc_off) {
+    // use_count "preservation" — DISABLED by default since restore step-0 (2026-07-01).
+    // This pre-step-0 hack copied the LIVE use/weak over the restored values every
+    // rollback. With step-0 the restore chain is complete, so the restored count IS
+    // correct (no game-loop lock is held at restore time — the dispatch runs in
+    // window_render, not inside tick). Worse, copying the live value PERPETUATES
+    // corruption: once any transient glitch leaves use=0 live, this re-applied 0
+    // over the correct restored 1 on every restore -> permanently dead signal ->
+    // the infinite HasPendingFrame catch-up hang (use=0 weak=0 spin, 5/10 runs).
+    // SQUIROLL_GLSC=1 re-enables for comparison runs.
+    static const bool g_glsc_preserve = (getenv("SQUIROLL_GLSC") != nullptr);
+    if (gl_sc_off && g_glsc_preserve) {
         Arena& A = g_ar[CPP_ARENA];
         *(int*)(A.base   + gl_sc_off + 4) = gl_use_b;
         *(int*)(A.base   + gl_sc_off + 8) = gl_weak_b;

@@ -29,6 +29,11 @@ void watch_cxx(bool on);
 void watchpoint_arm(void* addr);
 void watchpoint_disarm();
 
+// HANG DIAGNOSIS: suspend + ebp-walk every other thread of the process into
+// the log. Called by the gekko_bridge hang watchdog when the forward frame
+// stops advancing, so a silent stall becomes a named loop.
+void dump_all_thread_stacks(const char* why);
+
 // Register a th155 worker thread (call from the _beginthreadex hook). The
 // hardware watchpoint then arms DR0 on every registered thread, not just
 // the simulation thread — needed to catch a non-sim-thread writer.
