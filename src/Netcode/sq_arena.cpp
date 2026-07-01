@@ -189,14 +189,21 @@ void install(uintptr_t sq_code_lo, uintptr_t sq_code_hi) {
 
     // MEM_WRITE_WATCH: snapshot_ring tracks which pages each frame dirties,
     // so a rollback snapshot copies only what changed, not the whole arena.
-    g_base = (uint8_t*)VirtualAlloc(nullptr, ARENA_SIZE,
+    // DETERMINISM: fixed base (see cpp_arena) so sq-object pointers are identical run-to-run.
+    g_base = (uint8_t*)VirtualAlloc((void*)0x24000000, ARENA_SIZE,
                                     MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH,
                                     PAGE_READWRITE);
+    if (!g_base)
+        g_base = (uint8_t*)VirtualAlloc(nullptr, ARENA_SIZE,
+                                        MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH,
+                                        PAGE_READWRITE);
     if (!g_base) {
         log_printf("[sq_arena] !! VirtualAlloc(%u) failed — VM stays on CRT heap\n",
                    ARENA_SIZE);
         return;
     }
+    log_printf("[sq_arena] base=%p (fixed-base determinism %s)\n",
+               (void*)g_base, ((uintptr_t)g_base == 0x24000000) ? "ON" : "OFF");
     g_meta = (Meta*)g_base;
     g_meta->bump       = (sizeof(Meta) + 15u) & ~15u;  // first block 16-aligned
     g_meta->live_bytes = 0;

@@ -1576,6 +1576,35 @@ void advance_one_frame() {
             memset((void*)(uintptr_t)fa_base, 0, fa_ptr - fa_base);
         *(uint32_t*)(0x4DAD1C_R) = fa_base;   // reset the bump pointer
     }
+    // I2: Dr0 write-watch on the deterministic crash DrawCommandSlot head.
+    // The +0x305AE crash reads head=0xFFFFFF00 from the slot at 0x37000870
+    // (render region, alloc site create_and_bind 0x56AB5, address stable
+    // across runs thanks to the fixed arena bases). SQUIROLL_WP_RR=<hexaddr>
+    // (or =1 for the default) arms at f>=1 to catch the corrupting writer.
+    {
+        static int wp_rr = -2;   // -2 unparsed, 0 off, else address
+        if (wp_rr == -2) {
+            char b[24] = {0};
+            DWORD n = GetEnvironmentVariableA("SQUIROLL_WP_RR", b, sizeof b);
+            wp_rr = 0;
+            if (n > 0) {
+                uint32_t v = 0;
+                for (const char* s = b; *s; ++s) {
+                    char c = *s | 0x20;
+                    if (c >= '0' && c <= '9') v = v * 16 + (c - '0');
+                    else if (c >= 'a' && c <= 'f') v = v * 16 + (c - 'a' + 10);
+                    else if (c == 'x') v = 0;
+                    else break;
+                }
+                wp_rr = (v > 0x10000) ? (int)v : (int)0x37000870u;
+            }
+        }
+        static bool wp_rr_armed = false;
+        if (wp_rr && !wp_rr_armed && g_trace_rb == 0 && g_trace_frame >= 1) {
+            wp_rr_armed = true;
+            crash_handler::watchpoint_arm((void*)(uintptr_t)(uint32_t)wp_rr);
+        }
+    }
     if (trace) log_printf("[gekko_bridge] advance: -> update_related\n");
     // cpp_arena stays armed for the whole match (armed once at session arm).
     // It MUST capture every th155 operator-new — including the animation

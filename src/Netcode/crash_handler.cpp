@@ -393,10 +393,21 @@ static SafetyHookInline g_ff[5];
 static void log_fastfail_stack(const char* via) {
     log_crash_drain();
     crash_logf("\r\n==== FASTFAIL via %s ====\r\n", via);
+    // NB: do NOT probe with IsBadReadPtr here — it works by raising a real AV
+    // and swallowing it in SEH, but our VEH runs FIRST and logs it as a
+    // "CRASH at KERNEL32+..." (polluting exit-path logs and misclassifying
+    // clean runs as crashes). VirtualQuery bounds raise no exceptions.
+    auto readable = [](uintptr_t p, size_t len) -> bool {
+        MEMORY_BASIC_INFORMATION m;
+        if (VirtualQuery((void*)p, &m, sizeof m) != sizeof m) return false;
+        if (m.State != MEM_COMMIT || (m.Protect & PAGE_GUARD) || m.Protect == PAGE_NOACCESS)
+            return false;
+        return p + len <= (uintptr_t)m.BaseAddress + m.RegionSize;
+    };
     uintptr_t ebp = (uintptr_t)__builtin_frame_address(0);
     char loc[MAX_PATH + 32];
     for (int i = 0; i < 48 && ebp; ++i) {
-        if (IsBadReadPtr((void*)ebp, 8)) break;
+        if (!readable(ebp, 8)) break;
         const uintptr_t ret  = *(uintptr_t*)(ebp + 4);
         const uintptr_t next = *(uintptr_t*)ebp;
         if (ret) {
@@ -413,7 +424,7 @@ static void log_fastfail_stack(const char* via) {
     volatile uint32_t marker = 0;
     const uint32_t* sp = (const uint32_t*)&marker;
     for (int k = 0, shown = 0; k < 400 && shown < 28; ++k) {
-        if (IsBadReadPtr((void*)&sp[k], 4)) break;
+        if (!readable((uintptr_t)&sp[k], 4)) break;
         const uintptr_t v = sp[k];
         const uint32_t rva = (uint32_t)(v - base_address);
         if (rva >= 0x1000 && rva < 0x300000) {

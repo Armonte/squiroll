@@ -266,12 +266,76 @@ static void thiscall numdigit_hook(int self, int value) {
     g_h_numdigit.unsafe_thiscall<void>(self, value);
 }
 
+// Our own DLL's loaded [base, base+size) range. A ScriptAPI `this` can NEVER live
+// inside Netcode.dll — if RunOneFrame is invoked with such a `this`, it is a
+// corrupted boost::signals2 slot dispatch (a connection node whose bound target
+// resolved to {0x2FAD0, &g_h_runone}). Computed once from an address known to be
+// in our .text.
+static uint32_t g_self_lo = 0, g_self_hi = 0;
+static void compute_self_range() {
+    if (g_self_hi) return;
+    HMODULE h = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&compute_self_range, &h) && h) {
+        const uint8_t* b = (const uint8_t*)h;
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)b;
+        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(b + dos->e_lfanew);
+        g_self_lo = (uint32_t)(uintptr_t)b;
+        g_self_hi = g_self_lo + nt->OptionalHeader.SizeOfImage;
+    }
+}
+static inline bool self_is_ours(uint32_t p) {
+    return g_self_hi && p >= g_self_lo && p < g_self_hi;
+}
+
+// I2 PROBE: a ScriptAPI dispatched via a SCRIPT-HELD pointer must be sim state —
+// if it lives in the RENDER bump region (which leaks forward and REWINDS on
+// rollback), its memory gets reused by later render allocs and the dispatch
+// crashes (the +0x305AE READ-of-0xFFFFFF08: first dword = an RGBA color).
+// Log the block header (self-16) once per unique offset: link = the allocating
+// caller RVA -> names the misrouted allocation site so its routing can be fixed.
+static void probe_render_region_dispatch(int self, const char* who) {
+    if (!g_base) return;
+    uint32_t gb = (uint32_t)(uintptr_t)g_base;
+    if ((uint32_t)self < gb + RENDER_BASE || (uint32_t)self >= gb + ARENA_SIZE) return;
+    static uint32_t seen[24]; static int nseen = 0;
+    uint32_t off = (uint32_t)self - gb;
+    for (int k = 0; k < nseen; ++k) if (seen[k] == off) return;
+    if (nseen >= 24) return;
+    seen[nseen++] = off;
+    const uint32_t* h = (const uint32_t*)(uintptr_t)((uint32_t)self - 16);
+    log_printf("[rrdisp] %s on RENDER-REGION obj self=%08X off=0x%X "
+               "hdr{cls=%u req=%u link_rva=%05X magic=%08X} [0]=%08X f=%d rb=%d\n",
+               who, (uint32_t)self, off, h[0], h[1], h[2], h[3],
+               *(const uint32_t*)(uintptr_t)self,
+               gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb);
+}
+
 // DIAG: which Act::ScriptAPI::RunOneFrame (0x2FAD0) invokes the forward-only draw
 // slots? Log `this` + rb. A `this` that appears with rb==0 ONLY is the draw/render
 // ScriptAPI the re-sim skips (advance_one_frame's main+bg run on both rb=0 and rb>0).
 static SafetyHookInline g_h_runone{};
 static void thiscall runone_hook(int self) {
     static int n = 0;
+    // ROLLBACK CRASH GUARD: a corrupted boost::signals2 slot fires RunOneFrame with
+    // this == &g_h_runone (our own SafetyHookInline, in Netcode.dll). The body then
+    // walks our hook object as a ScriptAPI signal and does `lock inc` on a read-only
+    // .text address (control-block field = &runone_hook) -> 0xC0000005. That `this`
+    // is never a real ScriptAPI, so skip the call entirely (the corrupt dispatch is
+    // a no-op instead of a crash; render self-corrects next forward frame).
+    compute_self_range();
+    if (self_is_ours((uint32_t)self) || (uint32_t)self < 0x10000) {
+        static int badn = 0;
+        if (badn < 40) { ++badn;
+            log_printf("[runone] SKIP bad this=%08X rb=%d f=%d [0]=%08X [4]=%08X (in-our-dll=%d)\n",
+                       (uint32_t)self, gekko_bridge::g_trace_rb, gekko_bridge::g_trace_frame,
+                       (uint32_t)self >= 0x10000 ? *(uint32_t*)self : 0,
+                       (uint32_t)self >= 0x10000 ? *(uint32_t*)(self + 4) : 0,
+                       (int)self_is_ours((uint32_t)self)); }
+        return;
+    }
+    probe_render_region_dispatch(self, "RunOneFrame");
     // One-shot: are the main game-loop ScriptAPI (g_gameloop_scriptapi @0x49AFBC) and
     // the sim ScriptAPI (advance_one_frame drives *0x49B01C) the SAME object? Decides
     // whether the crash's render-connection list can be excluded as a whole ScriptAPI.
@@ -311,6 +375,17 @@ static void thiscall runone_hook(int self) {
 // catch use_count dropping to 0 (and the exact sc address to decouple).
 static SafetyHookInline g_h_haspend{};
 static char thiscall haspend_hook(int self) {
+    // Same corrupted-slot guard as runone_hook: a this inside our own DLL is not a
+    // real ScriptAPI; calling the original would `lock inc` a read-only .text addr.
+    compute_self_range();
+    if (self_is_ours((uint32_t)self) || (uint32_t)self < 0x10000) {
+        static int badn = 0;
+        if (badn < 20) { ++badn;
+            log_printf("[haspend] SKIP bad this=%08X rb=%d f=%d\n", (uint32_t)self,
+                       gekko_bridge::g_trace_rb, gekko_bridge::g_trace_frame); }
+        return 0;
+    }
+    probe_render_region_dispatch(self, "HasPendingFrame");
     uint32_t head = *(uint32_t*)(self + 0);
     uint32_t sc   = *(uint32_t*)(self + 4);
     uint32_t gb = (uint32_t)(uintptr_t)g_base;
@@ -843,6 +918,45 @@ static int __stdcall det_qpc(long long* p) {
     int f = gekko_bridge::g_trace_frame; if (p) *p = (long long)(f < 0 ? 0 : f) * 100000; return 1;
 }
 static int __stdcall det_qpf(long long* p) { if (p) *p = 6000000; return 1; }   // 100000*60
+// *** THE DOMINANT NONDETERMINISM ***: Ew_sRandom__ctor (0xE95A0) seeds its SFMT19937 RNGs from
+// GetLocalTime (wYear+wMonth+...+wMilliseconds). That RNG drives every effect's randomization
+// (generate_random_unit_vector3 0x10A8C0, Ew_cEwEftPGeometry*, etc.), so the whole effect/render
+// stream — and the dispatch list the rollback corrupts — differs EVERY launch. Pin GetLocalTime
+// to a constant SYSTEMTIME so the seed (and thus the effect RNG sequence) is identical run-to-run.
+// (Only other users are cosmetic timestamps.) 8 WORDs = SYSTEMTIME.
+// *** COMPREHENSIVE ADDRESS DETERMINISM ***: the Windows heap grows by reserving segments via
+// ntdll!NtAllocateVirtualMemory (NOT kernel32!VirtualAlloc, and not pinned by bottom-up-ASLR-off).
+// So th155's heap pools (0x0C... region, 0x00B-0x00D heap) still land at run-varying addresses,
+// and every pointer to a heap object in the rollback snapshot differs run-to-run. Hook the native
+// allocator and assign a DETERMINISTIC base (bump allocator) to every OS-chosen reservation, so
+// th155's entire dynamic address space is reproducible. Only touches *BaseAddress==NULL reserves;
+// explicit-base calls (our fixed arenas) pass through. Falls back to OS choice if our slot is taken.
+static SafetyHookInline g_h_ntalloc{};
+static uintptr_t g_va_next = 0x50000000;   // deterministic bump region (above image+arenas, below DLLs)
+typedef long (__stdcall* NtAllocVM_t)(void*, void**, unsigned long, size_t*, unsigned long, unsigned long);
+static long __stdcall ntalloc_hook(void* proc, void** base, unsigned long zbits,
+                                   size_t* size, unsigned long type, unsigned long prot) {
+    if (base && *base == nullptr && size && *size && (type & MEM_RESERVE) && g_va_next < 0x70000000) {
+        size_t rsz = (*size + 0xFFFF) & ~(size_t)0xFFFF;
+        void* tryb = (void*)((g_va_next + 0xFFFF) & ~(uintptr_t)0xFFFF);
+        size_t sz2 = *size;
+        long st = g_h_ntalloc.unsafe_stdcall<long>(proc, &tryb, zbits, &sz2, type, prot);
+        if (st >= 0) { g_va_next = (uintptr_t)tryb + rsz; *base = tryb; *size = sz2; return st; }
+        // our address was unavailable — fall through to an OS-chosen reservation
+    }
+    return g_h_ntalloc.unsafe_stdcall<long>(proc, base, zbits, size, type, prot);
+}
+static void __stdcall det_getlocaltime(unsigned short* st) {
+    static int n = 0;
+    if (n < 6) { ++n;
+        uint32_t ra = (uint32_t)((uintptr_t)__builtin_return_address(0) - base_address);
+        // caller_rva ~0xE95FE => Ew_sRandom__ctor => the RNG SEED went through our hook (pinned).
+        log_printf("[det] GetLocalTime caller_rva=%08X %s\n", ra,
+                   (ra >= 0xE95A0 && ra <= 0xE9736) ? "<<< RNG SEED (Ew_sRandom__ctor)" : "(cosmetic)");
+    }
+    if (!st) return;
+    st[0]=2026; st[1]=1; st[2]=0; st[3]=1; st[4]=0; st[5]=0; st[6]=0; st[7]=0;
+}
 
 } // namespace
 
@@ -870,14 +984,29 @@ void install() {
     // MEM_WRITE_WATCH: a snapshot module tracks which pages each frame
     // dirties (GetWriteWatch), so a rollback snapshot copies only what
     // changed, not the whole arena.
-    g_base = (uint8_t*)VirtualAlloc(nullptr, ARENA_SIZE,
+    // DETERMINISM: pin the arena to a FIXED base. With VirtualAlloc(nullptr) the OS picks the
+    // address, so it varies every run — and every arena-internal pointer (boost::signals2 slot
+    // node links, container layout in the render dispatch) varies with it. Anything that orders/
+    // hashes by pointer value then behaves differently run-to-run, so the rollback corrupts the
+    // dispatch list at a DIFFERENT frame each run (the crash-frame jitter). A fixed base makes the
+    // whole arena layout reproducible run-to-run. Fall back to OS-chosen only if the slot is taken.
+    g_base = (uint8_t*)VirtualAlloc((void*)0x30000000, ARENA_SIZE,
                                     MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH,
                                     PAGE_READWRITE);
+    if (!g_base) {
+        g_base = (uint8_t*)VirtualAlloc(nullptr, ARENA_SIZE,
+                                        MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH,
+                                        PAGE_READWRITE);
+        log_printf("[cpp_arena] fixed base 0x30000000 unavailable -> OS-chosen %p "
+                   "(run-to-run pointer determinism LOST)\n", (void*)g_base);
+    }
     if (!g_base) {
         log_printf("[cpp_arena] !! VirtualAlloc(%u) failed — C++ heap stays "
                    "on the CRT heap\n", ARENA_SIZE);
         return;
     }
+    log_printf("[cpp_arena] arena base = %p (fixed-base determinism %s)\n",
+               (void*)g_base, ((uintptr_t)g_base == 0x30000000) ? "ON" : "OFF");
     g_meta = (Meta*)g_base;
     g_meta->magic      = META_MAGIC;
     g_meta->bump        = (sizeof(Meta) + 15u) & ~15u;  // first SIM block 16-aligned
@@ -908,12 +1037,24 @@ void install() {
     // residual nondeterminism source is still being chased).
     if (getenv("SQUIROLL_DET"))
     {   // Patch th155's real-time IATs to frame-deterministic stubs (render determinism).
+    // Pin th155's entire dynamic address space (heap segments + pools) to deterministic bases.
+    // Gated behind SQUIROLL_VABUMP: only useful once the allocation SEQUENCE is deterministic
+    // (it isn't yet — the pre-match/render alloc count varies, so the bump just relocates noise).
+    if (getenv("SQUIROLL_VABUMP"))
+    if (HMODULE nt = GetModuleHandleA("ntdll.dll")) {
+        if (void* p = (void*)GetProcAddress(nt, "NtAllocateVirtualMemory")) {
+            g_h_ntalloc = safetyhook::create_inline(p, (void*)ntalloc_hook);
+            log_printf("[det] NtAllocateVirtualMemory hooked -> deterministic bases from 0x%08X\n",
+                       (unsigned)g_va_next);
+        }
+    }
     g_h_scripttime = safetyhook::create_inline((void*)(0x49450_R),  (void*)scripttime_hook);
     {
         struct { uint32_t iat; void* fn; const char* nm; } pat[] = {
             { 0x3883CC_R, (void*)&det_getasynckeystate, "GetAsyncKeyState" },
             { 0x3884BC_R, (void*)&det_timegettime,      "timeGetTime"      },
             { 0x3880A4_R, (void*)&det_gettickcount,     "GetTickCount"     },
+            { 0x3880E0_R, (void*)&det_getlocaltime,     "GetLocalTime(RNG seed)" },
             // QPC NOT hooked: it's pure PROFILING (effect vftable_19 stores it into a
             // perf-stats struct for UpdateLayerPerfCounter), not animation. Our small
             // frame value vs the real pre-hook baseline made elapsed negative -> worse.

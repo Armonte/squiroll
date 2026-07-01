@@ -180,11 +180,31 @@ void bootstrap_program(HANDLE process, HANDLE thread) {
 static char COMMAND_LINE_INVOKE[128] = EXE_INVOKE_STR;
 
 bool execute_program_inject(InitFuncData* init_data, bool wait_for_exit) {
+    // DETERMINISM: spawn th155.exe with bottom-up ASLR OFF (+ high-entropy off) so its default
+    // process heap and all DLLs load at fixed bases every run. Combined with th155.exe's cleared
+    // DYNAMICBASE bit and squiroll's fixed-base arenas, this makes every pointer the rollback
+    // snapshots reproducible run-to-run — required to make the render-dispatch crash 100% repro.
+    STARTUPINFOEXA six = {};
+    six.StartupInfo.cb = sizeof(six);
+    SIZE_T attr_sz = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_sz);
+    six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_sz);
+    DWORD64 mitig = 0;
+    bool have_attr = six.lpAttributeList &&
+        InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_sz);
+    if (have_attr) {
+        mitig = PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF
+              | PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_OFF;
+        UpdateProcThreadAttribute(six.lpAttributeList, 0,
+            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitig, sizeof(mitig), NULL, NULL);
+    }
     STARTUPINFOA si = { sizeof(STARTUPINFOA) };
     PROCESS_INFORMATION pi = {};
-    
+
+    DWORD flags = CREATE_SUSPENDED | (have_attr ? EXTENDED_STARTUPINFO_PRESENT : 0);
     bool ret = false;
-    if (CreateProcessA(EXE_INVOKE_STR, COMMAND_LINE_INVOKE, NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+    if (CreateProcessA(EXE_INVOKE_STR, COMMAND_LINE_INVOKE, NULL, NULL, TRUE, flags, NULL, NULL,
+                       have_attr ? (LPSTARTUPINFOA)&six : &si, &pi)) {
         
         bootstrap_program(pi.hProcess, pi.hThread);
         

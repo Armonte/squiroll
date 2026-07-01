@@ -26,6 +26,7 @@
 #include "sq_arena.h"
 #include "cpp_arena.h"
 #include "bullet_arena.h"
+#include "tf4_arena.h"
 #include "input_hist.h"
 #include "tf4_pool.h"
 #include "sq_trace.h"
@@ -306,6 +307,16 @@ bool common_init(
     // VEH crash logger — install before any of our patches/hooks so a
     // fault anywhere lands a module+RVA report in aocf_crash.log.
     crash_handler::install();
+
+    // IAT-patch th155's VirtualAlloc so the two engine-private "TF4 mspace"
+    // dlmalloc pools (allocated by tf4_mspace_create during engine init) get
+    // MEM_WRITE_WATCH + fixed bases and are recorded for rollback snapshotting.
+    // common_init runs at th155's entrypoint hook, BEFORE the original
+    // entrypoint (and hence engine init / tf4_mspace_create) is tail-called —
+    // so this is early enough to intercept the pool VirtualAllocs. Verified at
+    // runtime by the "[tf4_arena] pool ... intercepted" log lines and the
+    // absence of a "TOO LATE" line.
+    tf4_arena::early_install();
 
     // Redirect th155's Squirrel-instance object pool to allocate its slabs
     // from cpp_arena (rollback-snapshotted) instead of the TF4-engine mspace

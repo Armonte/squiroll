@@ -6,6 +6,7 @@
 #include "sq_arena.h"
 #include "bullet_arena.h"
 #include "cpp_arena.h"
+#include "tf4_arena.h"       // arenas 3/4 — the two engine-private TF4 mspace pools
 #include "crash_handler.h"   // watchpoint_arm — auto-attribute first divergence
 #include "patch_utils.h"     // base_address (vtable -> RVA resolution in the f=15 probe)
 #include "log.h"
@@ -75,12 +76,30 @@ namespace {
 
 static constexpr uint32_t PAGE   = 4096;
 static constexpr int      RING   = 16;   // > GekkoConfig::check_distance (8)
-static constexpr int      NARENA = 3;    // 0 = sq_arena, 1 = bullet_arena, 2 = cpp_arena
+static constexpr int      NARENA = 5;    // 0 = sq_arena, 1 = bullet_arena, 2 = cpp_arena,
+                                         // 3 = tf4 mspace A (~128MB), 4 = tf4 mspace B (~32MB)
+// Arenas [0, NDIAG) carry the bump/phash-fold/divf diagnostic machinery. The
+// tf4 pools (3,4) are dlmalloc mspaces with no bump field and legitimately
+// differ fwd-vs-resim (signals2 control blocks / Sqrat holders), so they are
+// capture/restore-ONLY — excluded from every checksum + divergence diagnostic.
+static constexpr int      NDIAG  = 3;
+
+// Largest arena an arm() can register. tf4 region A is 128 MB + 64 KB (the
+// allocation-granularity round-up in tf4_mspace_create: (gran + 0x8000377) &
+// ~(gran-1) with gran = 0x10000 -> 0x8010000, 32784 pages). Sizes the arm()
+// guard AND restore()'s per-arena `seen` bitmap, so both must exceed it.
+static constexpr uint32_t MAX_ARENA_BYTES = 144u * 1024 * 1024;   // headroom over 128MB+64KB
 
 // Per-slot dirty-page delta capacity. A 2D-fighter frame writes far less; the
 // cap only guards a pathological frame, which is logged loudly if hit.
+// tf4 A (arena 3) dirties ~1 page/frame -> 8 MB is ample. tf4 B (arena 4, the
+// 32 MB secondary pool) is written ~3550 pages (~14.5 MB) EVERY frame by a
+// background (audio/streaming decoder) thread that lives in the TF4 mspace, so
+// its cap is raised to 20 MB (~5100 records) to capture the whole region B
+// churn without the delta `break` that would leave it half-captured.
 static const uint32_t DELTA_CAP[NARENA] = { 8u * 1024 * 1024, 4u * 1024 * 1024,
-                                            8u * 1024 * 1024 };
+                                            8u * 1024 * 1024, 8u * 1024 * 1024,
+                                            20u * 1024 * 1024 };
 static constexpr uint32_t SMALL_CAP = 4u * 1024 * 1024;
 
 // One dirty-page record in a delta buffer: [page-offset u32][PAGE bytes].
@@ -152,11 +171,25 @@ static uint32_t hash_page(const uint8_t* p) {
 void arm() {
     if (g_armed) return;
 
+    // tf4 arenas 3/4 are optional — registered only if tf4_arena intercepted
+    // both pools (early enough, not disabled). Otherwise size 0 -> every loop
+    // skips them gracefully and rollback runs on the three core arenas as before.
+    //
+    // Region B ('stl', 32MB) is NOT registered by default: measured ~3550 dirty
+    // pages (~14.5MB) EVERY frame from a background audio/streaming thread —
+    // wholesale snapshot/restore races that thread (torn dlmalloc state ->
+    // intermittent ~f=12 abort). Its sim-relevant pool BLOCKS stay covered by
+    // the targeted boostpool capture. SQUIROLL_TF4B=1 re-enables for experiments.
+    // Region A ('system', 128MB) is ~1 dirty page/frame in battle — capture it.
+    const bool tf4_on  = tf4_arena::ready();
+    const bool tf4b_on = tf4_on && getenv("SQUIROLL_TF4B");
     struct Src { uint8_t* base; uint32_t size; };
     Src src[NARENA] = {
         { sq_arena::base(),     sq_arena::capacity()     },
         { bullet_arena::base(), bullet_arena::capacity() },
         { cpp_arena::base(),    cpp_arena::capacity()    },
+        { tf4_on  ? tf4_arena::base(0) : nullptr, tf4_on  ? tf4_arena::size(0) : 0 },
+        { tf4b_on ? tf4_arena::base(1) : nullptr, tf4b_on ? tf4_arena::size(1) : 0 },
     };
 
     uint32_t maxpages = 0;
@@ -165,12 +198,20 @@ void arm() {
         A.base   = src[a].base;
         A.size   = src[a].size;
         A.npages = src[a].size / PAGE;
+        // Zero-size arena (e.g. tf4 pools unavailable): skip it entirely. All
+        // per-arena loops (capture/restore/report) tolerate size==0 and no-op.
+        if (A.size == 0) {
+            A.mirror = nullptr;
+            A.phash  = nullptr;
+            continue;
+        }
         if (A.npages > maxpages) maxpages = A.npages;
-        // restore()'s `seen` bitmap is sized for a 128 MB arena. A larger
+        // restore()'s `seen` bitmap is sized for MAX_ARENA_BYTES. A larger
         // arena would overflow it — fail to arm rather than corrupt memory.
-        if (src[a].size > 128u * 1024 * 1024) {
+        if (src[a].size > MAX_ARENA_BYTES) {
             log_printf("[snapshot_ring] !! arm: arena %d too large (%u MB) — "
-                       "raise `seen` bitmap size\n", a, src[a].size / (1024*1024));
+                       "raise MAX_ARENA_BYTES / `seen` bitmap size\n",
+                       a, src[a].size / (1024*1024));
             return;
         }
         if (!A.base) {
@@ -209,11 +250,17 @@ void arm() {
             S.delta[a] = (uint8_t*)VirtualAlloc(nullptr, DELTA_CAP[a],
                              MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!S.delta[a]) delta_ok = false;
-            // DIAGNOSTIC: phash snapshot, npages * 4. Cheap.
-            S.phash_snap[a] = (uint32_t*)VirtualAlloc(nullptr,
-                                  g_ar[a].npages * 4u,
-                                  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (!S.phash_snap[a]) delta_ok = false;
+            // DIAGNOSTIC: phash snapshot, npages * 4. Cheap. Skip zero-size
+            // arenas (VirtualAlloc(0) fails) — their phash_snap is never read
+            // (divf/diagnostics run only for arenas [0, NDIAG)).
+            if (g_ar[a].npages) {
+                S.phash_snap[a] = (uint32_t*)VirtualAlloc(nullptr,
+                                      g_ar[a].npages * 4u,
+                                      MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (!S.phash_snap[a]) delta_ok = false;
+            } else {
+                S.phash_snap[a] = nullptr;
+            }
         }
         // DIAGNOSTIC: per-target-page byte shadows (4 KB each).
         for (int i = 0; i < N_TARGETS; ++i) {
@@ -229,9 +276,12 @@ void arm() {
 
     g_cur   = -1;
     g_armed = true;
-    log_printf("[snapshot_ring] armed: sq=%uMB bullet=%uMB cpp=%uMB ring=%d\n",
+    log_printf("[snapshot_ring] armed: sq=%uMB bullet=%uMB cpp=%uMB "
+               "tf4A=%uMB tf4B=%uMB ring=%d (tf4 %s)\n",
                g_ar[0].size / (1024 * 1024), g_ar[1].size / (1024 * 1024),
-               g_ar[2].size / (1024 * 1024), RING);
+               g_ar[2].size / (1024 * 1024), g_ar[3].size / (1024 * 1024),
+               g_ar[4].size / (1024 * 1024), RING,
+               tf4_on ? "ON" : "OFF");
 }
 
 bool armed() { return g_armed; }
@@ -243,7 +293,9 @@ namespace {
 // only [base, base+bump): the dead space beyond the high-water is not part
 // of the game state and including it makes the checksum disagree with a
 // fresh full hash of the live arena (a false-positive desync).
-static const uint32_t BUMP_OFF[NARENA] = { 0, 4, 4 };
+// tf4 entries (3,4) are unused — the tf4 pools are dlmalloc mspaces with no
+// bump field and are excluded from every checksum/diagnostic (see NDIAG).
+static const uint32_t BUMP_OFF[NARENA] = { 0, 4, 4, 0, 0 };
 
 // Full-state desync checksum: fold every in-use page hash (cheap — maintained
 // incrementally) plus the small blob.
@@ -267,7 +319,9 @@ static constexpr int CPP_ARENA = 2;
 static uint32_t fold_checksum(const uint8_t* sblob, uint32_t sblob_len) {
     uint32_t h = 2166136261u;
     for (int a = 0; a < NARENA; ++a) {
-        if (a == CPP_ARENA) continue;   // render state — not part of the sim checksum
+        // Skip cpp (render state) AND the tf4 pools (3,4): the sim checksum is
+        // sq(0)+bullet(1)+sblob only. cpp/tf4 legitimately differ fwd-vs-resim.
+        if (a >= CPP_ARENA) continue;
         uint32_t bump = *(const uint32_t*)(g_ar[a].base + BUMP_OFF[a]);
         uint32_t upg  = (bump + PAGE - 1) / PAGE;
         if (upg > g_ar[a].npages) upg = g_ar[a].npages;
@@ -484,6 +538,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
     uint64_t t_ww = 0, t_dirty = 0;
     for (int a = 0; a < NARENA; ++a) {
         Arena& A = g_ar[a];
+        if (A.size == 0) { S.dn[a] = 0; continue; }   // unregistered arena (tf4 off)
         ULONG_PTR count = A.npages;
         ULONG     gran  = 0;
         LARGE_INTEGER w0; QueryPerformanceCounter(&w0);
@@ -631,7 +686,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
     // combined checksum.
     {
         uint32_t hc[NARENA], bc[NARENA];
-        for (int a = 0; a < NARENA; ++a) {
+        for (int a = 0; a < NDIAG; ++a) {   // tf4 pools (3,4) have no bump field — excluded
             uint32_t bump = *(const uint32_t*)(g_ar[a].base + BUMP_OFF[a]);
             bc[a] = bump;
             uint32_t upg  = (bump + PAGE - 1) / PAGE;
@@ -648,7 +703,10 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
         // fold) differs, the phash divergence is a stale-hash artifact and the cpp
         // arena is actually byte-deterministic. Gated to early frames (cost).
         uint32_t cppb = 0;
-        if (frame <= 6) {
+        // RUN-TO-RUN NONDETERMINISM TRACE: compute the full non-HUD cpp content hash on every
+        // FORWARD save across many frames. Run the same seed twice and diff the [comp] fwd cppb
+        // per frame — the FIRST frame whose cppb differs run-to-run is where nondeterminism entered.
+        if (frame <= 120 && !re_capture_diag) {
             cppb = 2166136261u;
             const uint32_t* dw = (const uint32_t*)g_ar[CPP_ARENA].base;
             uint32_t ndw = bc[CPP_ARENA] / 4;
@@ -660,6 +718,26 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
         log_printf("[comp] f=%u sq=%08x/%u bt=%08x/%u cpp=%08x/%u cppb=%08x %s\n",
                    frame, hc[0], bc[0], hc[1], bc[1], hc[2], bc[2], cppb,
                    re_capture_diag ? "RESIM" : "fwd");
+
+        // RUN-TO-RUN ARENA DIFF (SQUIROLL_DUMP=N): with addresses fixed (ASLR off + fixed arena
+        // base), dump cpp [0,bump) to disk on the forward save of frame N. Run twice, binary-diff
+        // the two dumps — the differing offsets are the EXACT residual nondeterminism. Map each
+        // offset to its arena block (HDR_MAGIC 0x42504143 at payload-16, link_rva at +8) to name
+        // the allocating site, so we know if it's a few handles/DLL-ptrs (excludable) or pervasive.
+        {
+            static int dump_frame = -2;
+            if (dump_frame == -2) { char b[8]={0}; DWORD n=GetEnvironmentVariableA("SQUIROLL_DUMP",b,sizeof b);
+                                    dump_frame = (n>0)? atoi(b) : -1; }
+            if (dump_frame > 0 && (int)frame == dump_frame && !re_capture_diag) {
+                HANDLE h = CreateFileA("aocf_cpp_dump.bin", GENERIC_WRITE, 0, nullptr,
+                                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h != INVALID_HANDLE_VALUE) {
+                    DWORD w = 0; WriteFile(h, g_ar[CPP_ARENA].base, bc[CPP_ARENA], &w, nullptr);
+                    CloseHandle(h);
+                    log_printf("[dump] f=%u wrote cpp [0,%u) -> aocf_cpp_dump.bin\n", frame, bc[CPP_ARENA]);
+                }
+            }
+        }
     }
 
     // DIAGNOSTIC: every-frame divergence detection via per-page hash. At the
@@ -672,11 +750,11 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
     {
         Slot& S = g_ring[frame % RING];
         if (re_capture_diag) {
-            static const char* names[NARENA] = { "sq", "bt", "cpp" };
+            static const char* names[NARENA] = { "sq", "bt", "cpp", "tf4A", "tf4B" };
             static bool first_dump_done = false;   // dump page bytes ONCE
             (void)first_dump_done;                 // kept for binary stability
             int totalp = 0;
-            for (int a = 0; a < NARENA; ++a) {
+            for (int a = 0; a < NDIAG; ++a) {   // tf4 pools (3,4) excluded from divf
                 // cpp divf ON: bump is consistent fwd-vs-resim, so the divergence is
                 // a CONTENT write at a stable address — trace which pages/dwords.
                 int hits = 0;
@@ -829,8 +907,9 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                 }
             }
             // Refresh ALL snapshots to the new (re-sim) value — so any
-            // subsequent re-capture detects only NEW divergences.
-            for (int a = 0; a < NARENA; ++a)
+            // subsequent re-capture detects only NEW divergences. (Diag arenas
+            // only — tf4 pools have no phash_snap and are excluded from divf.)
+            for (int a = 0; a < NDIAG; ++a)
                 memcpy(S.phash_snap[a], g_ar[a].phash, g_ar[a].npages * 4);
             for (int i = 0; i < N_TARGETS; ++i) {
                 int a = TARGET_PAGES[i].arena; uint32_t off = TARGET_PAGES[i].off;
@@ -840,8 +919,8 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
         } else {
             // First capture (forward) of this frame in the current ring
             // window — snapshot the per-page hashes AND the target page bytes
-            // for later comparison.
-            for (int a = 0; a < NARENA; ++a)
+            // for later comparison. (Diag arenas only — see above.)
+            for (int a = 0; a < NDIAG; ++a)
                 memcpy(S.phash_snap[a], g_ar[a].phash, g_ar[a].npages * 4);
             for (int i = 0; i < N_TARGETS; ++i) {
                 int a = TARGET_PAGES[i].arena; uint32_t off = TARGET_PAGES[i].off;
@@ -876,10 +955,13 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
     }
 
     // Periodic report — dirty pages + where capture's time goes.
-    static uint32_t prc = 0, psq = 0, pbt = 0;
+    static uint32_t prc = 0, psq = 0, pbt = 0, pcpp = 0, pt4a = 0, pt4b = 0;
     static uint64_t a_ww = 0, a_dirty = 0, a_rest = 0, a_fold = 0;
     psq    += S.dn[0];
     pbt    += S.dn[1];
+    pcpp   += S.dn[2];
+    pt4a   += S.dn[3];
+    pt4b   += S.dn[4];
     a_ww   += t_ww;
     a_dirty += t_dirty;
     a_rest += (uint64_t)(pt1.QuadPart - pt0.QuadPart) - t_ww - t_dirty;
@@ -890,11 +972,12 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
         auto us = [&](uint64_t t) -> uint32_t {
             return (uint32_t)(t * 1000000ull / hz / prc);
         };
-        log_printf("[snapshot_ring] dirty/cap sq=%u bt=%u (%uKB)  us: "
-                   "getww=%u dirtycopy=%u sblobcopy=%u fold=%u\n",
-                   psq / prc, pbt / prc, (psq + pbt) / prc * 4,
+        log_printf("[snapshot_ring] dirty/cap sq=%u bt=%u cpp=%u tf4A=%u tf4B=%u "
+                   "(%uKB)  us: getww=%u dirtycopy=%u sblobcopy=%u fold=%u\n",
+                   psq / prc, pbt / prc, pcpp / prc, pt4a / prc, pt4b / prc,
+                   (psq + pbt + pcpp + pt4a + pt4b) / prc * 4,
                    us(a_ww), us(a_dirty), us(a_rest), us(a_fold));
-        prc = psq = pbt = 0;
+        prc = psq = pbt = pcpp = pt4a = pt4b = 0;
         a_ww = a_dirty = a_rest = a_fold = 0;
     }
 
@@ -947,14 +1030,47 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
         }
     }
 
+    // STEP 0 — revert the POST-CAPTURE window (the crash-root fix, 2026-07-01).
+    // Writes made since capture(g_cur) — the forward-only game-loop ScriptAPI
+    // dispatch (RunOneFrame connection-node inserts/erases/cursor advances) and
+    // the render pass both run AFTER the save — live in NO ring delta. The
+    // reverse-apply below therefore left them in place while everything else
+    // reverted, producing a MIXED state: e.g. the restored DrawCommandSlot head
+    // (frame-target value) pointing at a node whose page kept its post-capture
+    // "erased/freed/reused" bytes -> head -> 0xFFFFFF00 vertex colors -> the
+    // +0x305AE abort (Dr0-proven: the fatal value was never written to the
+    // slot itself; it sat one level deeper in a non-reverted page). The mirror
+    // holds every page's state as of capture(g_cur), so reverting the current
+    // write-watch dirty set to the mirror completes the chain:
+    //     live --(mirror)--> g_cur --(ring deltas)--> target.
+    for (int a = 0; a < NARENA; ++a) {
+        Arena& A = g_ar[a];
+        if (!A.size) continue;
+        ULONG_PTR count = A.npages;
+        ULONG     gran  = 0;
+        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, A.base, A.size,
+                          g_pgbuf, &count, &gran) != 0) {
+            log_printf("[snapshot_ring] !! restore GetWriteWatch failed arena=%d\n", a);
+            continue;
+        }
+        for (ULONG_PTR i = 0; i < count; ++i) {
+            uint32_t off = (uint32_t)((uint8_t*)g_pgbuf[i] - A.base);
+            if (off + PAGE > A.size) continue;
+            memcpy(A.base + off, A.mirror + off, PAGE);   // live -> state(g_cur)
+            // mirror/phash already hold the capture(g_cur) value — untouched.
+        }
+    }
+
     // Coalesced reverse-apply. A hot page (the VM operand stack) is dirtied
     // every frame, so it appears in every rolled-back frame's delta — the
     // naive newest-first apply would copy it once per frame. Instead walk
     // OLDEST->newest and restore each page exactly once, from the first
     // (oldest) delta that holds it: that pre-image is the page's value at
     // frame target-... = frame `target` (it was not dirtied in between).
-    // 1 bit/page; sized for the largest arena — cpp_arena, 128 MB / 4 KB.
-    static uint8_t seen[NARENA][(128u * 1024 * 1024 / PAGE) / 8];
+    // 1 bit/page; sized for the largest arena. tf4 region A is 128 MB + 64 KB
+    // (32784 pages) — larger than cpp's 128 MB — so this is sized for
+    // MAX_ARENA_BYTES, matching the arm() guard.
+    static uint8_t seen[NARENA][(MAX_ARENA_BYTES / PAGE) / 8];
     memset(seen, 0, sizeof(seen));
     for (int64_t f = target + 1; f <= g_cur; ++f) {
         Slot& S = g_ring[(uint32_t)(f % RING)];
@@ -998,7 +1114,7 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
     // Discard the write-watch entries our own restore writes just produced,
     // so the next capture sees only the re-sim advance's dirty pages.
     for (int a = 0; a < NARENA; ++a)
-        ResetWriteWatch(g_ar[a].base, g_ar[a].size);
+        if (g_ar[a].size) ResetWriteWatch(g_ar[a].base, g_ar[a].size);
 
     Slot& T = g_ring[frame % RING];
     if (T.frame != (int32_t)frame) {
