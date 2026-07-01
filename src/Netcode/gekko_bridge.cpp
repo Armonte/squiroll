@@ -2146,10 +2146,20 @@ bool tick() {
                                     && b[0] != '0') ? 1 : 0;
                     }
                     if (abort_on) {
-                        log_printf("[gekko_bridge] SQUIROLL_DESYNC_ABORT: first desync at frame=%d "
-                                   "— exiting for trace\n", e->data.desynced.frame);
-                        Sleep(300);
-                        ExitProcess(0);
+                        // Terminate + dump on the FIRST desync: the log then ends exactly
+                        // at the diverging frame with every per-frame diff diagnostic
+                        // ([comp]/[divf]/[engdiff]/[sblob]) for it already emitted.
+                        // Exit code 5 = "desync" so the harness can classify (0=clean).
+                        log_printf("[gekko_bridge] DESYNC_ABORT: frame=%d local=%08x remote=%08x "
+                                   "— dumping + exiting(5) for trace\n",
+                                   e->data.desynced.frame,
+                                   e->data.desynced.local_checksum,
+                                   e->data.desynced.remote_checksum);
+                        log_state_fingerprint(g_trace_frame, g_trace_rb, "desync-abort");
+                        battle_pools::log_fingerprint("desync-abort");
+                        log_flush();
+                        Sleep(500);
+                        ExitProcess(5);
                     }
                 }
                 break;
