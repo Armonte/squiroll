@@ -190,11 +190,25 @@ static int collect(Region* r) {
         //                  SoundPlayer::Play), diverges ±1 forward-vs-re-sim.
         //   [0x4DAD10,+4)  _Wndproc window/input state (async OS message handler)
         //                  — non-deterministic across the headless re-sim.
+        //   [0x4DB310,+0xA8) background-task condvar/mutex block — cond 0x4DB310,
+        //                  g_concurrency_task_cv_mutex 0x4DB338, queued-task slot
+        //                  0x4DB340 (a heap closure ptr, 0 when empty), mutex C
+        //                  0x4DB398. Written by producer/consumer threads at
+        //                  WALL-CLOCK time: fwd frame N had slot=0, the re-sim of
+        //                  N sees a live pointer → eng checksum mismatch = the
+        //                  f=716 DESYNC ([engdiff] rva 4DB008+0x338). Thread
+        //                  plumbing, not sim state.
+        //   [0x4DB6A8,+16) bg-ScriptAPI FIFO storage (closure ptr 0x4DB6AC,
+        //                  count 0x4DB6B0) — same wall-clock class; a rolled-back
+        //                  half-consumed slot is also the null-boost::function
+        //                  the re-sim kept invoking (clguard rva 0x32425 skips).
         const struct { uintptr_t lo, hi; } exr[] = {
-            { (uintptr_t)(0x49AF04_R), (uintptr_t)(0x49AF04_R) + 8  }, // _Wndproc window/input state (more)
-            { (uintptr_t)(0x4DAD10_R), (uintptr_t)(0x4DAD10_R) + 4  }, // _Wndproc window/input state
-            { (uintptr_t)(0x4DAEB8_R), (uintptr_t)(0x4DAEB8_R) + 20 }, // DirectInput device buffer
-            { (uintptr_t)(0x4DB004_R), (uintptr_t)(0x4DB004_R) + 4  }, // g_engine_loop_tick
+            { (uintptr_t)(0x49AF04_R), (uintptr_t)(0x49AF04_R) + 8    }, // _Wndproc window/input state (more)
+            { (uintptr_t)(0x4DAD10_R), (uintptr_t)(0x4DAD10_R) + 4    }, // _Wndproc window/input state
+            { (uintptr_t)(0x4DAEB8_R), (uintptr_t)(0x4DAEB8_R) + 20   }, // DirectInput device buffer
+            { (uintptr_t)(0x4DB004_R), (uintptr_t)(0x4DB004_R) + 4    }, // g_engine_loop_tick
+            { (uintptr_t)(0x4DB310_R), (uintptr_t)(0x4DB310_R) + 0xA8 }, // bg-task condvar/mutex/slot block
+            { (uintptr_t)(0x4DB6A8_R), (uintptr_t)(0x4DB6A8_R) + 16   }, // bg-ScriptAPI FIFO slot+count
         };
 
         // Emit committed run [a,e) as snapshot region(s), carving out every exr[].
