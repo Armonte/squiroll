@@ -116,10 +116,19 @@ static uint32_t pool_slots(const Pool* p) {
 
 void pregrow() {
     // Grow each used pool until it holds >= TARGET slots, so it will not
-    // need to grow mid-match (which would change the block set the
-    // snapshot walks). 1024 covers a danmaku-heavy peak with headroom;
-    // grow_count doubles per call so a couple of grows reach it.
-    static constexpr uint32_t TARGET = 1024;
+    // need to grow mid-match (which would change the block set the snapshot
+    // walks). 1024 covers a danmaku peak with headroom; grow_count doubles per
+    // call so this overshoots to ~2016 slots/pool. save() walks every pregrown
+    // slot + its free-list, so this IS a save-cost lever — but reducing it to
+    // 256 desynced 0x9999 (nitori/sinmyoumaru) at f=2 (a pool grew past the
+    // pregrown set mid-setup -> fwd/resim block-set mismatch). Safe reduction
+    // needs per-pool peak-usage data to size each pool individually; until then
+    // 1024 stays. SQUIROLL_PREGROW=N overrides for experiments (determinism-risky).
+    uint32_t TARGET = 1024;
+    { char b[8] = {0};
+      if (GetEnvironmentVariableA("SQUIROLL_PREGROW", b, sizeof b) > 0) {
+          uint32_t v = 0; for (const char* s = b; *s >= '0' && *s <= '9'; ++s) v = v*10 + (*s-'0');
+          if (v >= 32) TARGET = v; } }
     for (int i = 0; i < NPOOL; ++i) {
         Pool* p = pool_at(i);
         if (p->slot_size == 0) continue;  // pool never used yet — leave it
