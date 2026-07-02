@@ -523,7 +523,7 @@ static void gl_bfs_measure() {
 // every rollback restore so the forward-only render state never rolls back.
 void gl_capture() { if (g_gl_pin_on && g_armed) gl_pin_save(); }
 
-uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
+uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint32_t nocsum_tail) {
     if (!g_armed) return 0;
     Slot& S = g_ring[frame % RING];
     // Detect "the slot already holds this frame" BEFORE we overwrite S.frame
@@ -655,11 +655,14 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len) {
                    sblob_len, SMALL_CAP);
         sblob_len = SMALL_CAP;
     }
-    memcpy(S.sblob, sblob, sblob_len);
+    memcpy(S.sblob, sblob, sblob_len);        // FULL blob stored for restore
     S.sblob_len = sblob_len;
 
     LARGE_INTEGER pt1; QueryPerformanceCounter(&pt1);
-    uint32_t cs = fold_checksum(sblob, sblob_len);
+    // Exclude the restore-but-not-checksum tail (the RNG section) from the fold:
+    // it is stored+restored above but its bytes are render-contaminated.
+    uint32_t csum_len = (nocsum_tail <= sblob_len) ? sblob_len - nocsum_tail : sblob_len;
+    uint32_t cs = fold_checksum(sblob, csum_len);
     LARGE_INTEGER pt2; QueryPerformanceCounter(&pt2);
 
     // TRACE: ungated per-component checksum for EVERY save of the first frames, so

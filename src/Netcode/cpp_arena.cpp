@@ -368,6 +368,24 @@ static void thiscall runone_hook(int self) {
     if ((uint32_t)self == *(uint32_t*)(0x49AFBC_R)) snapshot_ring::gl_capture();
 }
 
+// DIAG (SQUIROLL_EFTTRACE): Ew_sEffect__CreateEffectGroup (0xEBEB0) — count
+// effect-group spawns per forward/re-sim to decide if the f=165 spark spawn is
+// render-only (fires rb==0 only -> route to render region) or a sim divergence
+// (fires inconsistently across re-sims -> uncaptured state). Logs the immediate
+// caller so the spawn SITE (script vs layer-task tick) is named.
+static SafetyHookInline g_h_eftgroup{};
+static uint32_t g_eft_fwd = 0, g_eft_resim = 0;
+static int thiscall eftgroup_hook(int mgr, int* tmpl, int block) {
+    uint32_t caller = (uint32_t)(uintptr_t)_ReturnAddress() - (uint32_t)base_address;
+    int rb = gekko_bridge::g_trace_rb;
+    if (rb) ++g_eft_resim; else ++g_eft_fwd;
+    static int nlog = 0;
+    if (nlog < 120) { ++nlog;
+        log_printf("[efttrace] CreateEffectGroup f=%d rb=%d caller_rva=%05X (fwd=%u resim=%u)\n",
+                   gekko_bridge::g_trace_frame, rb, caller, g_eft_fwd, g_eft_resim); }
+    return g_h_eftgroup.unsafe_thiscall<int>(mgr, tmpl, block);
+}
+
 // DIAG: confirm the slot-list shared_count divergence. signal_lock_slot_list (0x304F0)
 // reads the signal's slot-list shared_ptr from the ScriptAPI object: this+0 = list head,
 // this+4 = shared_count control block (sc+4 = use_count, sc+8 = weak_count). The crash
@@ -1050,6 +1068,8 @@ void install() {
     g_h_synclayer = safetyhook::create_inline((void*)(0xE5CD0_R), (void*)synclayer_hook);
     g_h_draw      = safetyhook::create_inline((void*)(0x10A080_R), (void*)draw_eff_hook);
     g_h_runone    = safetyhook::create_inline((void*)(0x2FAD0_R),  (void*)runone_hook);
+    if (getenv("SQUIROLL_EFTTRACE"))
+        g_h_eftgroup = safetyhook::create_inline((void*)(0xEBEB0_R), (void*)eftgroup_hook);
     g_h_pendframes= safetyhook::create_inline((void*)(0x591D0_R),  (void*)pendframes_hook);
     g_h_numdigit  = safetyhook::create_inline((void*)(0x158A40_R), (void*)numdigit_hook);
     (void)g_h_scripttime; (void)scripttime_hook; (void)g_h_scriptkey; (void)scriptkey_hook;
@@ -1346,6 +1366,21 @@ void trace_check(uint32_t frame, int rb) {
                    a.op == 1 ? "alloc" : "free ", a.size, a.caller, a.off,
                    b.op == 1 ? "alloc" : "free ", b.size, b.caller, b.off,
                    k == i ? "<-- FIRST DIFF" : "");
+    }
+    // When one side simply did MORE work (count mismatch with a matching
+    // prefix), the ±3 window above shows nothing past the shorter side —
+    // print the longer side's tail: those callers NAME the skipped work
+    // (e.g. re-sim f=165 ran 8 of forward's 24 events; forward's #8..#23
+    // are the branch the re-sim never took).
+    if (rn != sn) {
+        bool fwd_longer = sn > rn;
+        uint32_t  ln    = fwd_longer ? sn : rn;
+        for (uint32_t k = i; k < ln && k < i + 12; ++k) {
+            const TraceEv& e = fwd_longer ? g_tr_ring[slot][k] : g_tr[k];
+            log_printf("[cpptrace]   %s-only #%u %s sz=%u caller=%08X off=%X\n",
+                       fwd_longer ? "FWD" : "RESIM", k,
+                       e.op == 1 ? "alloc" : "free ", e.size, e.caller, e.off);
+        }
     }
 }
 uint8_t* base()      { return g_base; }

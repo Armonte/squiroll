@@ -320,6 +320,15 @@ static int collect(Region* r) {
     // DirectInput keyboard state table (see KBD_STATE_ADDR above).
     add(KBD_STATE_ADDR, KBD_STATE_BYTES);
 
+    // NB: the Ew::sRandom SFMT19937 state is captured SEPARATELY (rng_save/
+    // rng_load below), NOT here — it is RESTORE-BUT-NOT-CHECKSUM. Restoring it
+    // gives the re-sim a consistent RNG start (fixes the sim-side effect-spawn
+    // decision, i.e. the AnimController2D pointer divergence); but its end-of-
+    // frame state is contaminated by render-tied effect draws (bitmapfont
+    // damage numbers, layer-task particles — proven to spawn at diverging
+    // counts fwd-vs-resim), so folding it into the desync checksum produces a
+    // false eng divergence. Same class as cpp_arena: saved+restored, unchecked.
+
     // ENV gate: SQUIROLL_SNAP_EFFECT=0 disables the sEffect / sTask
     // additions from this snapshot. Use it to A/B test whether these
     // regions are implicated in a hang/freeze before reverting.
@@ -393,6 +402,60 @@ uint32_t save(uint8_t* out, uint32_t cap) {
             return 0;
     }
     return (uint32_t)(p - out);
+}
+
+// Ew::sRandom SFMT19937 state — RESTORE-BUT-NOT-CHECKSUM (see collect() note).
+// Chase g_ew_random_mgr(0x4DB0C4) -> vector<cRandom*> -> cRandom[1] wrapper ->
+// wrapper[1] = 0x9C8-byte state; serialize each as (addr,len,bytes) so rng_load
+// restores by saved address. The buffers are aligned_malloc'd once at init and
+// never move, so the address is a stable restore target.
+static int rng_collect(uint32_t* addrs, int maxn) {
+    int n = 0;
+    void* mgr = *(void**)(0x4DB0C4_R);
+    if (!mgr || !region_ok(mgr, 12)) return 0;
+    uint32_t begin = ((uint32_t*)mgr)[0], end = ((uint32_t*)mgr)[1];
+    for (uint32_t p = begin; p && p + 4 <= end && n < maxn; p += 4) {
+        uint32_t crandom = *(uint32_t*)(uintptr_t)p;
+        if (!crandom || !region_ok((void*)(uintptr_t)crandom, 8)) continue;
+        uint32_t wrapper = *(uint32_t*)(uintptr_t)(crandom + 4);
+        if (!wrapper || !region_ok((void*)(uintptr_t)wrapper, 8)) continue;
+        uint32_t state = *(uint32_t*)(uintptr_t)(wrapper + 4);
+        if (state && region_ok((void*)(uintptr_t)state, 0x9C8)) addrs[n++] = state;
+    }
+    return n;
+}
+
+uint32_t rng_save(uint8_t* out, uint32_t cap) {
+    uint32_t addrs[16];
+    int n = rng_collect(addrs, 16);
+    uint8_t* p = out; uint8_t* e = out + cap;
+    auto put = [&](const void* s, uint32_t l) -> bool {
+        if (p + l > e) return false; memcpy(p, s, l); p += l; return true;
+    };
+    uint32_t magic = SNAP_MAGIC ^ 0x524E47u, cnt = (uint32_t)n;   // 'RNG'
+    if (!put(&magic, 4) || !put(&cnt, 4)) return 0;
+    for (int i = 0; i < n; ++i) {
+        uint32_t a = addrs[i], l = 0x9C8;
+        if (!put(&a, 4) || !put(&l, 4) || !put((void*)(uintptr_t)a, l)) return 0;
+    }
+    // Never return 0 (empty is valid: RNG not yet created) — 8-byte header stands.
+    return (uint32_t)(p - out);
+}
+
+void rng_load(const uint8_t* blob, uint32_t len) {
+    if (len < 8) return;
+    const uint8_t* p = blob; const uint8_t* e = blob + len;
+    uint32_t magic = 0, cnt = 0;
+    memcpy(&magic, p, 4); p += 4; memcpy(&cnt, p, 4); p += 4;
+    if (magic != (SNAP_MAGIC ^ 0x524E47u)) return;
+    for (uint32_t i = 0; i < cnt && p + 8 <= e; ++i) {
+        uint32_t a = 0, l = 0;
+        memcpy(&a, p, 4); p += 4; memcpy(&l, p, 4); p += 4;
+        if (p + l > e) return;
+        if (a && l == 0x9C8 && region_ok((void*)(uintptr_t)a, l))
+            memcpy((void*)(uintptr_t)a, p, l);
+        p += l;
+    }
 }
 
 void load(const uint8_t* blob, uint32_t len) {

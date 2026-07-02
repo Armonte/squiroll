@@ -37,6 +37,9 @@ uint32_t save(uint8_t* out, uint32_t cap);
 // Restore from a save() blob — memcpy each recorded region back to its
 // address. Each region is range-checked before the write.
 void load(const uint8_t* blob, uint32_t len);
+// Ew::sRandom SFMT19937 state: restore-but-not-checksum (render-contaminated).
+uint32_t rng_save(uint8_t* out, uint32_t cap);
+void rng_load(const uint8_t* blob, uint32_t len);
 
 // DIAGNOSTIC: forward-vs-resim byte-diff of the th155 .data section. Called
 // post-advance with (frame, rb). On a forward advance it snapshots .data into

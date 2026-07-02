@@ -39,7 +39,7 @@ bool armed();
 // Capture frame `frame`: store the three arenas' dirty-page deltas and a copy
 // of `sblob` (the serialized non-arena sections). Returns the full-state
 // desync checksum.
-uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len);
+uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint32_t nocsum_tail = 0);
 
 // Roll the arenas back to `frame` and return that frame's sblob blob (its
 // length in *sblob_len). Returns nullptr if `frame` is outside the ring

@@ -857,6 +857,12 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         sect(&engine_snap::save);
         sect(&input_rec_save);
         sect(&input_hist::save);
+        // RNG section LAST + restore-but-not-checksum: its bytes are excluded
+        // from the desync fold (render-tied effect draws contaminate the state),
+        // but it is stored+restored so the re-sim's RNG start is consistent.
+        uint8_t* rng_start = sp;
+        sect(&engine_snap::rng_save);
+        uint32_t rng_tail = ok ? (uint32_t)(sp - rng_start) : 0;
         if (!ok) {
             log_printf("[gekko_bridge] !! small-section save overflow f=%u\n",
                        frame);
@@ -868,9 +874,9 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         // diverged. Sections are [u32 len][data], in sect() order.
         {
             const uint8_t* q = smb;
-            const char* nm[5] = { "bp", "mp", "eng", "irec", "ihist" };
-            char comps[160]; int cn = 0;
-            for (int s = 0; s < 5 && q + 4 <= sp; ++s) {
+            const char* nm[6] = { "bp", "mp", "eng", "irec", "ihist", "rng" };
+            char comps[192]; int cn = 0;
+            for (int s = 0; s < 6 && q + 4 <= sp; ++s) {
                 uint32_t L = *(const uint32_t*)q; q += 4;
                 if (q + L > sp) break;
                 uint32_t h = 2166136261u;
@@ -882,7 +888,7 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         }
         LARGE_INTEGER _c1; QueryPerformanceCounter(&_c1);
         uint32_t cs = snapshot_ring::capture(frame, smb,
-                                             (uint32_t)(sp - smb));
+                                             (uint32_t)(sp - smb), rng_tail);
         LARGE_INTEGER _c2; QueryPerformanceCounter(&_c2);
         g_perf_sblob += (uint64_t)(_c1.QuadPart - _c0.QuadPart);
         g_perf_cap   += (uint64_t)(_c2.QuadPart - _c1.QuadPart);
@@ -1097,6 +1103,7 @@ void load_state_from_buf(const void* buf, uint32_t len) {
             sect(&engine_snap::load);
             sect(&input_rec_load);
             sect(&input_hist::load);
+            sect(&engine_snap::rng_load);   // restore-but-not-checksum, section order matches save
         }
         // (trace_reset moved into advance_one_frame — see save_state_to_buf note.)
         return;
@@ -1829,12 +1836,21 @@ void advance_one_frame() {
             ExitProcess(0);
         }
     }
-    // cpp_arena divergence diagnostics ([cpptrace]/[allocdiag]) — DISABLED: cpp is
-    // intentionally excluded from the desync checksum (render state), so it
-    // diverges by design every frame. Diagnosing it just floods the log (the ~10
-    // fps) and walks the divergent arena. Re-enable only when debugging cpp itself.
-    // cpp_arena::trace_check(g_trace_frame, g_trace_rb);
-    // cpp_arena::diag_alloc_counts(g_trace_frame, g_trace_rb);
+    // cpp_arena alloc-sequence divergence trace ([cpptrace]) — env-gated. The old
+    // blanket-disable ("cpp diverges by design") predates restore step-0: the
+    // trace records ONLY advance-time (sim) allocs; render allocs happen outside
+    // the advance. SQUIROLL_CPPTRACE=1 re-arms it to name the first allocation
+    // where a re-sim's sequence deviates from its forward twin — the tool that
+    // pins the AnimationController2D+0x20 pointer divergence (f=166 depth=7).
+    {
+        static int ct_on = -1;
+        if (ct_on < 0) {
+            char b[8] = {0};
+            ct_on = (GetEnvironmentVariableA("SQUIROLL_CPPTRACE", b, sizeof b) > 0
+                     && b[0] != '0') ? 1 : 0;
+        }
+        if (ct_on) cpp_arena::trace_check(g_trace_frame, g_trace_rb);
+    }
     ++*(uint32_t*)(0x4DACE0_R);                             // g_frame_counter
     if (trace) log_printf("[gekko_bridge] advance: exit\n");
 }
