@@ -40,6 +40,14 @@ namespace cl_iter_guard {
 // argument we don't actually use, OR add our own counter. We do the
 // latter so the original signature is preserved.
 #define CONCURRENT_LIST_WALK_VISIT (0x13B00_R)
+// call_boost__function_3 (0x32400): invokes a boost::signals2 slot's
+// boost::function. Its empty-function path (*this == 0) throws
+// std::bad_function_call, which is UNCAUGHT -> abort. Under leak-on-free a
+// slot whose connection node was freed is left zeroed, so a re-sim that walks
+// a not-yet-cleaned-up (dangling) connection invokes an empty function and
+// aborts — the intermittent re-sim crash. A dead slot must NOT run, so we skip
+// it (return 0), the same philosophy as the universal null-deref skip.
+#define CALL_BOOST_FUNCTION_3 (0x32400_R)
 // Healthy boost::signals2 grouped_list connection counts are O(100).
 // Set the cap well above any realistic count but well below "infinite"
 // so a corrupted-cycle walk bails in milliseconds.
@@ -49,8 +57,10 @@ namespace {
 
 static SafetyHookInline g_h{};
 static SafetyHookInline g_h_walk{};
+static SafetyHookInline g_h_callfn{};
 static std::atomic<uint64_t> g_walk_bailouts{0};
 static std::atomic<uint64_t> g_walk_total{0};
+static std::atomic<uint64_t> g_callfn_skips{0};
 
 static inline bool is_arena_base(uintptr_t v) {
     if (!v) return false;
@@ -108,6 +118,29 @@ static int* thiscall walk_hook(int* this_, int a2, char a3, int* a4,
     return result;
 }
 
+// __thiscall(this) -> int. `this` is the boost::function object; this[0] is the
+// vtable/target descriptor (0 == empty). Skip an empty (dead/freed) slot rather
+// than let the original throw bad_function_call -> abort. A valid slot (target
+// != 0) goes straight through — one predicated load of overhead.
+static int thiscall callfn_hook(int* this_) {
+    // Skip a dead/corrupt slot: target (this_[0]) is either 0 (empty function ->
+    // bad_function_call throw) or a small garbage int left by a freed connection
+    // (e.g. 0xC, so (target&~1)+4 = 0x10 -> the observed fault=0x10 read). Any
+    // target below the 64KB null-reserve is not a real descriptor pointer.
+    if (this_ && (uintptr_t)this_ >= 0x10000) {
+        uint32_t target = (uint32_t)this_[0];
+        if (target < 0x10000) {
+            uint64_t n = g_callfn_skips.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & 0x3FF) == 1)
+                log_printf("[slotguard] skipped dead boost::function slot this=%p "
+                           "target=%08X (#%llu)\n",
+                           this_, target, (unsigned long long)n);
+            return 0;
+        }
+    }
+    return g_h_callfn.unsafe_thiscall<int>(this_);
+}
+
 } // namespace
 
 void install() {
@@ -115,13 +148,18 @@ void install() {
                                     (void*)hook);
     g_h_walk = safetyhook::create_inline((void*)CONCURRENT_LIST_WALK_VISIT,
                                          (void*)walk_hook);
+    g_h_callfn = safetyhook::create_inline((void*)CALL_BOOST_FUNCTION_3,
+                                           (void*)callfn_hook);
     log_printf("[clguard] hook concurrent_list_iter_step @ 0x%X %s, "
-               "concurrent_list_walk_visit @ 0x%X %s (cap=%u)\n",
+               "concurrent_list_walk_visit @ 0x%X %s (cap=%u), "
+               "call_boost__function_3 @ 0x%X %s\n",
                (uint32_t)CONCURRENT_LIST_ITER_STEP,
                g_h.enabled() ? "OK" : "FAIL",
                (uint32_t)CONCURRENT_LIST_WALK_VISIT,
                g_h_walk.enabled() ? "OK" : "FAIL",
-               kWalkMaxSteps);
+               kWalkMaxSteps,
+               (uint32_t)CALL_BOOST_FUNCTION_3,
+               g_h_callfn.enabled() ? "OK" : "FAIL");
 }
 
 } // namespace cl_iter_guard

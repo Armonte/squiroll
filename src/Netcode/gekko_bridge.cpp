@@ -2296,13 +2296,28 @@ static void kbd_poll_hook() {
         log_printf("[kbdmash] frame=%u v=%02X readbackZ=%02X\n",
                    sim_real_frame(), v, kbd[0x2C]);
 }
+// DIAG: log what keys the stuck victory/win-quote screen actually queries via
+// DeviceMapping::IsKeyDown (0x697F0) and what we return — pins whether the read
+// side sees our injected keys (and which button index the screen wants).
+static SafetyHookInline g_h_iskeydown{};
+static int cdecl iskeydown_hook(int key) {
+    int r = g_h_iskeydown.ccall<int>(key);
+    if (menu_mash_active()) {
+        static int nlog = 0;
+        if (nlog < 300) { ++nlog;
+            log_printf("[iskeydiag] IsKeyDown(%d)=%d\n", key, r); }
+    }
+    return r;
+}
 static void install_menu_mash_hook() {
     static bool done = false;
     if (done) return;
     done = true;
     g_h_kbd_poll = safetyhook::create_inline((void*)(0x3B850_R), (void*)kbd_poll_hook);
-    log_printf("[gekko_bridge] menu-mash keyboard hook @0x3B850 %s\n",
-               g_h_kbd_poll.enabled() ? "OK" : "FAIL");
+    g_h_iskeydown = safetyhook::create_inline((void*)(0x697F0_R), (void*)iskeydown_hook);
+    log_printf("[gekko_bridge] menu-mash keyboard hook @0x3B850 %s, IsKeyDown @0x697F0 %s\n",
+               g_h_kbd_poll.enabled() ? "OK" : "FAIL",
+               g_h_iskeydown.enabled() ? "OK" : "FAIL");
 }
 
 void pre_arm_poll() {
