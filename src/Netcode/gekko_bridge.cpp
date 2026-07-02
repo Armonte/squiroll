@@ -1117,22 +1117,33 @@ void load_state_from_buf(const void* buf, uint32_t len) {
         if (sblob) {
             const uint8_t* sp   = sblob;
             const uint8_t* send = sblob + sl;
-            auto sect = [&](auto load_fn) {
+            static uint64_t pl_bp = 0, pl_mp = 0, pl_eng = 0, pl_ir = 0, pl_ih = 0, pl_rng = 0;
+            static uint32_t pl_n = 0;
+            auto sect = [&](auto load_fn, uint64_t* acc) {
                 if (sp + 4 > send) return;
                 uint32_t w = *(const uint32_t*)sp;
                 sp += 4;
                 if (sp + w > send) return;
+                LARGE_INTEGER a; QueryPerformanceCounter(&a);
                 load_fn(sp, w);
+                LARGE_INTEGER b; QueryPerformanceCounter(&b);
+                *acc += (uint64_t)(b.QuadPart - a.QuadPart);
                 sp += w;
             };
-            sect(&battle_pools::load);
+            sect(&battle_pools::load, &pl_bp);
             battle_pools::set_load_frame((int)hdr->frame);  // probe: which save is being restored
-            sect(&battle_pools::boostpool_load);   // Sqrat math boost::pools (this.va/vf/vfBaria)
-            // cpp_arena is now dirty-page-snapshotted by snapshot_ring, not full-copied in the small blob.
-            sect(&engine_snap::load);
-            sect(&input_rec_load);
-            sect(&input_hist::load);
-            sect(&engine_snap::rng_load);   // restore-but-not-checksum, section order matches save
+            sect(&battle_pools::boostpool_load, &pl_mp);   // Sqrat math boost::pools
+            sect(&engine_snap::load, &pl_eng);
+            sect(&input_rec_load, &pl_ir);
+            sect(&input_hist::load, &pl_ih);
+            sect(&engine_snap::rng_load, &pl_rng);   // restore-but-not-checksum
+            if (++pl_n >= 120) {
+                LARGE_INTEGER fr; QueryPerformanceFrequency(&fr); uint64_t hz = fr.QuadPart;
+                auto us = [&](uint64_t t){ return (uint32_t)(t * 1000000ull / hz / pl_n); };
+                log_printf("[perf-load] us/load: bp=%u mp=%u eng=%u irec=%u ihist=%u rng=%u\n",
+                           us(pl_bp), us(pl_mp), us(pl_eng), us(pl_ir), us(pl_ih), us(pl_rng));
+                pl_bp = pl_mp = pl_eng = pl_ir = pl_ih = pl_rng = 0; pl_n = 0;
+            }
         }
         // (trace_reset moved into advance_one_frame — see save_state_to_buf note.)
         return;

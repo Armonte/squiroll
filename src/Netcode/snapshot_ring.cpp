@@ -1054,7 +1054,13 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
     // FASTFAIL) or a silent deadlock. Re-applied after the reverse-apply.
     static uint8_t       s_spbuf[512 * 1024];
     static sync_pin::Ent s_spent[8192];
+    // PROFILE: restore-phase timers (step0 getww / step0 copy / reverse-apply /
+    // syncpin / final resetww), reported per 120 restores.
+    static uint64_t r_sp = 0, r_s0ww = 0, r_s0cp = 0, r_rev = 0, r_pin = 0, r_rww = 0;
+    static uint32_t r_n = 0;
+    LARGE_INTEGER rt0; QueryPerformanceCounter(&rt0);
     int spn = sync_pin::snapshot_live(s_spbuf, sizeof s_spbuf, s_spent, 8192);
+    LARGE_INTEGER rt1; QueryPerformanceCounter(&rt1); r_sp += rt1.QuadPart - rt0.QuadPart;
 
     // STEP 0 — revert the POST-CAPTURE window (the crash-root fix, 2026-07-01).
     // Writes made since capture(g_cur) — the forward-only game-loop ScriptAPI
@@ -1074,8 +1080,11 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
         if (!A.size) continue;
         ULONG_PTR count = A.npages;
         ULONG     gran  = 0;
-        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, A.base, A.size,
-                          g_pgbuf, &count, &gran) != 0) {
+        LARGE_INTEGER w0; QueryPerformanceCounter(&w0);
+        UINT rc = GetWriteWatch(WRITE_WATCH_FLAG_RESET, A.base, A.size,
+                                g_pgbuf, &count, &gran);
+        LARGE_INTEGER w1; QueryPerformanceCounter(&w1); r_s0ww += w1.QuadPart - w0.QuadPart;
+        if (rc != 0) {
             log_printf("[snapshot_ring] !! restore GetWriteWatch failed arena=%d\n", a);
             continue;
         }
@@ -1085,6 +1094,7 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
             memcpy(A.base + off, A.mirror + off, PAGE);   // live -> state(g_cur)
             // mirror/phash already hold the capture(g_cur) value — untouched.
         }
+        LARGE_INTEGER w2; QueryPerformanceCounter(&w2); r_s0cp += w2.QuadPart - w1.QuadPart;
     }
 
     // Coalesced reverse-apply. A hot page (the VM operand stack) is dirtied
@@ -1096,6 +1106,7 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
     // 1 bit/page; sized for the largest arena. tf4 region A is 128 MB + 64 KB
     // (32784 pages) — larger than cpp's 128 MB — so this is sized for
     // MAX_ARENA_BYTES, matching the arm() guard.
+    LARGE_INTEGER rv0; QueryPerformanceCounter(&rv0);
     static uint8_t seen[NARENA][(MAX_ARENA_BYTES / PAGE) / 8];
     memset(seen, 0, sizeof(seen));
     for (int64_t f = target + 1; f <= g_cur; ++f) {
@@ -1119,6 +1130,7 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
         }
     }
     g_cur = target;
+    LARGE_INTEGER rv1; QueryPerformanceCounter(&rv1); r_rev += rv1.QuadPart - rv0.QuadPart;
 
     // SYNC-PRIMITIVE PIN, part 2: re-apply each pinned lock's live bytes over
     // whatever the restore just wrote (base + mirror + phash, exactly like the
@@ -1175,10 +1187,21 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
     // these writes don't show up as the re-sim's dirty pages.
     if (g_gl_pin_on) gl_pin_restore();
 
+    LARGE_INTEGER rp1; QueryPerformanceCounter(&rp1); r_pin += rp1.QuadPart - rv1.QuadPart;
+
     // Discard the write-watch entries our own restore writes just produced,
     // so the next capture sees only the re-sim advance's dirty pages.
     for (int a = 0; a < NARENA; ++a)
         if (g_ar[a].size) ResetWriteWatch(g_ar[a].base, g_ar[a].size);
+    LARGE_INTEGER rp2; QueryPerformanceCounter(&rp2); r_rww += rp2.QuadPart - rp1.QuadPart;
+    if (++r_n >= 120) {
+        LARGE_INTEGER fr; QueryPerformanceFrequency(&fr); uint64_t hz = fr.QuadPart;
+        auto us = [&](uint64_t t){ return (uint32_t)(t * 1000000ull / hz / r_n); };
+        log_printf("[perf-restore] us/restore: syncpin=%u step0_getww=%u step0_copy=%u "
+                   "reverse=%u pin_reapply=%u final_resetww=%u\n",
+                   us(r_sp), us(r_s0ww), us(r_s0cp), us(r_rev), us(r_pin), us(r_rww));
+        r_sp = r_s0ww = r_s0cp = r_rev = r_pin = r_rww = 0; r_n = 0;
+    }
 
     Slot& T = g_ring[frame % RING];
     if (T.frame != (int32_t)frame) {

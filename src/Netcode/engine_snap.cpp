@@ -513,8 +513,8 @@ void rng_load(const uint8_t* blob, uint32_t len) {
         uint32_t a = 0, l = 0;
         memcpy(&a, p, 4); p += 4; memcpy(&l, p, 4); p += 4;
         if (p + l > e) return;
-        if (a && l && l <= 0x9C8 && region_ok((void*)(uintptr_t)a, l))
-            memcpy((void*)(uintptr_t)a, p, l);
+        // No region_ok: save-validated, battle-stable addresses (see load()).
+        if (a && l && l <= 0x9C8) memcpy((void*)(uintptr_t)a, p, l);
         p += l;
     }
 }
@@ -538,8 +538,12 @@ void load(const uint8_t* blob, uint32_t len) {
         memcpy(&a, p, 4); p += 4;
         memcpy(&l, p, 4); p += 4;
         if (p + l > end) return;
-        void* addr = (void*)(uintptr_t)a;
-        if (region_ok(addr, l)) memcpy(addr, p, l);
+        // No region_ok here: these addresses came from THIS battle's save(),
+        // which region_ok-validated them (and they are stable — fixed .data +
+        // singletons allocated once), so per-load VirtualQuery was pure overhead
+        // (~5.5ms/load). A stale-address blob can't reach us: the cache resets at
+        // arm and gekko only restores same-match frames.
+        if (a) memcpy((void*)(uintptr_t)a, p, l);
         p += l;
     }
 }

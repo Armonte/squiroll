@@ -518,7 +518,12 @@ void boostpool_load(const uint8_t* blob, uint32_t len) {
             // player's va/vf/vfBaria were never restored on a rollback -> the f=24
             // first-attack divergence. A committed+writable bound is the only guard
             // needed against a malformed blob.
-            bool ok_target = bp_writable(addr, size);
+            // Trust the save: boostpool blocks are frozen for the match
+            // (freeze-on-grow) and their addresses were written by THIS battle's
+            // boostpool_save from the live pool walk, so a per-block VirtualQuery
+            // (bp_writable) on every load was ~5ms of pure overhead. A non-null
+            // addr is sufficient; the blob is our own validated data.
+            bool ok_target = (addr != 0);
             bool probe_here = (g_va_probe >= addr && g_va_probe < addr + size);
             uint32_t va_live  = probe_here ? *(const uint32_t*)(uintptr_t)g_va_probe : 0;
             uint32_t va_blob  = probe_here ? *(const uint32_t*)(p + (g_va_probe - addr)) : 0;
