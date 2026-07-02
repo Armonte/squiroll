@@ -648,25 +648,30 @@ static void arena_free(void* p) {
     // reuses this memory.
     sync_pin::forget_range((uint32_t)(uintptr_t)p,
                            (uint32_t)(uintptr_t)p + h->reqsize);
-    // EXPERIMENTAL — option (ii): instead of putting the block on its
-    // size-class free list, LEAK it. arena_alloc always bumps to fresh
-    // memory, no recycle. Used to test the hypothesis that cpp_arena's
-    // deterministic recycle exposes a latent use-after-free in TH155
-    // (a freed list node gets reused immediately and the new owner's
-    // bytes look like list pointers when the stale list walks it).
+    // RECYCLE: push the block onto its size-class free-list so arena_alloc
+    // reuses it instead of always bumping fresh memory.
     //
-    // If this fixes the hit-crash, the recycle is the cause and we
-    // need either a quarantine (delay recycle N frames) or to find
-    // the offending freer. Memory cost is real — full 128MB capacity
-    // gets exhausted faster — but should comfortably last one match.
-    // Zero-fill the payload too so any stale read sees null, not the
-    // previous live data.
+    // The old leak-everything mode (option ii — never link the free list) was a
+    // probe for a use-after-free hypothesis, but the real hit-crash root turned
+    // out to be the snapshot restore's post-capture window (restore step-0), NOT
+    // the recycle. Leaking grew the arena on every alloc; the fight masked it
+    // (the rollback restores g_meta->bump every frame) but the un-rolled-back
+    // round transition did not, so the arena crept toward the 128 MB cap over a
+    // match. Recycling bounds it: freed blocks are reused, so a full match — and
+    // multiple matches in a session — fit.
+    //
+    // Rollback-consistent: g_meta->free_off[] (the free-list heads) lives in the
+    // arena's Meta page, which the snapshot captures + restores, so the free-list
+    // state rolls back with everything else and the forward pass and its re-sim
+    // pop the SAME blocks in the SAME order (deterministic: the sim thread + its
+    // inline workers are single-threaded; hook_free leaks true off-thread frees
+    // during the fight so they can't perturb the list).
+    //
+    // Zero-fill the payload so any stale read of a recycled block sees null.
     memset(p, 0, h->reqsize);
-    h->magic     = 0;
-    // Free-list link NOT updated: block stays orphaned, arena_alloc
-    // will skip the free list and bump.
-    (void)foff;
-    (void)ci;
+    h->magic = 0;                          // freed; arena_alloc re-stamps on reuse
+    h->link  = g_meta->free_off[ci];       // push onto the size-class free-list
+    g_meta->free_off[ci] = foff;
     LeaveCriticalSection(&g_lock);
 }
 
