@@ -120,6 +120,9 @@ uint16_t forced_inputs[2] = {0, 0};
 // whether it is a rollback re-sim. Lets a fault detected deep in the
 // Squirrel VM be attributed to a specific frame / forward-vs-rollback.
 int g_trace_frame = -1;
+// Forward-only frame counter for the hang watchdog (bumped in advance_one_frame's
+// rb==0 path). Distinct from g_trace_frame, which cycles during re-sim.
+static volatile int g_wd_fwd_frame = -1;
 int g_trace_rb    = 0;
 // Rollback DEPTH = how many frames the current re-sim advance is past its load
 // target (g_trace_frame - last GekkoLoad frame). 0 on the forward. Lets the
@@ -1780,17 +1783,23 @@ void advance_one_frame() {
         // frame stops advancing, no exception). If f hasn't moved for 20s,
         // dump every thread's stack and exit(3) — a diagnosed artifact instead
         // of a harness timeout. Started lazily on the first forward advance.
+        // Watch the FORWARD frame (file-scope g_wd_fwd_frame, bumped only here on
+        // the rb==0 path). g_trace_frame cycles during re-sim (2..N every
+        // rollback), so watching it hid the real failure mode: a re-sim loop
+        // where forward never advances but g_trace_frame keeps changing.
+        g_wd_fwd_frame = g_trace_frame;
         static HANDLE wd = nullptr;
         if (!wd) {
             wd = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
                 int last = -1; DWORD since = GetTickCount();
                 for (;;) {
                     Sleep(3000);
-                    int f = g_trace_frame;
+                    int f = g_wd_fwd_frame;
                     if (f != last) { last = f; since = GetTickCount(); continue; }
                     if (GetTickCount() - since >= 20000) {
-                        log_printf("[watchdog] forward frame STUCK at f=%d for "
-                                   "20s — dumping stacks\n", f);
+                        log_printf("[watchdog] FORWARD frame STUCK at f=%d for 20s "
+                                   "(g_trace_frame=%d rb=%d) — dumping stacks\n",
+                                   f, g_trace_frame, g_trace_rb);
                         crash_handler::dump_all_thread_stacks("hang watchdog");
                         log_flush();
                         Sleep(600);
