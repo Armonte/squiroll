@@ -150,6 +150,13 @@ static const struct { int arena; uint32_t off; } TARGET_PAGES[] = {
 static constexpr int N_TARGETS = (int)(sizeof(TARGET_PAGES) / sizeof(TARGET_PAGES[0]));
 static Slot    g_ring[RING];
 static bool    g_armed = false;
+// FAST MODE: the per-frame divergence diagnostics ([cspart]/[comp]/[divf], the
+// cppb full-arena byte-hash of ~100MB, the all-page phash recompute) are pure
+// tracing and are what pin the sim to ~5fps. OFF by default. The desync
+// CHECKSUM (fold_checksum over incrementally-maintained phash) + capture/restore
+// are UNAFFECTED — desync is still detected and the abort still dumps.
+// SQUIROLL_DIAG=1 re-enables the heavy tracing for a hunt.
+static bool    g_diag = false;
 static int64_t g_cur   = -1;       // frame the live arenas currently hold
 
 // 64-bit FNV-1a over one page, 8 bytes/step with two independent accumulators
@@ -277,8 +284,10 @@ void arm() {
 
     g_cur   = -1;
     g_armed = true;
-    log_printf("[snapshot_ring] armed: sq=%uMB bullet=%uMB cpp=%uMB "
+    g_diag  = (getenv("SQUIROLL_DIAG") != nullptr);
+    log_printf("[snapshot_ring] armed (diag=%d): sq=%uMB bullet=%uMB cpp=%uMB "
                "tf4A=%uMB tf4B=%uMB ring=%d (tf4 %s)\n",
+               (int)g_diag,
                g_ar[0].size / (1024 * 1024), g_ar[1].size / (1024 * 1024),
                g_ar[2].size / (1024 * 1024), g_ar[3].size / (1024 * 1024),
                g_ar[4].size / (1024 * 1024), RING,
@@ -286,6 +295,7 @@ void arm() {
 }
 
 bool armed() { return g_armed; }
+bool diag_on() { return g_diag; }
 
 namespace {
 // Offset of the size-classed arena's `bump` (high-water) field within its
@@ -601,7 +611,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
     // divf/[comp]/phash_snap reflect real content (the dirty-only update leaves stale
     // hashes on pages that the write-watch reset stopped flagging -> false divergence).
     // Gated to early frames (cost ~one cppb pass) — enough to localize the race.
-    if (frame <= 12) {
+    if (g_diag && frame <= 12) {
         Arena& Ac = g_ar[CPP_ARENA];
         uint32_t bump = *(const uint32_t*)(Ac.base + BUMP_OFF[CPP_ARENA]);
         uint32_t upg = (bump + PAGE - 1) / PAGE;
@@ -670,7 +680,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
     // sq/bt look clean) can be pinned to the exact component — sq fold, bt fold, or
     // the sblob (bp/mp/eng/irec/ihist). The 'fwd ' vs 'RESIM' tag + frame let us
     // diff a frame's forward save against each of its re-sim saves.
-    if (frame <= 3) {
+    if (g_diag && frame <= 3) {
         uint32_t sqh = 2166136261u, bth = 2166136261u, sbh = 2166136261u;
         for (int a = 0; a <= 1; ++a) {
             uint32_t bump = *(const uint32_t*)(g_ar[a].base + BUMP_OFF[a]);
@@ -687,8 +697,9 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
 
     // DIAGNOSTIC: per-arena page-hash fold, so a desync can be pinned to the
     // exact arena (sq / bullet / cpp) that diverged rather than one opaque
-    // combined checksum.
-    {
+    // combined checksum. Fast mode skips it (the [divf] + cppb byte-hash below
+    // are the ~5fps cost); the real desync checksum `cs` above is unaffected.
+    if (g_diag) {
         uint32_t hc[NARENA], bc[NARENA];
         for (int a = 0; a < NDIAG; ++a) {   // tf4 pools (3,4) have no bump field — excluded
             uint32_t bump = *(const uint32_t*)(g_ar[a].base + BUMP_OFF[a]);
@@ -750,8 +761,10 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
     // save), compare current phash[] against the snapshot — any page whose
     // hash differs is where the re-sim's frame-N output deviates from the
     // forward run's. No arbitrary frame threshold; the EARLIEST divergent
-    // frame surfaces on its first re-capture.
-    {
+    // frame surfaces on its first re-capture. Fast mode skips it entirely
+    // (phash_snap/page_snap are used only here) — the ~100K page comparisons +
+    // per-page divword dumps are a big chunk of the tracing cost.
+    if (g_diag) {
         Slot& S = g_ring[frame % RING];
         if (re_capture_diag) {
             static const char* names[NARENA] = { "sq", "bt", "cpp", "tf4A", "tf4B" };

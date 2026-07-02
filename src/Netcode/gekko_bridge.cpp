@@ -872,10 +872,10 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
             if (out_checksum) *out_checksum = 0;
             return sizeof(SaveHeader);
         }
-        // DIAGNOSTIC: per-section sblob checksums — pins a desync to the
-        // exact small-section (battle_pools / engine/.data / input) that
-        // diverged. Sections are [u32 len][data], in sect() order.
-        {
+        // DIAGNOSTIC (fast mode skips — a full FNV byte-hash of every sblob
+        // section each save): per-section checksums that pin a desync to the
+        // exact small-section. The real desync checksum is unaffected.
+        if (snapshot_ring::diag_on()) {
             const uint8_t* q = smb;
             const char* nm[6] = { "bp", "mp", "eng", "irec", "ihist", "rng" };
             char comps[192]; int cn = 0;
@@ -1766,10 +1766,11 @@ void advance_one_frame() {
     if (rb_diag_enabled()) {
         battle_pools::diff_locate(g_trace_frame, g_trace_rb);
     }
-    // [engdiff] .data divergence locator — RE-ENABLED: the residual intermittent
-    // desync is eng (.data) diverging on some rollback re-sims. This pins the exact
-    // .data offset. ([bplive] stays off — bp is clean.)
-    engine_snap::diff_locate(g_trace_frame, g_trace_rb);
+    // [engdiff] .data divergence locator — HEAVY (byte-diffs every captured .data
+    // region against the forward snapshot each advance). Fast mode skips it; the
+    // desync checksum still catches an eng divergence, just without the offset.
+    if (snapshot_ring::diag_on())
+        engine_snap::diff_locate(g_trace_frame, g_trace_rb);
     // battle_pools::diff_live(g_trace_frame, g_trace_rb);
 
     // Self-terminate at a target battle frame so diagnostic runs exit cleanly.

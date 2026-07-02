@@ -35,6 +35,9 @@ namespace snapshot_ring {
 // advance/save.
 void arm();
 bool armed();
+// True when SQUIROLL_DIAG is set: heavy per-frame divergence tracing is on.
+// Fast mode (default) skips [cspart]/[comp]/[divf]/cppb + gekko [sblob]/diff_locate.
+bool diag_on();
 
 // Capture frame `frame`: store the three arenas' dirty-page deltas and a copy
 // of `sblob` (the serialized non-arena sections). Returns the full-state

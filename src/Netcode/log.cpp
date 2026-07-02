@@ -65,6 +65,10 @@ static std::atomic<uint64_t> g_write{0};         // producers CAS this
 static std::atomic<uint64_t> g_read{0};          // single consumer (worker)
 static std::atomic<uint64_t> g_dropped{0};
 static std::atomic<bool>     g_log_running{false};
+// Console (stdout) mirror is OFF by default — terminal rendering + fflush per
+// drain is the slowest sink and swamps the worker under heavy tracing, dropping
+// lines. The file log is the authoritative record. SQUIROLL_LOG_CONSOLE=1 re-enables.
+static bool                  g_log_console = false;
 
 // Producer: lock-free claim + publish. No mutex, no allocation.
 static inline void ring_push(const char* buf, size_t n) {
@@ -111,7 +115,7 @@ static void log_worker() {
         bool wrote = !batch.empty();
         if (wrote) {
             if (g_log_file) fwrite(batch.data(), 1, batch.size(), g_log_file);
-            fwrite(batch.data(), 1, batch.size(), stdout);
+            if (g_log_console) fwrite(batch.data(), 1, batch.size(), stdout);
         }
         uint64_t dropped = g_dropped.exchange(0, std::memory_order_relaxed);
         if (dropped) {
@@ -119,10 +123,10 @@ static void log_worker() {
             int wn = snprintf(w, sizeof w, "[log] !! dropped %llu lines (ring full)\n",
                               (unsigned long long)dropped);
             if (g_log_file) fwrite(w, 1, wn, g_log_file);
-            fwrite(w, 1, wn, stdout);
+            if (g_log_console) fwrite(w, 1, wn, stdout);
             wrote = true;
         }
-        if (wrote) { if (g_log_file) fflush(g_log_file); fflush(stdout); }
+        if (wrote) { if (g_log_file) fflush(g_log_file); if (g_log_console) fflush(stdout); }
         else       { Sleep(1); }                 // idle: nothing to drain
     }
 }
@@ -136,6 +140,7 @@ void open_log_file(const char* path) {
             g_ring[i].seq.store(i, std::memory_order_relaxed);
     }
 
+    g_log_console = (getenv("SQUIROLL_LOG_CONSOLE") != nullptr);
     g_log_file = fopen(path, "w");
     if (g_log_file) {
         // Fully buffered — the worker thread fflush()es after each drain,
