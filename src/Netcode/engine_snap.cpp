@@ -209,14 +209,20 @@ static int collect(Region* r) {
             { (uintptr_t)(0x4DB004_R), (uintptr_t)(0x4DB004_R) + 4    }, // g_engine_loop_tick
             { (uintptr_t)(0x4DB310_R), (uintptr_t)(0x4DB310_R) + 0xA8 }, // bg-task condvar/mutex/slot block
             { (uintptr_t)(0x4DB6A8_R), (uintptr_t)(0x4DB6A8_R) + 16   }, // bg-ScriptAPI FIFO slot+count
-            // Render-camera follow x/y (floats @0x4DB790/94, struct-based access,
-            // no direct xrefs): updated by the forward-only main-loop/render pass —
-            // the headless re-sim's copy stays FROZEN at the restore value while
-            // the forward's tracks the fighters, so any ASYMMETRIC matchup (the
-            // camera actually moving) flagged an instant f=2 eng "desync". Mirror
-            // reimu/marisa never exposed it. Sim-side camera state is separately
-            // fingerprinted (battle_pools Camera3D), so this stays covered.
-            { (uintptr_t)(0x4DB790_R), (uintptr_t)(0x4DB790_R) + 8    }, // render camera follow x/y
+            // RENDER SYNC BUFFERS (Manbow::*::SendToParentSync 0x55980 + world-rect
+            // 0x9EF60, both forward-only render): per-player transform/camera state
+            // sent to the render parent each frame. The headless re-sim never runs
+            // that path, so these stay FROZEN at the restore value while the forward
+            // pans the camera to follow the fighters -> any ASYMMETRIC matchup
+            // flagged an instant eng "desync" (0x4DB790+0x40 AND 0x4DB8D0+0x40 =
+            // buffer+0x40 position field; Dr0-confirmed writers 0x9F1E8 + 0x455CBA).
+            // Mirror reimu/marisa never moved the camera so never exposed it. These
+            // are pure presentation (gameplay reads none of it; sim camera state is
+            // separately covered by the Camera2D/3D render-tainted pools). Buffer
+            // layout from SendToParentSync: [1553]=0x4DB750 (24-dword stride x2),
+            // [1649]=0x4DB8D0 (28-dword stride x2).
+            { (uintptr_t)(0x4DB750_R), (uintptr_t)(0x4DB750_R) + 0xC0 }, // 24-dword sync buffers p0+p1
+            { (uintptr_t)(0x4DB8D0_R), (uintptr_t)(0x4DB8D0_R) + 0xE0 }, // 28-dword sync buffers p0+p1
         };
 
         // Emit committed run [a,e) as snapshot region(s), carving out every exr[].
