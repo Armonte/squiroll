@@ -108,6 +108,14 @@ static bool          g_session_started = false; // SessionStarted fired + vs.Ini
                                                  // gekko owns the frame counter
 static bool          g_solo            = false; // single-process GekkoStressSession:
                                                  // both players local, no networking
+static bool          g_match_setup_done = false; // one-time per-MATCH setup (pregrow /
+                                                 // reserve_anim_vectors / objpool freeze) is
+                                                 // done. Round boundaries disarm+re-arm the
+                                                 // gekko session, but must NOT re-run that
+                                                 // setup on carried-over live state (it
+                                                 // corrupts a resource tree + deadlocks a
+                                                 // worker at round-2 f=2). Reset on full
+                                                 // shutdown (real match end / menu return).
 static bool          g_watch_for_fight = false; // solo: armed by boot.nut, pre_arm_poll
                                                  // creates the session at Round_Fight
 static uint32_t      g_evt_trace = 0;            // diagnostic: # of Save/Load/
@@ -2108,20 +2116,26 @@ bool init_solo() {
     }
 
     g_active = true;
-    live_actors::set_defer_release(!g_arena_rollback);
-    cpp_arena::set_armed(true);          // capture operator-new for the whole match
-    battle_pools::pregrow();             // freeze the C++ battle pools' block set
-    tf4_pool::pregrow_objpools();        // freeze the generic-grow objpool family (f=34 hang)
-    battle_pools::reserve_anim_vectors(); // re-home AnimCtrl CompositeSprite vectors into cpp_arena
-    // Fix each player's input-history vector capacity so it never reallocs
-    // mid-match (its backing buffer then keeps a stable address to snapshot).
-    input_hist::pregrow();
-    // Arm dirty-page snapshotting: arenas installed, pools pre-grown — take
-    // the write-watch baseline before the first advance/save.
-    // Designate this (the battle/game thread) the simulation thread before
-    // the baseline — see init().
     cpp_arena::set_sim_thread(GetCurrentThreadId());
-    engine_snap::rng_reset_cache();   // re-resolve cached RNG/sTask restore addrs for the new match
+    // ONE-TIME per-match setup. On a round-2+ re-arm this is SKIPPED: the arena
+    // stayed armed across the round transition (soft disarm keeps it capturing),
+    // so round-2 actors allocated during the transition are already in the
+    // snapshot, and the pools/objpools/input-history are already frozen. Re-running
+    // reserve_anim_vectors on the carried-over live state re-homes already-homed
+    // buffers and corrupts a resource tree -> round-2 f=2 deadlock.
+    if (!g_match_setup_done) {
+        live_actors::set_defer_release(!g_arena_rollback);
+        cpp_arena::set_armed(true);          // capture operator-new for the whole match
+        battle_pools::pregrow();             // freeze the C++ battle pools' block set
+        tf4_pool::pregrow_objpools();        // freeze the generic-grow objpool family (f=34 hang)
+        battle_pools::reserve_anim_vectors(); // re-home AnimCtrl CompositeSprite vectors into cpp_arena
+        input_hist::pregrow();               // fix per-player input-history vector capacity
+        g_match_setup_done = true;
+    }
+    engine_snap::rng_reset_cache();   // re-resolve cached RNG/sTask restore addrs for the new round
+    // Re-take the write-watch baseline for THIS round: the transition ran on the
+    // vanilla loop (arena still capturing), so arm() re-mirrors the now-consistent
+    // state as the round's rollback baseline.
     snapshot_ring::arm();
 
     // The battle is already created — vs.Initialize ran under the
@@ -2246,6 +2260,7 @@ void shutdown() {
     g_session_started = false;
     g_solo = false;
     g_watch_for_fight = false;
+    g_match_setup_done = false;   // full teardown — next match re-runs one-time setup
     // Flush any actors held by defer-release so the engine can actually
     // reclaim their slots once we're done with the session.
     live_actors::set_defer_release(false);
@@ -2265,9 +2280,24 @@ bool is_session_started(){ return g_session_started; }
 // A best-of-3 match therefore arms/disarms 1-3 times; if the match has
 // ended, state never returns to 8 and the re-armed watch simply idles.
 static void disarm_for_round_end() {
-    log_printf("[gekko_bridge] round ended (battle.state left 8) -> disarm\n");
-    shutdown();                  // preserves g_watch_dual + dual params
-    g_watch_for_fight = true;    // re-arm at the next Round_Fight
+    // SOFT disarm: tear down ONLY the gekko rollback session so the cosmetic
+    // transition (KO/time-up demo, win pose, next-round intro) runs un-rolled-back
+    // on the vanilla loop. KEEP the arena armed + the pools/vectors/objpools frozen
+    // (g_match_setup_done stays true) so the arena keeps capturing the transition's
+    // allocations and round 2 re-arms onto a consistent, already-set-up state —
+    // re-running the one-time setup here is what corrupted a resource tree and
+    // deadlocked a worker at round-2 f=2. A full teardown (menu return) goes
+    // through shutdown(), which resets g_match_setup_done.
+    log_printf("[gekko_bridge] round ended (battle.state left 8) -> soft disarm "
+               "(gekko session only; arena stays armed)\n");
+    if (g_session) {
+        if (!g_solo) gekko_default_adapter_destroy();
+        gekko_destroy(&g_session);
+        g_session = nullptr;
+    }
+    g_active = false;
+    g_session_started = false;
+    g_watch_for_fight = true;    // pre_arm_poll re-arms at the next Round_Fight
 }
 
 // Solo fast-forward. While a solo stress session owns the frame loop and
