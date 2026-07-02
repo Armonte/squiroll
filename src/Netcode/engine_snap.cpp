@@ -392,6 +392,23 @@ static int collect(Region* r) {
 
 } // namespace
 
+// Diagnosis helper: classify a diverging captured address (from [engtrip]) as
+// a named singleton+offset so a per-real-frame counter can be identified and
+// moved to restore-but-not-checksum (like STASK_FRAME).
+void classify_and_log(uint32_t addr, uint32_t fwd, uint32_t resim) {
+    uint32_t se = (uint32_t)(uintptr_t)(*G_EW_SEFFECT);
+    uint32_t st = (uint32_t)(uintptr_t)(*G_EW_STASK);
+    uint32_t sa = (uint32_t)(uintptr_t)(*G_SCRIPTAPI_PTR);
+    const char* what = "?"; uint32_t off = 0;
+    if (se && addr >= se && addr < se + 0x218)       { what = "sEffect";   off = addr - se; }
+    else if (st && addr >= st && addr < st + 0x1AAC8){ what = "sTask";     off = addr - st; }
+    else if (sa && addr >= sa && addr < sa + 0x108)  { what = "ScriptAPI"; off = addr - sa; }
+    else if (addr >= 0x400000 && addr < 0x800000)    { what = ".data";     off = addr; }
+    log_printf("[engclass] diverging addr=0x%08X = %s+0x%X  fwd=%08X resim=%08X  "
+               "(seffect=%08X stask=%08X scriptapi=%08X)\n",
+               addr, what, off, fwd, resim, se, st, sa);
+}
+
 // CACHED region list (see rng_collect note): collect() resolves ~50 regions,
 // VirtualQuery-validating each every save (~8ms — the .data committed-run walk
 // + pointer-graph region_ok). The region ADDRESSES are stable for the whole

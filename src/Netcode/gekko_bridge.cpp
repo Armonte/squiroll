@@ -783,9 +783,14 @@ static void eng_stash(uint32_t frame, int rb, const uint8_t* bytes, uint32_t len
             p = data + l;
         }
     }
+    // dword-aligned context so classify sees the whole value, not one byte.
+    uint32_t d0w = d0 & ~3u;
+    uint32_t fwdw = 0, resw = 0;
+    if (d0w + 4 <= len) { memcpy(&fwdw, F.buf + d0w, 4); memcpy(&resw, bytes + d0w, 4); }
     log_printf("[engtrip] FIRST eng mismatch f=%u depth=%d blob-off=%u -> "
-               ".data addr=0x%08X  fwd=%02X resim=%02X len=%u\n",
-               frame, g_trace_depth, d0, va, F.buf[d0], bytes[d0], len);
+               "addr=0x%08X  fwd=%02X resim=%02X dword fwd=%08X resim=%08X len=%u\n",
+               frame, g_trace_depth, d0, va, F.buf[d0], bytes[d0], fwdw, resw, len);
+    if (va) engine_snap::classify_and_log(va, fwdw, resw);
 }
 static void bp_stash_dump(uint32_t frame);
 static void bp_stash(uint32_t frame, int rb, const uint8_t* bytes, uint32_t len) {
