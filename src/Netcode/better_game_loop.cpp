@@ -85,6 +85,15 @@ uint32_t measured_fps = 0;   // real measured rate, for display/diagnostics only
 uint32_t sim_get_fps() { return current_fps; }
 void     sim_set_fps(uint32_t v) { current_fps = v; }
 
+// Monotonic real-frame counter, bumped once per better_game_loop iteration
+// (i.e. once per real displayed frame, in EVERY branch incl. the vanilla
+// transition). Used by the menu-mash keyboard hook to toggle the confirm key
+// per real frame — GetTickCount can't be used (SQUIROLL_DET hooks it) and a
+// per-poll-call counter is unreliable (the poll fires a variable number of
+// times per frame).
+uint32_t g_real_frame = 0;
+uint32_t sim_real_frame() { return g_real_frame; }
+
 void stdcall better_game_loop() {
     // This is th155's game/simulation thread. Designate it to cpp_arena now
     // — far earlier than gekko_bridge::init — so the arena is thread-gated
@@ -121,6 +130,7 @@ void stdcall better_game_loop() {
     int64_t leniency = get_timer_leniency() * 10000;
 
     while (expect(!exit_requested, true)) {
+        ++g_real_frame;   // one per real displayed frame (all branches)
 #if PROFILING
         perf_api.BeginEvent("Frame", nullptr, 0xFFFFFFFF);
 #endif

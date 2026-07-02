@@ -670,8 +670,22 @@ static void arena_free(void* p) {
     // Zero-fill the payload so any stale read of a recycled block sees null.
     memset(p, 0, h->reqsize);
     h->magic = 0;                          // freed; arena_alloc re-stamps on reuse
-    h->link  = g_meta->free_off[ci];       // push onto the size-class free-list
-    g_meta->free_off[ci] = foff;
+    // RECYCLE is OFF by default (SQUIROLL_RECYCLE=1 to enable). Re-enabling the
+    // free-list push bounds the arena (94MB->56MB) but reintroduces a HIGH crash
+    // rate (~7/8 seeds FASTFAIL): th155 reads through a just-freed block whose
+    // memory a deterministic recycle immediately hands to a new owner -> the
+    // stale walk sees foreign bytes. Leak-everything (orphan the block) is stable
+    // (the zeroed block is never reused, so the stale read sees null). The
+    // correct fix for the arena growth is a QUARANTINE (delay recycle N frames)
+    // so the stale reference is gone before reuse — a follow-up.
+    static int recycle = -1;
+    if (recycle < 0) { char b[4] = {0};
+        recycle = (GetEnvironmentVariableA("SQUIROLL_RECYCLE", b, sizeof b) > 0 && b[0] != '0') ? 1 : 0; }
+    if (recycle) {
+        h->link = g_meta->free_off[ci];    // push onto the size-class free-list
+        g_meta->free_off[ci] = foff;
+    }
+    // else: leak (orphan) — arena_alloc bumps fresh. (void)foff kept implicit.
     LeaveCriticalSection(&g_lock);
 }
 

@@ -1,6 +1,11 @@
 // GekkoNet bridge — skeleton. See gekko_bridge.h for the public API and
 // design notes. Each TODO below is a concrete next step.
 
+// safetyhook MUST precede any squiroll header — util.h #defines the calling-
+// convention keywords (thiscall/stdcall) as macros and safetyhook uses those
+// identifiers as method names (same ordering rule as actor2d_log/cpp_arena).
+#include <safetyhook.hpp>
+
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -1916,6 +1921,13 @@ void advance_one_frame() {
                 int last = -1; DWORD since = GetTickCount();
                 for (;;) {
                     Sleep(3000);
+                    // Paused while no gekko session is driving frames: the round
+                    // transition / match-end runs on the VANILLA loop (soft
+                    // disarm), so the forward gekko frame legitimately stops
+                    // advancing there. Firing then was a false positive that
+                    // KILLED the game mid-transition (never reaching the win
+                    // screen). Only watch an armed, started session.
+                    if (!g_session_started) { last = -1; since = GetTickCount(); continue; }
                     int f = g_wd_fwd_frame;
                     if (f != last) { last = f; since = GetTickCount(); continue; }
                     if (GetTickCount() - since >= 20000) {
@@ -2001,6 +2013,7 @@ void render_one_frame() {
 // ---------------------------------------------------------------- session --
 
 static void apply_test_round_frames();  // defined below; used by init/init_solo
+static void install_menu_mash_hook();   // defined below; installs the kbd-poll hook
 
 bool init(uint16_t local_port, uint16_t remote_port,
           uint8_t local_player_idx, const char* remote_ip)
@@ -2008,6 +2021,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
     if (g_session) return false;
     register_cpp_ser();
     fake_input_init();
+    install_menu_mash_hook();
 
     gekko_create(&g_session, GekkoGameSession);
 
@@ -2090,6 +2104,7 @@ bool init_solo() {
     if (g_session) return false;
     register_cpp_ser();
     fake_input_init();
+    install_menu_mash_hook();
 
     g_solo = true;
     gekko_create(&g_session, GekkoStressSession);
@@ -2123,11 +2138,15 @@ bool init_solo() {
     g_active = true;
     cpp_arena::set_sim_thread(GetCurrentThreadId());
     // ONE-TIME per-match setup. On a round-2+ re-arm this is SKIPPED: the arena
-    // stayed armed across the round transition (soft disarm keeps it capturing),
-    // so round-2 actors allocated during the transition are already in the
-    // snapshot, and the pools/objpools/input-history are already frozen. Re-running
-    // reserve_anim_vectors on the carried-over live state re-homes already-homed
-    // buffers and corrupts a resource tree -> round-2 f=2 deadlock.
+    // stays armed across the round transition (the disarm keeps it capturing),
+    // so round-2 state is already in the snapshot and the pools/objpools/input-
+    // history are already frozen. Re-running reserve_anim_vectors on the carried-
+    // over live state re-homes already-homed buffers and corrupts a resource tree
+    // -> round-2 f=2 deadlock. Disarming the arena for the transition instead
+    // (so it stops capturing) splits th155's resource red-black tree across the
+    // arena/real-heap boundary -> round-2 rollback reverts only the arena half ->
+    // treeguard corruption at ~f=31. Our dynamic-alloc capture (vs CCCaster's
+    // fixed-region snapshot) requires the arena stay armed to keep that tree whole.
     if (!g_match_setup_done) {
         live_actors::set_defer_release(!g_arena_rollback);
         cpp_arena::set_armed(true);          // capture operator-new for the whole match
@@ -2239,6 +2258,53 @@ void watch_for_fight_dual(uint16_t local_port, uint16_t remote_port,
 // Solo arms a GekkoStressSession (started immediately); dual arms a
 // GekkoGameSession (then better_game_loop holds the frame loop until
 // the handshake fires GekkoSessionStarted).
+// True while the game is on the vanilla loop between rounds / at match-end
+// (soft-disarmed, but the match has already started once). The keyboard-poll
+// hook below uses this to mash a menu-confirm key so the CPU-vs-CPU win quote /
+// result screens auto-advance to CSS instead of sitting forever waiting for a
+// human.
+bool menu_mash_active() {
+    return g_fake_input && g_match_setup_done && !g_session_started;
+}
+
+// The win quote / result menus read ::input_all.b1 = keyboard (byte_4DAF00) +
+// joystick — NOT the battle input path. So auto-advance means injecting a
+// confirm KEY into the DirectInput keyboard state buffer that
+// __keyboard_device_get_state (0x3B850) fills each frame. Hook it: after the
+// real poll, OR the confirm keys in during the disarmed transition. Mashed
+// on/off (~every 4 real frames) so the menu sees distinct presses, not a hold.
+static SafetyHookInline g_h_kbd_poll{};
+static void kbd_poll_hook() {
+    g_h_kbd_poll.call();   // original: GetDeviceState -> byte_4DAF00[256]
+    if (!menu_mash_active()) return;   // fight: no injection, no log
+    static uint32_t nmash = 0; ++nmash;
+    uint8_t* kbd = (uint8_t*)(0x4DAF00_R);   // DirectInput 256-byte DIK state
+    // Toggle the confirm key per REAL FRAME (4 on / 4 off) so ::input_talk.b0
+    // sees a fresh 0->1 press every 8 frames. The menus advance on b0 == 1 (a
+    // hold-counter that equals 1 only on the press frame, talk_command.nut:194),
+    // so a permanently-held key would advance exactly once. GetTickCount is out
+    // (SQUIROLL_DET hooks it) and a per-poll-call toggle is unreliable (variable
+    // polls/frame). Keys = the SYSTEM device map (input.nut CreateSystemInputDevice):
+    //   b0 = 44 (Z), b1 = 45 (X), b2 = 46 (C).
+    uint8_t v = ((sim_real_frame() >> 2) & 1) ? 0x80u : 0u;
+    kbd[0x2C] = v;   // DIK_Z = b0 (talk decide)
+    kbd[0x2D] = v;   // DIK_X = b1 (menu decide)
+    kbd[0x2E] = v;   // DIK_C = b2 (talk decide)
+    // DIAG: log the first 48 mash frames CONSECUTIVELY so the 4-on/4-off
+    // alternation is visible (a strided sample aliases the period).
+    if (nmash <= 48)
+        log_printf("[kbdmash] frame=%u v=%02X readbackZ=%02X\n",
+                   sim_real_frame(), v, kbd[0x2C]);
+}
+static void install_menu_mash_hook() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    g_h_kbd_poll = safetyhook::create_inline((void*)(0x3B850_R), (void*)kbd_poll_hook);
+    log_printf("[gekko_bridge] menu-mash keyboard hook @0x3B850 %s\n",
+               g_h_kbd_poll.enabled() ? "OK" : "FAIL");
+}
+
 void pre_arm_poll() {
     if (!g_watch_for_fight || g_session) return;
     int st = 0;
@@ -2293,8 +2359,15 @@ static void disarm_for_round_end() {
     // re-running the one-time setup here is what corrupted a resource tree and
     // deadlocked a worker at round-2 f=2. A full teardown (menu return) goes
     // through shutdown(), which resets g_match_setup_done.
+    // SOFT disarm: tear down ONLY the gekko rollback session so the transition
+    // (victory pose, win quote, intro) runs forward-only on the vanilla loop —
+    // NOT rolled back. But KEEP the arena armed (capturing): disarming it splits
+    // th155's resource red-black tree across the arena/real-heap boundary and
+    // corrupts round 2 (treeguard @ ~f=31). The cost is the arena keeps growing
+    // with the transition's cosmetic allocations + logs off-thread worker frees
+    // it can't handle; acceptable for a few-round match, revisit for long sets.
     log_printf("[gekko_bridge] round ended (battle.state left 8) -> soft disarm "
-               "(gekko session only; arena stays armed)\n");
+               "(gekko session only; arena stays armed to keep the resource tree whole)\n");
     if (g_session) {
         if (!g_solo) gekko_default_adapter_destroy();
         gekko_destroy(&g_session);

@@ -10,5 +10,7 @@ void init_better_game_loop();
 // the same dt as the original forward pass. See better_game_loop.cpp.
 uint32_t sim_get_fps();
 void     sim_set_fps(uint32_t v);
+// Monotonic per-real-frame counter (see better_game_loop.cpp).
+uint32_t sim_real_frame();
 
 #endif
