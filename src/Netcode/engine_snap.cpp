@@ -376,7 +376,12 @@ static int collect(Region* r) {
     // and ride that snapshot. The mutex at sTask+0x4 and the
     // shared_ptrs at sTask+0x28.. are deliberately NOT touched.
     if (void* stask = *G_EW_STASK) {
-        add((uint8_t*)stask + STASK_FRAME_OFF, STASK_FRAME_BYTES);
+        // STASK_FRAME (+0x18014) is the worker-frame head counter — incremented
+        // by DispatchWorkerTask (render/worker path) FORWARD-ONLY, frozen in the
+        // headless re-sim -> false eng desync on effect-spawning matchups (0x9999
+        // f=2). Captured via rng_collect (restore-but-not-checksum) instead, so
+        // it still restores but never checksums. The LAYER triples + FLAGS are
+        // real sim state and STAY checksummed (moving them hung 0xBEEF/0xF00D).
         add((uint8_t*)stask + STASK_LAYER_BASE_OFF,
             STASK_LAYER_COUNT * STASK_LAYER_TRIPLE);
         add((uint8_t*)stask + STASK_FLAGS_OFF, STASK_FLAGS_BYTES);
@@ -415,37 +420,47 @@ uint32_t save(uint8_t* out, uint32_t cap) {
 // wrapper[1] = 0x9C8-byte state; serialize each as (addr,len,bytes) so rng_load
 // restores by saved address. The buffers are aligned_malloc'd once at init and
 // never move, so the address is a stable restore target.
-static int rng_collect(uint32_t* addrs, int maxn) {
+// Collect the RESTORE-BUT-NOT-CHECKSUM regions as (addr,len): SFMT RNG state
+// buffers + the sTask worker-frame counter (forward-only). Restored so the
+// re-sim is consistent, but excluded from the desync checksum (their bytes are
+// advanced forward-only by the render/worker path).
+struct NcRegion { uint32_t addr, len; };
+static int rng_collect(NcRegion* r, int maxn) {
     int n = 0;
     void* mgr = *(void**)(0x4DB0C4_R);
-    if (!mgr || !region_ok(mgr, 12)) return 0;
-    uint32_t begin = ((uint32_t*)mgr)[0], end = ((uint32_t*)mgr)[1];
-    for (uint32_t p = begin; p && p + 4 <= end && n < maxn; p += 4) {
-        uint32_t crandom = *(uint32_t*)(uintptr_t)p;
-        if (!crandom || !region_ok((void*)(uintptr_t)crandom, 8)) continue;
-        uint32_t wrapper = *(uint32_t*)(uintptr_t)(crandom + 4);
-        if (!wrapper || !region_ok((void*)(uintptr_t)wrapper, 8)) continue;
-        uint32_t state = *(uint32_t*)(uintptr_t)(wrapper + 4);
-        if (state && region_ok((void*)(uintptr_t)state, 0x9C8)) addrs[n++] = state;
+    if (mgr && region_ok(mgr, 12)) {
+        uint32_t begin = ((uint32_t*)mgr)[0], end = ((uint32_t*)mgr)[1];
+        for (uint32_t p = begin; p && p + 4 <= end && n < maxn; p += 4) {
+            uint32_t crandom = *(uint32_t*)(uintptr_t)p;
+            if (!crandom || !region_ok((void*)(uintptr_t)crandom, 8)) continue;
+            uint32_t wrapper = *(uint32_t*)(uintptr_t)(crandom + 4);
+            if (!wrapper || !region_ok((void*)(uintptr_t)wrapper, 8)) continue;
+            uint32_t state = *(uint32_t*)(uintptr_t)(wrapper + 4);
+            if (state && region_ok((void*)(uintptr_t)state, 0x9C8))
+                r[n++] = { state, 0x9C8 };
+        }
+    }
+    if (void* stask = *G_EW_STASK) {
+        uint32_t a = (uint32_t)(uintptr_t)stask + STASK_FRAME_OFF;
+        if (n < maxn && region_ok((void*)(uintptr_t)a, STASK_FRAME_BYTES))
+            r[n++] = { a, STASK_FRAME_BYTES };   // worker-frame head counter
     }
     return n;
 }
 
 uint32_t rng_save(uint8_t* out, uint32_t cap) {
-    uint32_t addrs[16];
-    int n = rng_collect(addrs, 16);
+    NcRegion r[24];
+    int n = rng_collect(r, 24);
     uint8_t* p = out; uint8_t* e = out + cap;
     auto put = [&](const void* s, uint32_t l) -> bool {
         if (p + l > e) return false; memcpy(p, s, l); p += l; return true;
     };
-    uint32_t magic = SNAP_MAGIC ^ 0x524E47u, cnt = (uint32_t)n;   // 'RNG'
+    uint32_t magic = SNAP_MAGIC ^ 0x524E47u, cnt = (uint32_t)n;
     if (!put(&magic, 4) || !put(&cnt, 4)) return 0;
-    for (int i = 0; i < n; ++i) {
-        uint32_t a = addrs[i], l = 0x9C8;
-        if (!put(&a, 4) || !put(&l, 4) || !put((void*)(uintptr_t)a, l)) return 0;
-    }
-    // Never return 0 (empty is valid: RNG not yet created) — 8-byte header stands.
-    return (uint32_t)(p - out);
+    for (int i = 0; i < n; ++i)
+        if (!put(&r[i].addr, 4) || !put(&r[i].len, 4) ||
+            !put((void*)(uintptr_t)r[i].addr, r[i].len)) return 0;
+    return (uint32_t)(p - out);   // never 0: 8-byte header stands even when empty
 }
 
 void rng_load(const uint8_t* blob, uint32_t len) {
@@ -458,7 +473,7 @@ void rng_load(const uint8_t* blob, uint32_t len) {
         uint32_t a = 0, l = 0;
         memcpy(&a, p, 4); p += 4; memcpy(&l, p, 4); p += 4;
         if (p + l > e) return;
-        if (a && l == 0x9C8 && region_ok((void*)(uintptr_t)a, l))
+        if (a && l && l <= 0x9C8 && region_ok((void*)(uintptr_t)a, l))
             memcpy((void*)(uintptr_t)a, p, l);
         p += l;
     }
