@@ -7,6 +7,7 @@
 #include "bullet_arena.h"
 #include "cpp_arena.h"
 #include "tf4_arena.h"       // arenas 3/4 — the two engine-private TF4 mspace pools
+#include "sync_pin.h"        // lock pinning across restore (locks never roll back)
 #include "crash_handler.h"   // watchpoint_arm — auto-attribute first divergence
 #include "patch_utils.h"     // base_address (vtable -> RVA resolution in the f=15 probe)
 #include "log.h"
@@ -1030,6 +1031,15 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
         }
     }
 
+    // SYNC-PRIMITIVE PIN, part 1: snapshot the LIVE bytes of every registered
+    // lock (CRITICAL_SECTIONs + std::mutex imps, see sync_pin.h) BEFORE any
+    // memory moves. Locks are wall-clock state — a reverted lock under a live
+    // thread => _Mtx_lock error -> throw -> abort (the f~248 streaming-slot
+    // FASTFAIL) or a silent deadlock. Re-applied after the reverse-apply.
+    static uint8_t       s_spbuf[512 * 1024];
+    static sync_pin::Ent s_spent[8192];
+    int spn = sync_pin::snapshot_live(s_spbuf, sizeof s_spbuf, s_spent, 8192);
+
     // STEP 0 — revert the POST-CAPTURE window (the crash-root fix, 2026-07-01).
     // Writes made since capture(g_cur) — the forward-only game-loop ScriptAPI
     // dispatch (RunOneFrame connection-node inserts/erases/cursor advances) and
@@ -1093,6 +1103,35 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
         }
     }
     g_cur = target;
+
+    // SYNC-PRIMITIVE PIN, part 2: re-apply each pinned lock's live bytes over
+    // whatever the restore just wrote (base + mirror + phash, exactly like the
+    // gl_sc treatment below). Only entries inside a snapshotted arena matter —
+    // the restore never touched anything else.
+    {
+        uint32_t pos = 0;
+        int applied = 0;
+        for (int i = 0; i < spn; ++i) {
+            uint32_t addr = s_spent[i].addr, len = s_spent[i].len;
+            for (int a = 0; a < NARENA; ++a) {
+                Arena& A = g_ar[a];
+                if (!A.size) continue;
+                uint32_t lo = (uint32_t)(uintptr_t)A.base;
+                if (addr < lo || addr + len > lo + A.size) continue;
+                uint32_t off = addr - lo;
+                memcpy(A.base   + off, s_spbuf + pos, len);
+                memcpy(A.mirror + off, s_spbuf + pos, len);
+                for (uint32_t o = off & ~(PAGE - 1); o < off + len; o += PAGE)
+                    A.phash[o / PAGE] = hash_page(A.base + o);
+                ++applied;
+                break;
+            }
+            pos += len;
+        }
+        static int nlog = 0;
+        if (nlog < 6 && applied) { ++nlog;
+            log_printf("[sync_pin] restore re-applied %d/%d pinned locks\n", applied, spn); }
+    }
 
     // use_count "preservation" — DISABLED by default since restore step-0 (2026-07-01).
     // This pre-step-0 hack copied the LIVE use/weak over the restored values every

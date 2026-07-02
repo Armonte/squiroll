@@ -15,6 +15,7 @@
 #include "log.h"
 #include "sq_arena.h"      // sq_arena::base/capacity  (for the [arenas] dump)
 #include "snapshot_ring.h" // snapshot_ring::gl_capture (game-loop render-dispatch pin)
+#include "sync_pin.h"      // forget freed locks (never re-apply stale lock bytes)
 #include "bullet_arena.h"  // bullet_arena::base/capacity
 
 namespace actor2d_log { void watch_arm(uint32_t addr); }  // Dr0 write-watch (VEH logs writer rva)
@@ -623,6 +624,12 @@ static void arena_free(void* p) {
     g_meta->live_bytes -= h->reqsize;
     uint32_t foff = (uint32_t)((uint8_t*)h - g_base);
     trace_rec(2, h->reqsize, 0, foff);
+    // A freed block may have hosted pinned sync primitives (locks freed
+    // WITHOUT DeleteCriticalSection/_Mtx_destroy) — drop those registry
+    // entries so sync_pin never re-applies stale lock bytes over whatever
+    // reuses this memory.
+    sync_pin::forget_range((uint32_t)(uintptr_t)p,
+                           (uint32_t)(uintptr_t)p + h->reqsize);
     // EXPERIMENTAL — option (ii): instead of putting the block on its
     // size-class free list, LEAK it. arena_alloc always bumps to fresh
     // memory, no recycle. Used to test the hypothesis that cpp_arena's

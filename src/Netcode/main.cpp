@@ -27,6 +27,7 @@
 #include "cpp_arena.h"
 #include "bullet_arena.h"
 #include "tf4_arena.h"
+#include "sync_pin.h"
 #include "input_hist.h"
 #include "tf4_pool.h"
 #include "sq_trace.h"
@@ -317,6 +318,7 @@ bool common_init(
     // runtime by the "[tf4_arena] pool ... intercepted" log lines and the
     // absence of a "TOO LATE" line.
     tf4_arena::early_install();
+    sync_pin::install();   // must precede engine init: registers every lock created inside the arenas
 
     // Redirect th155's Squirrel-instance object pool to allocate its slabs
     // from cpp_arena (rollback-snapshotted) instead of the TF4-engine mspace
