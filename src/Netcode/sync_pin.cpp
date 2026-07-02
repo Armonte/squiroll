@@ -136,6 +136,11 @@ void install() {
                g_real_delcs != nullptr);
 }
 
+void pin(uint32_t addr, uint32_t len) {
+    if (!g_installed) return;
+    reg(addr, len);
+}
+
 void forget_range(uint32_t lo, uint32_t hi) {
     if (!g_installed || !g_n) return;
     EnterCriticalSection(&g_lock);

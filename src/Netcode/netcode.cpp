@@ -688,6 +688,13 @@ void thiscall SyncInput_hook(ManbowNetworkInputSession* self) {
     g_active_input_session = self;
     ((void (thiscall*)(ManbowNetworkInputSession*))(0xE3340_R))(self);
 
+    // (Removed: a menu-mash here was the WRONG path. SyncInput feeds the BATTLE
+    // input recorder; the win-quote / result menus read ::input_all = keyboard +
+    // joystick (input.nut), a separate device path. poll_input_state 0x169D80 is
+    // only ever called by SyncInput + the battle recorder — never the menu. The
+    // menu auto-advance must inject into the keyboard state (0x4DAF00, written by
+    // __keyboard_device_get_state 0x3b850) instead. See gekko_bridge::menu_mash_active.)
+
     // Cache the polled local input bits so gekko_bridge can feed them
     // into gekko_add_local_input each frame without re-reading the
     // device pointer chain.

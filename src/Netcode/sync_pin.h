@@ -22,6 +22,12 @@ struct Ent { uint32_t addr, len; };
 void install();                       // hooks; call from common_init (early)
 void forget_range(uint32_t lo, uint32_t hi);  // arena block freed -> drop entries
 
+// Manually register a primitive the init hooks missed. The static LTCG CRT
+// INLINES some std::mutex ctors (no _Mtx_init_in_situ call), so those imps
+// never reach the registry — e.g. the sound-stream writer's mutex. Idempotent
+// (deduped by address); call from a hook that sees the object in use.
+void pin(uint32_t addr, uint32_t len);
+
 // Copy the live bytes of every registered primitive into buf; returns the
 // number of entries written to out[] (each with its byte offset into buf
 // implied by accumulation order). Thread-safe snapshot of the registry.

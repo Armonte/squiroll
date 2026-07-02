@@ -6,7 +6,8 @@
 
 #include "crash_handler.h"
 #include "log.h"
-#include "util.h"   // base_address — needed by the clguard VEH path
+#include "util.h"      // base_address — needed by the clguard VEH path
+#include "cpp_arena.h" // describe_block — crash-time arena attribution
 
 // Zydis — used by the universal NULL-deref skip in the VEH.
 #define ZYAN_NO_LIBC
@@ -349,6 +350,21 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
                c->Eax, c->Ebx, c->Ecx, c->Edx);
     crash_logf("  esi=%08X edi=%08X ebp=%08X esp=%08X\r\n",
                c->Esi, c->Edi, c->Ebp, c->Esp);
+    // Arena attribution: any register pointing into an allocated cpp-arena
+    // block gets its allocator call-site RVA from the block header — tells us
+    // WHAT object (by construction site) is involved in the crash.
+    {
+        struct { const char* n; DWORD v; } regs[] = {
+            {"eax", c->Eax}, {"ebx", c->Ebx}, {"ecx", c->Ecx}, {"edx", c->Edx},
+            {"esi", c->Esi}, {"edi", c->Edi},
+        };
+        for (auto& rg : regs) {
+            uint32_t rva = 0, sz = 0, pay = 0;
+            if (cpp_arena::describe_block(rg.v, &rva, &sz, &pay))
+                crash_logf("  %s -> arena block payload=%08X size=%u alloc_rva=%08X\r\n",
+                           rg.n, pay, sz, rva);
+        }
+    }
 
     // EBP-chain stack walk — resolves each return address to module+RVA.
     crash_logf("  --- stack (ebp chain) ---\r\n");

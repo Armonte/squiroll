@@ -429,14 +429,22 @@ static char thiscall haspend_hook(int self) {
         use = 1; weak = 1;
     }
     // DANGER = the release decrement will hit 0 (use<=0 going in) or sc is a bad ptr.
-    // use==1 is HEALTHY (signal holds 1 ref). Log every danger (any ScriptAPI).
+    // use==1 is HEALTHY (signal holds 1 ref). An OUT-of-arena sc that has been
+    // OUT since before the fight (f=-1) is a ScriptAPI whose control block just
+    // lives on the real heap (pre-arm/off-thread alloc) — benign; log each
+    // distinct (self,sc) pair ONCE instead of 600 spam lines.
     bool danger = (!in_arena) || (use <= 0);
-    static int n = 0;
-    if (n < 600 && danger) {
-        ++n;
-        log_printf("[haspend] f=%d rb=%d self=%08X%s head=%08X sc=%08X(%s) use=%d weak=%d  <-DANGER\n",
-                   gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb, (uint32_t)self,
-                   gl ? "*GL" : "", head, sc, in_arena ? "arena" : "OUT", use, weak);
+    static uint32_t seen_pairs[32][2]; static int nseen = 0;
+    if (danger) {
+        bool dup = false;
+        for (int i = 0; i < nseen; ++i)
+            if (seen_pairs[i][0] == (uint32_t)self && seen_pairs[i][1] == sc) { dup = true; break; }
+        if (!dup) {
+            if (nseen < 32) { seen_pairs[nseen][0] = (uint32_t)self; seen_pairs[nseen][1] = sc; ++nseen; }
+            log_printf("[haspend] f=%d rb=%d self=%08X%s head=%08X sc=%08X(%s) use=%d weak=%d  <-DANGER\n",
+                       gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb, (uint32_t)self,
+                       gl ? "*GL" : "", head, sc, in_arena ? "arena" : "OUT", use, weak);
+        }
     }
     (void)head;
     return g_h_haspend.unsafe_thiscall<char>(self);
@@ -706,6 +714,13 @@ static const ExclRange g_excl[] = {
     // tf4_ogg_alloc_shared — operator new shared_ptr<TF4::Ogg>, the Ogg/Vorbis
     // audio decoder object; the audio thread mutates it every frame.
     { 0x16B380u, 0x16B400u },
+    // NOTE (2026-07-02): do NOT exclude the g_gameloop_scriptapi lazy-init site
+    // (0x5161, the 0x14-byte game-loop dispatch signal). Tried: moving the
+    // signal OBJECT to the real heap while its connection-list NODES stay in
+    // the arena splits one timeline-consistent structure across the rollback
+    // boundary (reverted nodes + non-reverted head/cursor) -> torn walk ->
+    // CRASHED EARLIER (f=90 vs ~1/4 at round ends). Same lesson as the
+    // round-end disarm: keep linked structures on ONE side of the boundary.
     // NOTE: routing the RENDER allocators (DrawCommandSlot create_and_bind
     // 0x56A90-0x56AD0, reset 0x57DC0) to the real heap DID make f=2 deterministic
     // (the free-list churn that pushed the sim's connection nodes to different
@@ -854,11 +869,10 @@ static void cdecl hook_free(void* block) {
         return;
     }
     if (g_resim) {
-        // DIAGNOSTIC: log caller RVA every 64 suppressions so we can
-        // identify the divergence sources (real-heap frees that the
-        // forward run does but the re-sim suppresses). The forward run's
-        // matching free DOES happen — the asymmetry is exactly here.
-        if ((g_resim_skips & 0x3F) == 0) {
+        // DIAGNOSTIC: identify re-sim-suppressed real-heap frees. NULL frees
+        // are no-ops — don't log them at all (they were ~64/frame of pure
+        // spam from 0x30473D). Real pointers log every 256th.
+        if (block && (g_resim_skips & 0xFF) == 0) {
             uint32_t caller = (uint32_t)(uintptr_t)_ReturnAddress();
             log_printf("[cpp_arena] re-sim: suppressed real-heap free %p "
                        "(#%u) by rva=%08X\n", block, g_resim_skips,
@@ -1198,6 +1212,30 @@ bool     is_excluded_page(uint32_t pg) {           // TF4_Number HUD digit-geome
 }
 uint32_t gameloop_addr() {                         // *0x49AFBC = game-loop render-dispatch ScriptAPI
     return *(uint32_t*)(0x49AFBC_R);
+}
+
+bool describe_block(uint32_t addr, uint32_t* alloc_rva, uint32_t* reqsize,
+                    uint32_t* payload) {
+    uint8_t* B = g_base;
+    if (!B || !g_meta) return false;
+    uint32_t lo = (uint32_t)(uintptr_t)B, hi = lo + ARENA_SIZE;
+    if (addr < lo + sizeof(Meta) || addr >= hi) return false;
+    // Walk back at 16-byte steps looking for an allocated-block header whose
+    // payload span covers addr. Bounded scan; false positives are unlikely
+    // (magic + sane reqsize + span check) and harmless — this is crash-time
+    // attribution, not memory management.
+    uint32_t p = addr & ~15u;
+    for (uint32_t back = 0; back < 0x20000 && p >= lo + sizeof(Meta); back += 16, p -= 16) {
+        const Hdr* h = (const Hdr*)(uintptr_t)p;
+        if (h->magic == HDR_MAGIC && h->reqsize > 0 && h->reqsize < ARENA_SIZE
+            && p + sizeof(Hdr) + h->reqsize > addr) {
+            if (alloc_rva) *alloc_rva = h->link;   // caller RVA while allocated
+            if (reqsize)   *reqsize   = h->reqsize;
+            if (payload)   *payload   = p + sizeof(Hdr);
+            return true;
+        }
+    }
+    return false;
 }
 
 // ------------------------------------------------------------ trail determinism --

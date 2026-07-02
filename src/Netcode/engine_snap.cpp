@@ -207,7 +207,13 @@ static int collect(Region* r) {
             { (uintptr_t)(0x4DAD10_R), (uintptr_t)(0x4DAD10_R) + 4    }, // _Wndproc window/input state
             { (uintptr_t)(0x4DAEB8_R), (uintptr_t)(0x4DAEB8_R) + 20   }, // DirectInput device buffer
             { (uintptr_t)(0x4DB004_R), (uintptr_t)(0x4DB004_R) + 4    }, // g_engine_loop_tick
-            { (uintptr_t)(0x4DB310_R), (uintptr_t)(0x4DB310_R) + 0xA8 }, // bg-task condvar/mutex/slot block
+            // bg-task condvar/mutex/thread block: originally [+0xA8) but the
+            // block extends further — 0x4DB3C0 holds a WORKER THREAD ID (fwd
+            // 0x7A8C vs re-sim -1) that flagged the f=347 false desync, and the
+            // unnamed run up to g_ewctx_169c (0x4DB5A8) is all thread-pool
+            // plumbing (netthread3 handle/id 0x4DB368/6C, cv wait state, ...)
+            // written at wall-clock time by producer/consumer threads.
+            { (uintptr_t)(0x4DB310_R), (uintptr_t)(0x4DB5A8_R)        }, // bg-task cv/mutex/thread block
             { (uintptr_t)(0x4DB6A8_R), (uintptr_t)(0x4DB6A8_R) + 16   }, // bg-ScriptAPI FIFO slot+count
             // RENDER SYNC BUFFERS (Manbow::*::SendToParentSync 0x55980 + world-rect
             // 0x9EF60, both forward-only render): per-player transform/camera state

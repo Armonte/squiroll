@@ -12,6 +12,9 @@
 #include "sq_arena.h"
 #include "bullet_arena.h"
 #include "crash_handler.h" // watchpoint_arm — corruptor hunt
+#include "sync_pin.h"      // pin() — register inlined-ctor mutexes on first use
+
+namespace gekko_bridge { extern int g_trace_rb; }
 
 namespace cl_iter_guard {
 
@@ -48,6 +51,20 @@ namespace cl_iter_guard {
 // aborts — the intermittent re-sim crash. A dead slot must NOT run, so we skip
 // it (return 0), the same philosophy as the universal null-deref skip.
 #define CALL_BOOST_FUNCTION_3 (0x32400_R)
+// sound_stream_write_chunk_slot (0x16C060): the game-loop signal slot that
+// pumps decoded BGM chunks into the stream's circular buffer, guarded by a
+// std::mutex at writer+16 that the AUDIO thread locks concurrently from the
+// read side. Two rollback hazards, both observed as the f~60/f~248 FASTFAILs
+// and the intermittent mid-round stall:
+//  1. That mutex's ctor is INLINED by the LTCG static CRT, so sync_pin's
+//     _Mtx_init_in_situ hook never sees it -> not pinned -> a restore rewinds
+//     a lock the audio thread is actively using -> _Mtx_lock error ->
+//     _Throw_C_error -> uncaught -> abort. Fix: self-healing pin on first use.
+//  2. Re-sims re-pump the same chunks (audio is a wall-clock side effect, not
+//     sim state): buffer fills -> writer blocks at real-time drain speed (the
+//     [runone] rb=1 stall), and dead streams re-release their resource handle
+//     every re-sim (refcount underflow). Fix: skip the pump when rb != 0.
+#define SOUND_STREAM_WRITE_CHUNK_SLOT (0x16C060_R)
 // Healthy boost::signals2 grouped_list connection counts are O(100).
 // Set the cap well above any realistic count but well below "infinite"
 // so a corrupted-cycle walk bails in milliseconds.
@@ -58,9 +75,11 @@ namespace {
 static SafetyHookInline g_h{};
 static SafetyHookInline g_h_walk{};
 static SafetyHookInline g_h_callfn{};
+static SafetyHookInline g_h_sndslot{};
 static std::atomic<uint64_t> g_walk_bailouts{0};
 static std::atomic<uint64_t> g_walk_total{0};
 static std::atomic<uint64_t> g_callfn_skips{0};
+static std::atomic<uint64_t> g_sndslot_skips{0};
 
 static inline bool is_arena_base(uintptr_t v) {
     if (!v) return false;
@@ -141,6 +160,27 @@ static int thiscall callfn_hook(int* this_) {
     return g_h_callfn.unsafe_thiscall<int>(this_);
 }
 
+// __cdecl(int* pwriter, DWORD* hres). See SOUND_STREAM_WRITE_CHUNK_SLOT above.
+static void cdecl sndslot_hook(int* pwriter, uint32_t* hres) {
+    uint32_t writer = pwriter ? (uint32_t)*pwriter : 0;
+    if (writer >= 0x10000) {
+        // Self-healing sync-pin: the writer's std::mutex imp at +16 (ctor is
+        // CRT-inlined so the init hook missed it). pin() dedupes by address.
+        sync_pin::pin(writer + 16, 0x30);
+        static uint32_t pinned_once = 0;
+        if (pinned_once != writer) {
+            pinned_once = writer;
+            log_printf("[sndguard] pinned stream-writer mutex %08X (+16)\n",
+                       writer);
+        }
+    }
+    if (gekko_bridge::g_trace_rb) {   // re-sim: audio is wall-clock, don't pump
+        g_sndslot_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_h_sndslot.unsafe_ccall<void>(pwriter, hres);
+}
+
 } // namespace
 
 void install() {
@@ -150,16 +190,21 @@ void install() {
                                          (void*)walk_hook);
     g_h_callfn = safetyhook::create_inline((void*)CALL_BOOST_FUNCTION_3,
                                            (void*)callfn_hook);
+    g_h_sndslot = safetyhook::create_inline((void*)SOUND_STREAM_WRITE_CHUNK_SLOT,
+                                            (void*)sndslot_hook);
     log_printf("[clguard] hook concurrent_list_iter_step @ 0x%X %s, "
                "concurrent_list_walk_visit @ 0x%X %s (cap=%u), "
-               "call_boost__function_3 @ 0x%X %s\n",
+               "call_boost__function_3 @ 0x%X %s, "
+               "sound_stream_write_chunk_slot @ 0x%X %s\n",
                (uint32_t)CONCURRENT_LIST_ITER_STEP,
                g_h.enabled() ? "OK" : "FAIL",
                (uint32_t)CONCURRENT_LIST_WALK_VISIT,
                g_h_walk.enabled() ? "OK" : "FAIL",
                kWalkMaxSteps,
                (uint32_t)CALL_BOOST_FUNCTION_3,
-               g_h_callfn.enabled() ? "OK" : "FAIL");
+               g_h_callfn.enabled() ? "OK" : "FAIL",
+               (uint32_t)SOUND_STREAM_WRITE_CHUNK_SLOT,
+               g_h_sndslot.enabled() ? "OK" : "FAIL");
 }
 
 } // namespace cl_iter_guard

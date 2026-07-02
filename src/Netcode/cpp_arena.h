@@ -81,6 +81,13 @@ uint32_t gameloop_addr();
 // in the divergence diagnostic. Pages are registered as numbers update each frame.
 bool is_excluded_page(uint32_t pg);
 
+// Crash-time attribution: if addr points into an ALLOCATED arena block, fill
+// alloc_rva (the operator-new caller RVA from the block header), reqsize and
+// payload base, and return true. Scans backwards for the block header —
+// diagnostic-only cost, safe to call from the VEH/fastfail path.
+bool describe_block(uint32_t addr, uint32_t* alloc_rva, uint32_t* reqsize,
+                    uint32_t* payload);
+
 // B1 trail determinism: rebuild every active Manbow::TrailLayer ribbon mesh from its
 // (deterministic) circular-buffer positions into its persistent cpp-arena vertex
 // buffer. Call at the end of each advance (fwd AND re-sim) so the snapshot captures

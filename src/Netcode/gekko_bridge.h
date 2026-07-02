@@ -66,7 +66,8 @@ void watch_for_fight_dual(uint16_t local_port, uint16_t remote_port,
 void pre_arm_poll();
 
 void shutdown();
-bool is_active();          // session exists; UDP poll runs in background
+bool is_active();
+bool menu_mash_active();          // session exists; UDP poll runs in background
 bool is_session_started(); // GekkoSessionStarted fired; tick() owns the frame
 
 // Per-frame entry. Returns true if the visible frame was advanced.

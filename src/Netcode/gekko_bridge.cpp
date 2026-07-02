@@ -2309,15 +2309,78 @@ static int cdecl iskeydown_hook(int key) {
     }
     return r;
 }
+// DIAG: input_button_update_hold_counter (0x6A720) is the engine-side reader
+// that turns g_dinput_keyboard_dik_state into the b0..bN hold counters the
+// menus poll (::input_talk.b0 == 1 advances the win quote). Log the keyboard
+// b0/Z entry during mash: proves (a) the update RUNS during the transition and
+// (b) the counter pulses 0/1 with our injection. If (a) fails, the input pump
+// is stalled; if (b) holds but nothing advances, the screen waits on something
+// other than input_talk.
+static SafetyHookInline g_h_condrange{};
+static int thiscall condrange_hook(void** self, uint32_t* info, int counters) {
+    int r = g_h_condrange.unsafe_thiscall<int>(self, info, counters);
+    if (menu_mash_active() && info) {
+        // Total-call heartbeat: proves whether ANY script-side device Update
+        // (loop.nut ::input_all / talk.nut ::input_talk) is ticking during the
+        // transition. 0 lines here + mash active = the script pump is frozen.
+        static uint32_t total = 0;
+        if (((total++) & 0xFF) == 0)
+            log_printf("[talkdiag] device-updates alive: total=%u frame=%u\n",
+                       total, sim_real_frame());
+        const int16_t* e   = (const int16_t*)(uintptr_t)info[1];
+        const int16_t* end = (const int16_t*)(uintptr_t)info[2];
+        for (; e && e + 1 < end; e += 2) {
+            if (e[0] == -1 && ((const uint8_t*)e)[2] == 0x2C) {   // keyboard Z = b0
+                static int n = 0;
+                if (n < 80) { ++n;
+                    log_printf("[talkdiag] b0 upd: idx=%u kbdZ=%02X counter=%d frame=%u\n",
+                               info[0], *(uint8_t*)(0x4DAF00_R + 0x2C),
+                               *(int*)(uintptr_t)(counters + 4 * info[0]),
+                               sim_real_frame());
+                }
+                break;
+            }
+        }
+    }
+    return r;
+}
+// DIAG 3: Manbow::InputSingle::Update (0x168510, virtual slot 1) — the REAL
+// per-device update ::input_talk pumps (talk.nut Update -> ::input_talk.Update()
+// -> per-device InputSingle::Update -> keyboard reader lambda -> b0..b11 hold
+// counters at this+12..). 0x6A720 (earlier talkdiag) belongs to a DIFFERENT
+// class and proved nothing. Log dev==-1 (keyboard) entries during mash:
+// b0 pulsing 0/1 => the input chain works and the block is script-side;
+// silence => input_talk isn't pumped at the win quote.
+static SafetyHookInline g_h_isu{};
+static int thiscall inputsingle_update_hook(int self) {
+    int r = g_h_isu.unsafe_thiscall<int>(self);
+    if (menu_mash_active()) {
+        int dev = *(int*)(uintptr_t)(self + 232);
+        if (dev == -1) {
+            static int n = 0;
+            if (n < 150) { ++n;
+                log_printf("[talkdiag2] IS::Update dev=-1 self=%08X b0=%d b2=%d "
+                           "kbdZ=%02X frame=%u\n",
+                           (uint32_t)self, *(int*)(uintptr_t)(self + 12),
+                           *(int*)(uintptr_t)(self + 20),
+                           *(uint8_t*)(0x4DAF00_R + 0x2C), sim_real_frame()); }
+        }
+    }
+    return r;
+}
 static void install_menu_mash_hook() {
     static bool done = false;
     if (done) return;
     done = true;
     g_h_kbd_poll = safetyhook::create_inline((void*)(0x3B850_R), (void*)kbd_poll_hook);
     g_h_iskeydown = safetyhook::create_inline((void*)(0x697F0_R), (void*)iskeydown_hook);
-    log_printf("[gekko_bridge] menu-mash keyboard hook @0x3B850 %s, IsKeyDown @0x697F0 %s\n",
+    g_h_condrange = safetyhook::create_inline((void*)(0x6A720_R), (void*)condrange_hook);
+    g_h_isu = safetyhook::create_inline((void*)(0x168510_R), (void*)inputsingle_update_hook);
+    log_printf("[gekko_bridge] menu-mash keyboard hook @0x3B850 %s, IsKeyDown @0x697F0 %s, "
+               "hold-counter @0x6A720 %s\n",
                g_h_kbd_poll.enabled() ? "OK" : "FAIL",
-               g_h_iskeydown.enabled() ? "OK" : "FAIL");
+               g_h_iskeydown.enabled() ? "OK" : "FAIL",
+               g_h_condrange.enabled() ? "OK" : "FAIL");
 }
 
 void pre_arm_poll() {
