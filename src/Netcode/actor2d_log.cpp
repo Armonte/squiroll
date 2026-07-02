@@ -170,7 +170,7 @@ static LONG CALLBACK vw_veh(EXCEPTION_POINTERS* ep) {
     // RESULT is small (<=2) — captures the lock(->2)/release(->1) and the critical drop
     // to 0 — with the writer rva + frame + rb. This shows EXACTLY who decrements the
     // use_count to 0 and on which side (forward vs rollback re-sim).
-    if (now != 0 && g_vw_hits < 400) {
+    if (now != 0 && g_vw_hits < 2000) {
         ++g_vw_hits;
         log_printf("[velwatch] %08X <- val=%08X rva=%08X f=%d rb=%d d=%d\n",
                    g_vw_addr, now, (uint32_t)(c->Eip - base_address),

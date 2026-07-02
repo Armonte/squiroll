@@ -75,7 +75,15 @@ static void cdecl set_window_mode_custom(int, int, bool fullscreen, bool vsync) 
 
 static bool fullscreen_queued = false;
 static bool exit_requested = false;
-static uint32_t current_fps = 0;
+// GetFPS() (th155 0xEA21, patched below to read this) feeds a script-computed
+// sim dt = 1/GetFPS(). It updates once/sec from the real frame count, so it
+// drifts across a rollback burst -> a frame's forward pass and its re-sim read
+// different fps -> different dt -> desync (round-transition sq 0x241FC8D0).
+// advance_one_frame freezes it to 60 for the deterministic sim via these.
+uint32_t current_fps = 60;   // what GetFPS() returns — pinned to 60 for determinism
+uint32_t measured_fps = 0;   // real measured rate, for display/diagnostics only
+uint32_t sim_get_fps() { return current_fps; }
+void     sim_set_fps(uint32_t v) { current_fps = v; }
 
 void stdcall better_game_loop() {
     // This is th155's game/simulation thread. Designate it to cpp_arena now
@@ -195,7 +203,15 @@ void stdcall better_game_loop() {
 
         if (expect_chance(now >= qpc_next_fps_update, true, FRAC_SECONDS_PER_FRAME)) {
             qpc_next_fps_update = now + qpc_second_frequency;
-            current_fps = frames_this_sec;
+            measured_fps = frames_this_sec;
+            // GetFPS() (which scripts read, incl. a per-frame dt = 1/GetFPS the
+            // battle HUD stores in SIM-checksummed state) must be deterministic:
+            // the measured value jitters 59/60/61 with real frame timing, so a
+            // rollback re-sim of a frame reads a different fps than its forward
+            // pass -> desync (round transition, sq 0x241FC8D0). The game is a
+            // fixed 60 Hz sim, so pin GetFPS to 60. measured_fps keeps the real
+            // value for anything that wants the true rate.
+            current_fps = 60;
             frames_this_sec = 0;
         }
 

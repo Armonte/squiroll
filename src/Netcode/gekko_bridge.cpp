@@ -23,6 +23,8 @@
 #include "battle_pools.h"  // TF4 TPoolAllocator battle objects
 #include "tf4_pool.h"      // generic-grow objpool redirect + freeze
 #include "engine_snap.h"   // scheduler fixed-region snapshot
+#include "actor2d_log.h"   // actor2d_log::watch_arm (Dr0 write-watch)
+#include "better_game_loop.h" // sim_get_fps/sim_set_fps (freeze GetFPS during sim)
 #include "cpp_arena.h"     // C++ std::list node arena
 #include "bullet_arena.h"  // Bullet physics heap arena
 #include "snapshot_ring.h" // dirty-page rollback snapshot for the big arenas
@@ -735,6 +737,48 @@ static constexpr int      BPSTASH_RING = 16;
 static constexpr uint32_t BPSTASH_CAP  = 1u << 20;   // bp section is ~400KB
 struct BpStash { int32_t frame; uint32_t len; uint8_t* buf; };
 static BpStash g_bpstash[2][BPSTASH_RING];
+
+// Parallel stash for the engine_snap ("eng") section — the .data + singleton
+// graph. bp is byte-identical across the round-transition desync (f=542), so
+// the divergence is in eng or the sq/bt arenas; this pins the eng case. The
+// eng blob is self-describing ([magic][count] then per region [addr][len]
+// [bytes]), so on the first fwd-vs-resim mismatch we walk it in place and
+// report the exact .data ADDRESS that diverged — no offline diff needed.
+static BpStash g_engstash[2][BPSTASH_RING];
+static void eng_stash(uint32_t frame, int rb, const uint8_t* bytes, uint32_t len) {
+    BpStash& S = g_engstash[rb ? 1 : 0][frame % BPSTASH_RING];
+    if (!S.buf)
+        S.buf = (uint8_t*)VirtualAlloc(nullptr, BPSTASH_CAP,
+                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!S.buf || len > BPSTASH_CAP) { S.frame = -1; return; }
+    S.frame = (int32_t)frame; S.len = len; memcpy(S.buf, bytes, len);
+    if (!rb) return;
+    BpStash& F = g_engstash[0][frame % BPSTASH_RING];
+    if (F.frame != (int32_t)frame || !F.buf || F.len != len ||
+        memcmp(F.buf, bytes, len) == 0) return;
+    static bool dumped = false;
+    if (dumped) return;
+    dumped = true;
+    uint32_t d0 = 0; while (d0 < len && F.buf[d0] == bytes[d0]) ++d0;
+    // Walk the self-describing blob to map d0 -> a captured .data address.
+    const uint8_t* p = bytes; const uint8_t* e = bytes + len;
+    uint32_t va = 0;  // resolved diverging address, 0 if in header/unmapped
+    if (len >= 8) {
+        p += 8;  // skip [magic][count]
+        while (p + 8 <= e) {
+            uint32_t a = *(const uint32_t*)p, l = *(const uint32_t*)(p + 4);
+            const uint8_t* data = p + 8;
+            if (data + l > e) break;
+            if (bytes + d0 >= data && bytes + d0 < data + l) {
+                va = a + (uint32_t)((bytes + d0) - data); break;
+            }
+            p = data + l;
+        }
+    }
+    log_printf("[engtrip] FIRST eng mismatch f=%u depth=%d blob-off=%u -> "
+               ".data addr=0x%08X  fwd=%02X resim=%02X len=%u\n",
+               frame, g_trace_depth, d0, va, F.buf[d0], bytes[d0], len);
+}
 static void bp_stash_dump(uint32_t frame);
 static void bp_stash(uint32_t frame, int rb, const uint8_t* bytes, uint32_t len) {
     BpStash& S = g_bpstash[rb ? 1 : 0][frame % BPSTASH_RING];
@@ -866,7 +910,9 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         // timelines; desync-abort writes the diverging frame's pair to disk.
         if (ok) bp_stash(frame, g_trace_rb, smb + 4, *(uint32_t*)smb);
         ps_mp  += timed(&battle_pools::boostpool_save);   // Sqrat math boost::pools
+        uint8_t* eng_sect_start = sp;                       // [len][bytes] for eng
         ps_eng += timed(&engine_snap::save);
+        if (ok) eng_stash(frame, g_trace_rb, eng_sect_start + 4, *(uint32_t*)eng_sect_start);
         ps_ir  += timed(&input_rec_save);
         ps_ih  += timed(&input_hist::save);
         if (++ps_n >= 240) {
@@ -1660,6 +1706,22 @@ static void log_region_checksums() {
 }
 
 void advance_one_frame() {
+    // DIAG: Dr0 write-watch on an arbitrary address (SQUIROLL_WATCH_ADDR=0xXXXX),
+    // armed once on the sim thread. Used to name the writer of the round-
+    // transition frame-dt divergence (sq 0x241FC8D0). [velwatch] logs each write
+    // with the writer rva + value + fwd/resim tag.
+    {
+        static int wa = -2, wfrom = 0;
+        if (wa == -2) { char b[16] = {0};
+            wa = (GetEnvironmentVariableA("SQUIROLL_WATCH_ADDR", b, sizeof b) > 0)
+                 ? (int)strtoul(b, nullptr, 0) : -1;
+            char c[12] = {0};
+            if (GetEnvironmentVariableA("SQUIROLL_WATCH_FROM", c, sizeof c) > 0)
+                wfrom = (int)strtoul(c, nullptr, 0); }
+        // Arm only once we reach WATCH_FROM: the sq VM heap address is reused,
+        // so an early arm exhausts the hit budget on an unrelated object.
+        if (wa > 0 && g_trace_frame >= wfrom) { actor2d_log::watch_arm((uint32_t)wa); wa = -1; }
+    }
     // log_region_checksums();   // X-finder probe (done: X is real-heap, not .data)
     // Drive one full logic tick WITHOUT rendering.
     //
@@ -1780,7 +1842,16 @@ void advance_one_frame() {
     // is not snapshotted — a re-sim re-free would double-free).
     cpp_arena::set_resim(g_trace_rb != 0);
     cpp_arena::trace_reset();                               // start THIS advance's alloc trace
+    // Freeze GetFPS()=60 for the deterministic sim: a script computes dt =
+    // 1/GetFPS() and stores it in battle state; GetFPS reads the measured
+    // current_fps which drifts across a rollback burst (updates once/sec), so a
+    // frame's forward pass and its re-sim would compute different dt -> desync
+    // (round-transition, sq 0x241FC8D0). Restore the real value after so the fps
+    // display (read in window_render, outside advance) is unaffected.
+    uint32_t saved_fps = sim_get_fps();
+    sim_set_fps(60);
     update_related(*MAIN_SCRIPTAPI_PTR);                    // RunOneFrame(g_main), once
+    sim_set_fps(saved_fps);
     log_state_fingerprint(g_trace_frame, g_trace_rb, "post-run");
     if (rb_diag_enabled()) battle_pools::log_fingerprint("post-run");
     if (trace) log_printf("[gekko_bridge] advance: -> ScriptAPI::Update\n");
@@ -2016,11 +2087,16 @@ bool init_solo() {
     config.state_size = 1 * 1024 * 1024;   // see init() — snapshot_ring owns the state
     config.max_spectators = 0;
     config.num_players = 2;
-    // Roll back 8 frames every frame: the stress session re-simulates
-    // current-8 .. current each tick, so save + load + advance all run
-    // hard, in one process. This is the rig for rollback determinism /
-    // perf iteration.
+    // Roll back check_distance frames every frame: the stress session
+    // re-simulates current-N .. current each tick, so save + load + advance
+    // all run N+1x per displayed frame. 8 = the pathological determinism/perf
+    // rig; SQUIROLL_DISTANCE=N lowers it for a smooth, closer-to-real-rollback
+    // playthrough (e.g. 2 to actually watch full rounds without the 9x crawl).
     config.check_distance = 8;
+    { char b[8] = {0};
+      if (GetEnvironmentVariableA("SQUIROLL_DISTANCE", b, sizeof b) > 0) {
+          uint32_t v = 0; for (const char* s = b; *s >= '0' && *s <= '9'; ++s) v = v*10 + (*s-'0');
+          if (v >= 1 && v <= 8) config.check_distance = v; } }
 
     gekko_start(g_session, &config);
 
@@ -2614,7 +2690,28 @@ bool tick() {
     // actually started, and only solo for now — dual must drive this off
     // the confirmed (non-speculative) frame so a predicted-then-rolled-
     // back KO can't disarm early (TODO when dual is re-tested).
+    // SQUIROLL_NO_DISARM=1: keep the session armed THROUGH the round transition
+    // instead of tearing down + re-arming at the next Round_Fight. The re-arm
+    // path re-runs the one-time match setup (pregrow/reserve_anim_vectors) on
+    // top of live state and corrupts a resource red-black tree + deadlocks a
+    // worker (round-2 f=2 hang). Staying armed rolls back the non-interactive
+    // transition too, but with restore step-0 + sync_pin that may now be safe —
+    // this tests it.
+    static int no_disarm = -1;
+    if (no_disarm < 0) { char b[4] = {0};
+        no_disarm = (GetEnvironmentVariableA("SQUIROLL_NO_DISARM", b, sizeof b) > 0 && b[0] != '0') ? 1 : 0; }
+    // Log battle.state transitions so round switches are visible in the log.
+    // (Only forward frames — this runs once per real frame in tick.)
     if (g_session_started && g_solo) {
+        static int last_st = -1;
+        int st = 0;
+        if (read_battle_state(&st) && st != last_st) {
+            log_printf("[round] battle.state %d -> %d (fwd f=%d)\n",
+                       last_st, st, g_trace_frame);
+            last_st = st;
+        }
+    }
+    if (g_session_started && g_solo && !no_disarm) {
         int st = 0;
         if (read_battle_state(&st) && st != 8) {
             disarm_for_round_end();

@@ -675,6 +675,66 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
     uint32_t cs = fold_checksum(sblob, csum_len);
     LARGE_INTEGER pt2; QueryPerformanceCounter(&pt2);
 
+    // PHASH TRIPWIRE (ungated, write-once): bp+eng are byte-identical at the
+    // round-transition desync (f=542), so the diverging checksum input is an
+    // sq(0)/bt(1) arena page. On the forward save snapshot the sq/bt phash into
+    // the slot; on a resim re-capture of the same frame compare and report the
+    // FIRST diverging page -> arena base+offset, once, so it can be Dr0'd / IDA'd.
+    if (!g_diag) {   // in diag mode the [divf] block below already does this
+        Slot& St = g_ring[frame % RING];
+        // Optional byte shadow of one sq/bt page (SQUIROLL_SHADOW_PG=N, arena
+        // SQUIROLL_SHADOW_ARENA=0|1) so the tripwire can byte-diff it and print
+        // the exact diverging dwords + values (frame counter? pointer? RNG?).
+        static int shadow_pg = -2, shadow_a = 0;
+        static uint8_t shadow[PAGE];
+        if (shadow_pg == -2) { char b[12] = {0};
+            shadow_pg = (GetEnvironmentVariableA("SQUIROLL_SHADOW_PG", b, sizeof b) > 0)
+                        ? (int)strtoul(b, nullptr, 0) : -1;
+            char c[4] = {0};
+            if (GetEnvironmentVariableA("SQUIROLL_SHADOW_ARENA", c, sizeof c) > 0)
+                shadow_a = (c[0] == '1') ? 1 : 0; }
+        if (!re_capture_diag) {
+            for (int a = 0; a <= 1; ++a)
+                if (St.phash_snap[a])
+                    memcpy(St.phash_snap[a], g_ar[a].phash, g_ar[a].npages * 4u);
+            if (shadow_pg >= 0 && (uint32_t)shadow_pg < g_ar[shadow_a].npages)
+                memcpy(shadow, g_ar[shadow_a].base + shadow_pg * PAGE, PAGE);
+        } else {
+            static bool ph_dumped = false;
+            static const char* nm[2] = { "sq", "bt" };
+            for (int a = 0; a <= 1 && !ph_dumped; ++a) {
+                if (!St.phash_snap[a]) continue;
+                uint32_t bump = *(const uint32_t*)(g_ar[a].base + BUMP_OFF[a]);
+                uint32_t upg  = (bump + PAGE - 1) / PAGE;
+                if (upg > g_ar[a].npages) upg = g_ar[a].npages;
+                for (uint32_t pg = 0; pg < upg; ++pg) {
+                    if (St.phash_snap[a][pg] != g_ar[a].phash[pg]) {
+                        ph_dumped = true;
+                        log_printf("[phtrip] FIRST arena divergence f=%u arena=%s "
+                                   "pg=%u addr=0x%08X fwd_hash=%08x resim_hash=%08x\n",
+                                   frame, nm[a], pg,
+                                   (uint32_t)(uintptr_t)g_ar[a].base + pg * PAGE,
+                                   St.phash_snap[a][pg], g_ar[a].phash[pg]);
+                        // Byte-diff the shadowed page (if this is it) to name dwords.
+                        if (a == shadow_a && pg == (uint32_t)shadow_pg) {
+                            const uint32_t* fwd = (const uint32_t*)shadow;
+                            const uint32_t* now = (const uint32_t*)(g_ar[a].base + pg * PAGE);
+                            int shown = 0;
+                            for (uint32_t o = 0; o < PAGE / 4 && shown < 16; ++o)
+                                if (fwd[o] != now[o]) {
+                                    log_printf("[phdiff]   +0x%03X (addr 0x%08X) fwd=%08X resim=%08X\n",
+                                               o * 4, (uint32_t)(uintptr_t)g_ar[a].base + pg * PAGE + o * 4,
+                                               fwd[o], now[o]);
+                                    ++shown;
+                                }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // TRACE: ungated per-component checksum for EVERY save of the first frames, so
     // the residual intermittent f=2 desync (cs diverges fwd-vs-resim while [comp]
     // sq/bt look clean) can be pinned to the exact component — sq fold, bt fold, or
