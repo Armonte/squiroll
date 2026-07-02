@@ -209,6 +209,14 @@ static int collect(Region* r) {
             { (uintptr_t)(0x4DB004_R), (uintptr_t)(0x4DB004_R) + 4    }, // g_engine_loop_tick
             { (uintptr_t)(0x4DB310_R), (uintptr_t)(0x4DB310_R) + 0xA8 }, // bg-task condvar/mutex/slot block
             { (uintptr_t)(0x4DB6A8_R), (uintptr_t)(0x4DB6A8_R) + 16   }, // bg-ScriptAPI FIFO slot+count
+            // Render-camera follow x/y (floats @0x4DB790/94, struct-based access,
+            // no direct xrefs): updated by the forward-only main-loop/render pass —
+            // the headless re-sim's copy stays FROZEN at the restore value while
+            // the forward's tracks the fighters, so any ASYMMETRIC matchup (the
+            // camera actually moving) flagged an instant f=2 eng "desync". Mirror
+            // reimu/marisa never exposed it. Sim-side camera state is separately
+            // fingerprinted (battle_pools Camera3D), so this stays covered.
+            { (uintptr_t)(0x4DB790_R), (uintptr_t)(0x4DB790_R) + 8    }, // render camera follow x/y
         };
 
         // Emit committed run [a,e) as snapshot region(s), carving out every exr[].

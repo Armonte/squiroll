@@ -188,6 +188,14 @@ function Initialize() {
             param.slave_color[1]  = 1;
             param.spell[0]       = 0;
             param.spell[1]       = 0;
+            // Matchup resolved C++-side (plugin.cpp set_network_constants):
+            // SQUIROLL_CHARS override, else derived from SQUIROLL_INPUT_SEED
+            // over the full roster — desync hunting must load every character.
+            local net = ::setting.network;
+            if ("chars_m0" in net) param.master_name[0] = net.chars_m0;
+            if ("chars_s0" in net) param.slave_name[0]  = net.chars_s0;
+            if ("chars_m1" in net) param.master_name[1] = net.chars_m1;
+            if ("chars_s1" in net) param.slave_name[1]  = net.chars_s1;
             param.background_id  = 26;
             param.bgm_id         = 1;
             param.seed           = ::manbow.timeGetTime();

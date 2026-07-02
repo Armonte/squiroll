@@ -148,6 +148,57 @@ static inline void set_network_constants(HSQUIRRELVM v) {
     // Auto-connect (test-rig): if "host"/"client", boot.nut auto-pairs
     // two clients without going through the menu.
     sq_setstring(v, _SC("auto_connect"), get_auto_connect());
+    // Stress-rig matchup: 4 character names pushed ready-resolved so boot.nut
+    // does no string parsing. SQUIROLL_CHARS="m0,s0,m1,s1" (internal names)
+    // overrides; otherwise the pair is derived DETERMINISTICALLY from
+    // SQUIROLL_INPUT_SEED over the roster, so a seed reproduces its matchup
+    // AND its inputs. Fixed reimu/marisa only exercised 2 of 19 characters'
+    // scripts/effect pools — desync hunting needs the whole roster.
+    {
+        static const char* ROSTER[] = {
+            "reimu","marisa","yukari","miko","mamizou","futo","udonge",
+            "tenshi","nitori","jyoon","usami","doremy","kokoro","hijiri",
+            "mokou","koishi","ichirin","sinmyoumaru","kasen" };
+        constexpr int NR = sizeof(ROSTER) / sizeof(*ROSTER);
+        const char* pick[4] = { "reimu", "marisa", "reimu", "marisa" };
+        char cb[128] = {0};
+        if (GetEnvironmentVariableA("SQUIROLL_CHARS", cb, sizeof cb) > 0) {
+            // explicit "m0,s0,m1,s1" — validate each against the roster
+            int n = 0;
+            for (char* t = strtok(cb, ","); t && n < 4; t = strtok(nullptr, ",")) {
+                for (int r = 0; r < NR; ++r)
+                    if (_stricmp(t, ROSTER[r]) == 0) { pick[n] = ROSTER[r]; break; }
+                ++n;
+            }
+        } else {
+            char sb[24] = {0};
+            if (GetEnvironmentVariableA("SQUIROLL_INPUT_SEED", sb, sizeof sb) > 0) {
+                uint32_t x = (uint32_t)strtoul(sb, nullptr, 0);
+                if (x) {
+                    for (int i = 0; i < 4; ++i) {
+                        x = x * 1664525u + 1013904223u;
+                        pick[i] = ROSTER[(x >> 16) % NR];
+                    }
+                    // a team's master/slave must differ — bump the slave to the
+                    // roster entry AFTER the master (the old "+1 on a fresh
+                    // random index" could land back on the same name: miko/miko)
+                    auto fix_dup = [&](int m, int s) {
+                        if (pick[m] != pick[s]) return;
+                        for (int r = 0; r < NR; ++r)
+                            if (ROSTER[r] == pick[m]) { pick[s] = ROSTER[(r + 1) % NR]; return; }
+                    };
+                    fix_dup(0, 1);
+                    fix_dup(2, 3);
+                }
+            }
+        }
+        log_printf("[squiroll] stress matchup: %s/%s vs %s/%s\n",
+                   pick[0], pick[1], pick[2], pick[3]);
+        sq_setstring(v, _SC("chars_m0"), pick[0]);
+        sq_setstring(v, _SC("chars_s0"), pick[1]);
+        sq_setstring(v, _SC("chars_m1"), pick[2]);
+        sq_setstring(v, _SC("chars_s1"), pick[3]);
+    }
     sq_setstring(v, _SC("peer_ip"), get_peer_ip());
     sq_setinteger(v, _SC("peer_port"), get_peer_port());
     sq_setinteger(v, _SC("device_id"), get_device_id());
