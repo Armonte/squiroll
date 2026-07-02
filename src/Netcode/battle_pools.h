@@ -38,6 +38,9 @@ void reserve_anim_vectors();
 // actor-manager + ID counters) into out[0..cap). Returns bytes written,
 // 0 on overflow.
 uint32_t save(uint8_t* out, uint32_t cap);
+// Byte spans (into the last save() dest buffer) of render-tainted pools —
+// excluded from the gekko desync checksum, kept in the blob for restore.
+int nochecksum_spans(const uint8_t** lo, const uint8_t** hi, int maxn);
 
 // Restore from a save() blob — memcpy every block back to its (stable)
 // address and restore the allocator structs + counters.

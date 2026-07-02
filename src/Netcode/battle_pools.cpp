@@ -49,11 +49,11 @@ struct Pool {
 // every frame by actor scripts, so they MUST roll back. (Verified via
 // the New stubs @0x6D5F0/0x6EA20/0x702A0/0x75480, each of which
 // references its std::_Ref_count_obj_alloc<...TPoolAllocator> vtable.)
-struct PoolRef { uint32_t rva; const char* name; };
+struct PoolRef { uint32_t rva; const char* name; bool render_tainted; };
 static const PoolRef g_pool_rva[] = {
     { 0x49B370, "Actor2DManager/World2D" },
     { 0x49B390, "Actor2DProcGroup" },
-    { 0x49B410, "Camera2D" },
+    { 0x49B410, "Camera2D", true },
     { 0x49B4F0, "Aura" },
     { 0x49B590, "cEftResChain" },
     { 0x49B5B0, "AnimCtrlTrail" },
@@ -66,7 +66,7 @@ static const PoolRef g_pool_rva[] = {
     { 0x49B690, "Actor2DGroup" },
     { 0x49B6B0, "Afterimage" },
     { 0x49B6D0, "Sensor" },
-    { 0x49B6F0, "Camera3D" },
+    { 0x49B6F0, "Camera3D", true },
     { 0x49B770, "ActorCollisionData" },
     { 0x49B790, "EwActor" },
     { 0x49B450, "InputGlobal" },
@@ -204,6 +204,18 @@ static constexpr uint32_t POOL_MAGIC = 0x4C4F4F50;  // 'POOL'
 static constexpr uint32_t MAXSLOT = 65536;
 static uint8_t g_freebits[MAXSLOT / 8];
 
+// Checksum-exempt spans of the LAST save(): byte ranges (absolute, into the
+// caller's dest buffer) of render-tainted pools. Consumed immediately by
+// gekko_bridge's desync-checksum walk over the same buffer.
+static const uint8_t* g_ncs_lo[4];
+static const uint8_t* g_ncs_hi[4];
+static int g_ncs_n = 0;
+int nochecksum_spans(const uint8_t** lo, const uint8_t** hi, int maxn) {
+    int n = (g_ncs_n < maxn) ? g_ncs_n : maxn;
+    for (int i = 0; i < n; ++i) { lo[i] = g_ncs_lo[i]; hi[i] = g_ncs_hi[i]; }
+    return n;
+}
+
 uint32_t save(uint8_t* out, uint32_t cap) {
     uint8_t* p   = out;
     uint8_t* end = out + cap;
@@ -217,7 +229,9 @@ uint32_t save(uint8_t* out, uint32_t cap) {
     uint32_t magic = POOL_MAGIC, npool = NPOOL;
     if (!put(&magic, 4) || !put(&npool, 4)) return 0;
 
+    g_ncs_n = 0;
     for (int i = 0; i < NPOOL; ++i) {
+        const uint8_t* pool_rec_start = p;
         Pool* pl = pool_at(i);
         if (!put(pl, sizeof(Pool))) return 0;
         uint32_t ss = pl->slot_size;
@@ -278,6 +292,20 @@ uint32_t save(uint8_t* out, uint32_t cap) {
             fa = *(const uint32_t*)(uintptr_t)fa;
         }
         *nfree = freec;
+
+        // Render-tainted pools: the RENDERER writes into these objects
+        // (Camera2D/3D are ConnectRenderSlot'ed — the forward-only draw pass
+        // stores matrices/state into them), so their bytes can never match
+        // forward-vs-re-sim and would flag false desyncs. They stay IN the
+        // blob (restore needs them); the gekko checksum walks around these
+        // spans (gekko_bridge save_state_to_buf), exactly like the cpp span.
+        // The authoritative sim camera state (::camera table: target/zoom/
+        // shake) lives in sq_arena and remains fully checksummed.
+        if (g_pool_rva[i].render_tainted && g_ncs_n < (int)(sizeof(g_ncs_lo) / sizeof(*g_ncs_lo))) {
+            g_ncs_lo[g_ncs_n] = pool_rec_start;
+            g_ncs_hi[g_ncs_n] = p;
+            ++g_ncs_n;
+        }
     }
 
     if (!put((const void*)ACTOR_MGR_ADDR, ACTOR_MGR_BYTES)) return 0;

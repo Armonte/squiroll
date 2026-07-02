@@ -722,6 +722,76 @@ static uint32_t g_perf_nsave = 0, g_perf_nload = 0, g_perf_nadv = 0;
 // save split: small-section serialization vs snapshot_ring::capture.
 static uint64_t g_perf_sblob = 0, g_perf_cap = 0;
 
+// DESYNC BYTE-DIFF STASH — per-frame copies of the bp ("pools") save section,
+// one ring per timeline ([0]=forward rb==0, [1]=re-sim rb>0). The gekko desync
+// event only carries checksums; these buffers let the abort path write the
+// actual diverging bytes to disk for offline attribution (the save format is
+// walkable: per pool Pool struct + block table + live slots(addr,bytes) +
+// free list — see battle_pools::save).
+static constexpr int      BPSTASH_RING = 16;
+static constexpr uint32_t BPSTASH_CAP  = 1u << 20;   // bp section is ~400KB
+struct BpStash { int32_t frame; uint32_t len; uint8_t* buf; };
+static BpStash g_bpstash[2][BPSTASH_RING];
+static void bp_stash_dump(uint32_t frame);
+static void bp_stash(uint32_t frame, int rb, const uint8_t* bytes, uint32_t len) {
+    BpStash& S = g_bpstash[rb ? 1 : 0][frame % BPSTASH_RING];
+    if (!S.buf)
+        S.buf = (uint8_t*)VirtualAlloc(nullptr, BPSTASH_CAP,
+                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!S.buf || len > BPSTASH_CAP) { S.frame = -1; return; }
+    S.frame = (int32_t)frame;
+    S.len   = len;
+    memcpy(S.buf, bytes, len);
+    // TRIPWIRE: the bp divergence is TRANSIENT — one rollback depth of a frame
+    // produces different bytes, later re-sims of the same frame match again
+    // (so a last-write stash sees nothing, and gekko's desync event fires on
+    // whichever save it happens to compare). Compare every re-sim save against
+    // the forward stash immediately and dump the FIRST mismatch, tagged with
+    // the depth that produced it.
+    if (rb) {
+        BpStash& F = g_bpstash[0][frame % BPSTASH_RING];
+        if (F.frame == (int32_t)frame && F.buf && F.len == len &&
+            memcmp(F.buf, bytes, len) != 0) {
+            static bool dumped = false;
+            if (!dumped) {
+                dumped = true;
+                uint32_t d0 = 0;
+                while (d0 < len && F.buf[d0] == bytes[d0]) ++d0;
+                log_printf("[bptrip] FIRST bp mismatch f=%u rb=%d depth=%d "
+                           "byte-off=%u len=%u — dumping\n",
+                           frame, rb, g_trace_depth, d0, len);
+                bp_stash_dump(frame);
+            }
+        }
+    }
+}
+static void bp_stash_dump(uint32_t frame) {
+    // Write-once: the tripwire's mismatching pair must not be clobbered by the
+    // later desync-abort calling this again (by then the ring holds a converged
+    // re-sim and the evidence is gone).
+    static bool s_dumped = false;
+    if (s_dumped) return;
+    s_dumped = true;
+    static const char* nm[2] = { "aocf_bp_fwd.bin", "aocf_bp_resim.bin" };
+    for (int side = 0; side < 2; ++side) {
+        BpStash& S = g_bpstash[side][frame % BPSTASH_RING];
+        if (S.frame == (int32_t)frame && S.buf) {
+            HANDLE h = CreateFileA(nm[side], GENERIC_WRITE, 0, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                DWORD wr = 0;
+                WriteFile(h, S.buf, S.len, &wr, nullptr);
+                CloseHandle(h);
+                log_printf("[gekko_bridge] desync bp dump %s f=%u len=%u\n",
+                           nm[side], frame, S.len);
+            }
+        } else {
+            log_printf("[gekko_bridge] desync bp dump %s f=%u MISSING (slot has f=%d)\n",
+                       nm[side], frame, S.frame);
+        }
+    }
+}
+
 uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                            uint32_t frame) {
     if (cap < sizeof(SaveHeader)) return 0;
@@ -777,6 +847,11 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         };
         LARGE_INTEGER _c0; QueryPerformanceCounter(&_c0);
         sect(&battle_pools::save);
+        // DESYNC BYTE-DIFF STASH (the ACTIVE save path — the put_section chain
+        // below is the non-snapshot_ring fallback): first section == bp, bytes
+        // at smb+4 with the u32 length at smb. Kept per frame for both
+        // timelines; desync-abort writes the diverging frame's pair to disk.
+        if (ok) bp_stash(frame, g_trace_rb, smb + 4, *(uint32_t*)smb);
         sect(&battle_pools::boostpool_save);   // Sqrat math boost::pools (this.va/vf/vfBaria)
         // cpp_arena is now dirty-page-snapshotted by snapshot_ring, not full-copied in the small blob.
         sect(&engine_snap::save);
@@ -906,9 +981,18 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         // forward-vs-re-sim. We still SAVE + restore it (snapshot_ring) for visual
         // correctness, but EXCLUDE its bytes from the desync checksum below. Track
         // its span so the checksum can skip it.
-        bool ok = put_section("sq_arena",  &sq_arena::save)
-               && put_section("pools",     &battle_pools::save)
-               && put_section("boostpools", &battle_pools::boostpool_save)
+        bool ok = put_section("sq_arena",  &sq_arena::save);
+        uint8_t* bp_sect_start = p;
+        ok = ok && put_section("pools",     &battle_pools::save);
+        uint8_t* bp_sect_end = p;
+        // DESYNC BYTE-DIFF STASH: keep this frame's bp ("pools") section bytes,
+        // separately for the forward pass and the re-sim. On desync-abort the
+        // two buffers for the diverging frame go to disk (aocf_bp_fwd.bin /
+        // aocf_bp_resim.bin) for offline byte-diff -> pool/slot/field naming.
+        if (ok && bp_sect_end > bp_sect_start + 4)
+            bp_stash(frame, g_trace_rb, bp_sect_start + 4,
+                     (uint32_t)(bp_sect_end - bp_sect_start - 4));
+        ok = ok && put_section("boostpools", &battle_pools::boostpool_save)
                && put_section("engine",    &engine_snap::save);
         cpp_sect_start = p;
         ok = ok && put_section("cpp_arena", &cpp_arena::save);
@@ -943,9 +1027,30 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
             // legitimately differs forward-vs-re-sim; including it would flag false
             // desyncs. cpp_arena is still saved+restored for visuals; the sim is
             // fully covered by sq/pools/boostpools/engine/bullet/input.
-            uint32_t a = fletcher32_acc(0xFFFFFFFFu, trailer2_start,
-                                        (size_t)(cpp_sect_start - trailer2_start));
-            a = fletcher32_acc(a, cpp_sect_end, (size_t)(p - cpp_sect_end));
+            // Skip spans: the cpp_arena section AND the render-tainted pool
+            // records inside the bp section (Camera2D/3D — the renderer writes
+            // into those objects forward-only, so their bytes can never match
+            // fwd-vs-resim; see battle_pools::nochecksum_spans). All spans lie
+            // within [trailer2_start, p); walk the gaps in address order.
+            struct Sp { const uint8_t* lo; const uint8_t* hi; };
+            Sp sp[6];
+            int nsp = 0;
+            sp[nsp++] = { cpp_sect_start, cpp_sect_end };
+            const uint8_t *clo[4], *chi[4];
+            int nc = battle_pools::nochecksum_spans(clo, chi, 4);
+            for (int i = 0; i < nc && nsp < 6; ++i)
+                if (clo[i] >= trailer2_start && chi[i] <= p)
+                    sp[nsp++] = { clo[i], chi[i] };
+            for (int i = 0; i < nsp; ++i)
+                for (int j = i + 1; j < nsp; ++j)
+                    if (sp[j].lo < sp[i].lo) { Sp t = sp[i]; sp[i] = sp[j]; sp[j] = t; }
+            uint32_t a = 0xFFFFFFFFu;
+            const uint8_t* cur = trailer2_start;
+            for (int i = 0; i < nsp; ++i) {
+                if (sp[i].lo > cur) a = fletcher32_acc(a, cur, (size_t)(sp[i].lo - cur));
+                if (sp[i].hi > cur) cur = sp[i].hi;
+            }
+            if (p > cur) a = fletcher32_acc(a, cur, (size_t)(p - cur));
             *out_checksum = a;
         } else {
             *out_checksum = sq_n > 0 ? fletcher32(text_blob, sq_n) : 0;
@@ -2155,6 +2260,7 @@ bool tick() {
                                    e->data.desynced.frame,
                                    e->data.desynced.local_checksum,
                                    e->data.desynced.remote_checksum);
+                        bp_stash_dump((uint32_t)e->data.desynced.frame);
                         log_state_fingerprint(g_trace_frame, g_trace_rb, "desync-abort");
                         battle_pools::log_fingerprint("desync-abort");
                         log_flush();
