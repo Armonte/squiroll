@@ -40,6 +40,8 @@ void load(const uint8_t* blob, uint32_t len);
 // Ew::sRandom SFMT19937 state: restore-but-not-checksum (render-contaminated).
 uint32_t rng_save(uint8_t* out, uint32_t cap);
 void rng_load(const uint8_t* blob, uint32_t len);
+// Reset the cached RNG/sTask restore-region addresses (call at battle arm).
+void rng_reset_cache();
 
 // DIAGNOSTIC: forward-vs-resim byte-diff of the th155 .data section. Called
 // post-advance with (frame, rb). On a forward advance it snapshots .data into

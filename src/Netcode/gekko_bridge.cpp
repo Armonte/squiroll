@@ -849,22 +849,48 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
             sp += w;
         };
         LARGE_INTEGER _c0; QueryPerformanceCounter(&_c0);
-        sect(&battle_pools::save);
+        // Per-section timing (PROFILE): pin which serializer dominates the ~28ms
+        // sblob build. Accumulated + reported per 240 saves.
+        static uint64_t ps_bp = 0, ps_mp = 0, ps_eng = 0, ps_ir = 0, ps_ih = 0;
+        static uint32_t ps_n = 0;
+        auto timed = [&](auto fn) {
+            LARGE_INTEGER a; QueryPerformanceCounter(&a);
+            sect(fn);
+            LARGE_INTEGER b; QueryPerformanceCounter(&b);
+            return (uint64_t)(b.QuadPart - a.QuadPart);
+        };
+        ps_bp += timed(&battle_pools::save);
         // DESYNC BYTE-DIFF STASH (the ACTIVE save path — the put_section chain
         // below is the non-snapshot_ring fallback): first section == bp, bytes
         // at smb+4 with the u32 length at smb. Kept per frame for both
         // timelines; desync-abort writes the diverging frame's pair to disk.
         if (ok) bp_stash(frame, g_trace_rb, smb + 4, *(uint32_t*)smb);
-        sect(&battle_pools::boostpool_save);   // Sqrat math boost::pools (this.va/vf/vfBaria)
-        // cpp_arena is now dirty-page-snapshotted by snapshot_ring, not full-copied in the small blob.
-        sect(&engine_snap::save);
-        sect(&input_rec_save);
-        sect(&input_hist::save);
+        ps_mp  += timed(&battle_pools::boostpool_save);   // Sqrat math boost::pools
+        ps_eng += timed(&engine_snap::save);
+        ps_ir  += timed(&input_rec_save);
+        ps_ih  += timed(&input_hist::save);
+        if (++ps_n >= 240) {
+            LARGE_INTEGER fr; QueryPerformanceFrequency(&fr); uint64_t hz = fr.QuadPart;
+            auto us = [&](uint64_t t){ return (uint32_t)(t * 1000000ull / hz / ps_n); };
+            log_printf("[perf-sect] us/save: bp=%u mp=%u eng=%u irec=%u ihist=%u\n",
+                       us(ps_bp), us(ps_mp), us(ps_eng), us(ps_ir), us(ps_ih));
+            ps_bp = ps_mp = ps_eng = ps_ir = ps_ih = 0; ps_n = 0;
+        }
         // RNG section LAST + restore-but-not-checksum: its bytes are excluded
         // from the desync fold (render-tied effect draws contaminate the state),
         // but it is stored+restored so the re-sim's RNG start is consistent.
         uint8_t* rng_start = sp;
-        sect(&engine_snap::rng_save);
+        static uint64_t ps_rng = 0;
+        { LARGE_INTEGER a; QueryPerformanceCounter(&a);
+          sect(&engine_snap::rng_save);
+          LARGE_INTEGER b; QueryPerformanceCounter(&b);
+          ps_rng += (uint64_t)(b.QuadPart - a.QuadPart); }
+        if (ps_n == 0) {   // report piggybacks the perf-sect gate above (just reset)
+            LARGE_INTEGER fr; QueryPerformanceFrequency(&fr);
+            log_printf("[perf-rng] us/save rng=%u\n",
+                       (uint32_t)(ps_rng * 1000000ull / fr.QuadPart / 240));
+            ps_rng = 0;
+        }
         uint32_t rng_tail = ok ? (uint32_t)(sp - rng_start) : 0;
         if (!ok) {
             log_printf("[gekko_bridge] !! small-section save overflow f=%u\n",
@@ -1955,6 +1981,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
     // thread before the baseline is taken, so only its allocations enter
     // cpp_arena (the audio thread is kept out of the snapshot).
     cpp_arena::set_sim_thread(GetCurrentThreadId());
+    engine_snap::rng_reset_cache();   // re-resolve cached RNG/sTask restore addrs for the new match
     snapshot_ring::arm();
     apply_test_round_frames();
 
@@ -2007,6 +2034,7 @@ bool init_solo() {
     // Designate this (the battle/game thread) the simulation thread before
     // the baseline — see init().
     cpp_arena::set_sim_thread(GetCurrentThreadId());
+    engine_snap::rng_reset_cache();   // re-resolve cached RNG/sTask restore addrs for the new match
     snapshot_ring::arm();
 
     // The battle is already created — vs.Initialize ran under the

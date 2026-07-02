@@ -392,9 +392,27 @@ static int collect(Region* r) {
 
 } // namespace
 
+// CACHED region list (see rng_collect note): collect() resolves ~50 regions,
+// VirtualQuery-validating each every save (~8ms — the .data committed-run walk
+// + pointer-graph region_ok). The region ADDRESSES are stable for the whole
+// battle (fixed .data, singletons allocated once, pool structs fixed), so
+// resolve ONCE and reuse; only the byte copy (~293KB, ~30us) runs per save.
+static Region g_col_cache[MAX_REGIONS];
+static int    g_col_cached = -1;
+void rng_reset_cache();   // fwd (defined below) — also resets this cache
+
 uint32_t save(uint8_t* out, uint32_t cap) {
     Region r[MAX_REGIONS];
-    int n = collect(r);
+    int n;
+    if (g_col_cached >= 0) {
+        n = g_col_cached;
+        for (int i = 0; i < n; ++i) r[i] = g_col_cache[i];
+    } else {
+        n = collect(r);
+        // Latch once the pointer graph is up (ScriptAPI/sEffect/sTask resolved);
+        // by the first post-arm save the battle is fully built, so n is stable.
+        if (n > 0) { for (int i = 0; i < n; ++i) g_col_cache[i] = r[i]; g_col_cached = n; }
+    }
 
     uint8_t* p   = out;
     uint8_t* end = out + cap;
@@ -425,7 +443,20 @@ uint32_t save(uint8_t* out, uint32_t cap) {
 // re-sim is consistent, but excluded from the desync checksum (their bytes are
 // advanced forward-only by the render/worker path).
 struct NcRegion { uint32_t addr, len; };
+// CACHED: the SFMT state buffers + sTask frame counter are aligned_malloc'd /
+// heap-allocated ONCE at battle init and never move. Re-chasing the pointer
+// graph and VirtualQuery-validating every region on EVERY save cost ~24ms/save
+// (the dominant sblob cost). Resolve once (first save where the RNG exists),
+// cache the (addr,len) list, and just copy from it thereafter. A new battle
+// re-arms the snapshot which resets g_nc_cached, so stale addresses can't leak.
+static NcRegion g_nc_cache[32];
+static int      g_nc_cached = -1;   // -1 = not resolved yet
 static int rng_collect(NcRegion* r, int maxn) {
+    if (g_nc_cached >= 0) {          // fast path: reuse the resolved list
+        int n = g_nc_cached < maxn ? g_nc_cached : maxn;
+        for (int i = 0; i < n; ++i) r[i] = g_nc_cache[i];
+        return n;
+    }
     int n = 0;
     void* mgr = *(void**)(0x4DB0C4_R);
     if (mgr && region_ok(mgr, 12)) {
@@ -445,8 +476,17 @@ static int rng_collect(NcRegion* r, int maxn) {
         if (n < maxn && region_ok((void*)(uintptr_t)a, STASK_FRAME_BYTES))
             r[n++] = { a, STASK_FRAME_BYTES };   // worker-frame head counter
     }
+    // Cache only once the graph is fully built (RNG present) so we don't latch
+    // an empty list during boot. Until then, resolve every call (cheap: empty).
+    if (n > 0) {
+        for (int i = 0; i < n; ++i) g_nc_cache[i] = r[i];
+        g_nc_cached = n;
+    }
     return n;
 }
+// Called from snapshot_ring::arm() (via engine_snap) at each battle start so a
+// fresh match re-resolves the RNG/sTask addresses.
+void rng_reset_cache() { g_nc_cached = -1; g_col_cached = -1; }
 
 uint32_t rng_save(uint8_t* out, uint32_t cap) {
     NcRegion r[24];
