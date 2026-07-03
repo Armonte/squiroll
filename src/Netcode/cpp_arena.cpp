@@ -316,6 +316,21 @@ static void probe_render_region_dispatch(int self, const char* who) {
 // DIAG: which Act::ScriptAPI::RunOneFrame (0x2FAD0) invokes the forward-only draw
 // slots? Log `this` + rb. A `this` that appears with rb==0 ONLY is the draw/render
 // ScriptAPI the re-sim skips (advance_one_frame's main+bg run on both rb=0 and rb>0).
+// ROLLBACK SERIALIZATION LOCK. Held by the sim thread across a snapshot restore
+// (and capture) and acquired by runone_hook around every RunOneFrame. th155 runs
+// RunOneFrame on THREE ScriptAPIs from THREE threads — the sim advance
+// (0x49B01C), the game-loop render dispatch (Manbow_main_game_loop ->
+// g_gameloop_scriptapi 0x49AFBC, UNLOCKED), and the background ScriptAPI worker
+// (bg_scriptapi_thread_loop -> g_bg_scriptapi 0x49AF9C). The last two walk
+// boost::signals2 connection lists that live in the rolled-back cpp arena,
+// concurrently with the sim thread's restore rewriting them -> corrupt walk ->
+// the distance=10 game-loop dispatch abort + worker-hang classes. Serialize: no
+// RunOneFrame runs while a restore is in flight, and vice-versa. Recursive (a
+// CRITICAL_SECTION is) so the sim thread's own advance-RunOneFrame then
+// capture/restore nest harmlessly on one thread.
+static CRITICAL_SECTION g_rollback_cs;
+static bool             g_rollback_cs_init = false;
+
 static SafetyHookInline g_h_runone{};
 static void thiscall runone_hook(int self) {
     static int n = 0;
@@ -364,8 +379,20 @@ static void thiscall runone_hook(int self) {
     // (sqDIV) — it allocates sq-referenced state too, not just render-dispatch. Reverted.
     // Snapshot the render-dispatch graph at the stable RunOneFrame-end; the collision with
     // re-simmed sim objects is handled by an identity check in gl_pin_restore.
+    // Serialize the NON-sim ScriptAPI walks (game-loop 0x49AFBC, bg 0x49AF9C —
+    // other threads) against a concurrent restore. Do NOT lock the SIM advance's
+    // RunOneFrame (g_sim_scriptapi 0x49B01C): it internally waits on the worker /
+    // bg threads (SyncLayerWorkers, HasPendingFrame catch-up), and holding
+    // g_rollback_cs while waiting for a thread that must ENTER g_rollback_cs
+    // deadlocks (the 0xC0DE hang: game-loop+bg blocked in runone_hook's
+    // EnterCriticalSection while the sim advance held it and waited). The sim
+    // thread's serialization comes from capture()/restore() holding the lock —
+    // NOT from its own advance — so excluding 0x49B01C is correct and safe.
+    bool sim_api = ((uint32_t)self == *(uint32_t*)(0x49B01C_R));
+    if (!sim_api && g_rollback_cs_init) EnterCriticalSection(&g_rollback_cs);
     g_h_runone.unsafe_thiscall<int>(self);
     if ((uint32_t)self == *(uint32_t*)(0x49AFBC_R)) snapshot_ring::gl_capture();
+    if (!sim_api && g_rollback_cs_init) LeaveCriticalSection(&g_rollback_cs);
 }
 
 // DIAG (SQUIROLL_EFTTRACE): Ew_sEffect__CreateEffectGroup (0xEBEB0) — count
@@ -1054,6 +1081,8 @@ void install() {
     // before the hooks go live so the very first hooked call is already
     // protected.
     InitializeCriticalSection(&g_lock);
+    InitializeCriticalSection(&g_rollback_cs);
+    g_rollback_cs_init = true;
 
     // MEM_WRITE_WATCH: a snapshot module tracks which pages each frame
     // dirties (GetWriteWatch), so a rollback snapshot copies only what
@@ -1213,6 +1242,13 @@ bool     is_excluded_page(uint32_t pg) {           // TF4_Number HUD digit-geome
 uint32_t gameloop_addr() {                         // *0x49AFBC = game-loop render-dispatch ScriptAPI
     return *(uint32_t*)(0x49AFBC_R);
 }
+
+// Rollback serialization (see g_rollback_cs). snapshot_ring holds this across
+// restore/capture so a concurrent game-loop/bg-thread RunOneFrame can't walk the
+// arena connection lists mid-rewrite. Defined here (external linkage) —
+// g_rollback_cs itself is anon-namespace but visible in this translation unit.
+void rollback_lock()   { if (g_rollback_cs_init) EnterCriticalSection(&g_rollback_cs); }
+void rollback_unlock() { if (g_rollback_cs_init) LeaveCriticalSection(&g_rollback_cs); }
 
 bool describe_block(uint32_t addr, uint32_t* alloc_rva, uint32_t* reqsize,
                     uint32_t* payload) {

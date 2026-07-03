@@ -131,6 +131,12 @@ void diag_alloc_counts(int frame, int rb);
 uint8_t* base();        // arena base — the MEM_WRITE_WATCH region
 uint32_t used();        // high-water bytes (what save() writes)
 uint32_t capacity();    // arena reservation
+
+// Rollback serialization: snapshot_ring holds this across restore/capture so a
+// concurrent game-loop/bg-thread RunOneFrame can't walk the arena connection
+// lists mid-rewrite. Recursive (CRITICAL_SECTION). See cpp_arena.cpp.
+void rollback_lock();
+void rollback_unlock();
 size_t   live_bytes();  // currently-handed-out payload bytes
 
 // DIAGNOSTIC: find which th155 malloc() call produced the block containing

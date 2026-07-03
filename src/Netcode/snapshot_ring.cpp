@@ -533,8 +533,18 @@ static void gl_bfs_measure() {
 // every rollback restore so the forward-only render state never rolls back.
 void gl_capture() { if (g_gl_pin_on && g_armed) gl_pin_save(); }
 
+// RAII: hold cpp_arena's rollback lock for the whole call so a concurrent
+// game-loop/bg-thread RunOneFrame (which acquires the same lock in runone_hook)
+// cannot walk the arena connection lists while capture reads / restore rewrites
+// them. Recursive CS -> the sim thread's own nested locks are harmless.
+struct RollbackGuard {
+    RollbackGuard()  { cpp_arena::rollback_lock(); }
+    ~RollbackGuard() { cpp_arena::rollback_unlock(); }
+};
+
 uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint32_t nocsum_tail) {
     if (!g_armed) return 0;
+    RollbackGuard _rb;
     Slot& S = g_ring[frame % RING];
     // Detect "the slot already holds this frame" BEFORE we overwrite S.frame
     // below — this is how the per-frame phash-snap diagnostic distinguishes
@@ -1065,6 +1075,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
 const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
     *sblob_len = 0;
     if (!g_armed) return nullptr;
+    RollbackGuard _rb;   // block game-loop/bg RunOneFrame during the arena rewrite
     int64_t target = (int64_t)frame;
     if (target > g_cur) {
         log_printf("[snapshot_ring] !! restore future f=%u cur=%d\n",
