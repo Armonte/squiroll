@@ -69,6 +69,13 @@ bool is_armed();
 // render-effect connection-node leak out of the sim bump.
 void set_render_pass(bool on);
 
+// Render-region dispatch-signal blocks (create_and_bind 0x56AB5): payload
+// offsets into the arena, registered at alloc. Forward-only render dispatch —
+// snapshot_ring forward-state-pins each one across restore so a rollback never
+// rewinds their slot-list head/shared_count to control blocks the game-loop
+// thread already released (the 0xEAC9 round-end crash). Returns count written.
+int dispatch_signal_offsets(uint32_t* out, int maxn);
+
 // Runtime address of the game-loop (forward-only render-dispatch) ScriptAPI object
 // (*0x49AFBC). Its boost::signals2 slot-list shared_count is embedded in the object; the
 // re-sim never runs this ScriptAPI, so rolling it back reverts the use_count to a dead

@@ -26,6 +26,7 @@
 #include "live_actors.h"
 #include "sq_arena.h"      // Squirrel subsystem arena (objects + VM + stacks)
 #include "battle_pools.h"  // TF4 TPoolAllocator battle objects
+#include "desync_registry.h" // render-only field registry: desync-report annotation
 #include "tf4_pool.h"      // generic-grow objpool redirect + freeze
 #include "engine_snap.h"   // scheduler fixed-region snapshot
 #include "actor2d_log.h"   // actor2d_log::watch_arm (Dr0 write-watch)
@@ -141,6 +142,16 @@ int g_trace_frame = -1;
 // Forward-only frame counter for the hang watchdog (bumped in advance_one_frame's
 // rb==0 path). Distinct from g_trace_frame, which cycles during re-sim.
 static volatile int g_wd_fwd_frame = -1;
+// Endless-rollback-cycle diagnostics (the "early stall": forward frame frozen
+// while the stress session keeps yielding rollback re-sims — Advance frames
+// cycling e.g. 16->19->13 with rb_so_far climbing). The watchdog prints these
+// so a hang log names the starvation instead of just "stuck": if adv_rb keeps
+// climbing while adv_fwd is frozen, it's the cycle; if BOTH freeze, the sim
+// thread is genuinely blocked (check the stack dump).
+static volatile int      g_wd_last_adv_frame = -1;   // last AdvanceEvent frame
+static volatile int      g_wd_last_adv_rb    = 0;    // was it a rollback re-sim?
+static volatile uint32_t g_wd_adv_fwd_n = 0;         // forward advances (total)
+static volatile uint32_t g_wd_adv_rb_n  = 0;         // rollback advances (total)
 int g_trace_rb    = 0;
 // Rollback DEPTH = how many frames the current re-sim advance is past its load
 // target (g_trace_frame - last GekkoLoad frame). 0 on the forward. Lets the
@@ -277,6 +288,15 @@ static uint32_t fletcher32(const uint8_t* data, size_t len) {
     // TODO: use whatever checksum GekkoNet's desync detector prefers.
     return fletcher32_acc(0xFFFFFFFFu, data, len);
 }
+
+// NOTE on render-heap (0x1a) pointers: the 0x1A000000..0x1AFFFFFF region is
+// th155's render-resource heap (fonts, sprite backing, effect resources — never
+// sim state). Pointers into it are non-deterministic across a rollback, so they
+// are excluded from the desync checksum. The exclusion is emitted as byte-exact
+// nochecksum spans by battle_pools::save() (which scans each written slot's
+// dwords — slot memory is dword-aligned by construction), NOT by masking words
+// here: the blob's sections are variable-length, so a word-window walk over the
+// whole blob cannot line up with the slots' field grid.
 
 } // namespace gekko_bridge — temporarily close so the extern is global
 
@@ -799,6 +819,43 @@ static void eng_stash(uint32_t frame, int rb, const uint8_t* bytes, uint32_t len
                "addr=0x%08X  fwd=%02X resim=%02X dword fwd=%08X resim=%08X len=%u\n",
                frame, g_trace_depth, d0, va, F.buf[d0], bytes[d0], fwdw, resw, len);
     if (va) engine_snap::classify_and_log(va, fwdw, resw);
+    // ENG DESYNC REPORT: don't stop at the first byte — walk EVERY captured
+    // region record ([addr][len][data]) and print every diverging dword with a
+    // name: desync_registry .data globals (KNOWN-RENDER — should have been
+    // excluded; seeing one here means the exclusion isn't plumbed) or the
+    // engclass classification (sEffect/sTask/ScriptAPI/.data + offset). One
+    // run's log = the complete eng triage.
+    {
+        int printed = 0, unknown = 0, known = 0;
+        const uint8_t* q = bytes + 8;
+        while (q + 8 <= e) {
+            uint32_t a = *(const uint32_t*)q, l = *(const uint32_t*)(q + 4);
+            const uint8_t* data = q + 8;
+            if (data + l > e) break;
+            uint32_t rec_off = (uint32_t)(data - bytes);
+            for (uint32_t k = 0; k + 4 <= l; k += 4) {
+                uint32_t fv, rv;
+                memcpy(&fv, F.buf + rec_off + k, 4);
+                memcpy(&rv, bytes + rec_off + k, 4);
+                if (fv == rv) continue;
+                uint32_t addr = a + k;
+                uint32_t rva  = addr - (uint32_t)base_address;
+                const auto* g = desync_registry::find_data_global(rva);
+                if (g) ++known; else ++unknown;
+                if (printed < 24) {
+                    ++printed;
+                    log_printf("[engreport] addr=%08X (rva %06X) fwd=%08X "
+                               "resim=%08X  %s%s\n", addr, rva, fv, rv,
+                               g ? "KNOWN-RENDER: " : "** UNKNOWN ** ",
+                               g ? g->name : "");
+                    if (!g) engine_snap::classify_and_log(addr, fv, rv);
+                }
+            }
+            q = data + l;
+        }
+        log_printf("[engreport] ==== verdict: %d KNOWN-RENDER, %d UNKNOWN "
+                   "dword(s) ====\n", known, unknown);
+    }
 }
 static void bp_stash_dump(uint32_t frame);
 static void bp_stash(uint32_t frame, int rb, const uint8_t* bytes, uint32_t len) {
@@ -857,6 +914,19 @@ static void bp_stash_dump(uint32_t frame) {
             log_printf("[gekko_bridge] desync bp dump %s f=%u MISSING (slot has f=%d)\n",
                        nm[side], frame, S.frame);
         }
+    }
+    // DESYNC REPORT: annotated in-log analysis of the pair (every diverging
+    // slot named + KNOWN-RENDER/UNKNOWN verdict per dword) — the log alone is
+    // the complete triage, the .bins stay for deeper offline digging.
+    {
+        BpStash& F = g_bpstash[0][frame % BPSTASH_RING];
+        BpStash& R = g_bpstash[1][frame % BPSTASH_RING];
+        if (F.frame == (int32_t)frame && R.frame == (int32_t)frame &&
+            F.buf && R.buf && F.len == R.len)
+            battle_pools::diff_report(F.buf, R.buf, F.len);
+        else if (F.buf && R.buf)
+            log_printf("[bpreport] pair mismatch (fwd f=%d len=%u / resim f=%d "
+                       "len=%u) — no report\n", F.frame, F.len, R.frame, R.len);
     }
 }
 
@@ -1134,18 +1204,27 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
             // into those objects forward-only, so their bytes can never match
             // fwd-vs-resim; see battle_pools::nochecksum_spans). All spans lie
             // within [trailer2_start, p); walk the gaps in address order.
+            // Skip spans: cpp_arena + render-tainted pool records + per-dword
+            // render-heap (0x1a) pointer fields inside bp slots (battle_pools::
+            // nochecksum_spans — one 4..12-byte span per render pointer run, so
+            // size for hundreds). Spans arrive in ascending blob order; the cpp
+            // section span is appended where it belongs (after the bp section),
+            // and the insertion sort below is O(n) on that nearly-sorted input.
             struct Sp { const uint8_t* lo; const uint8_t* hi; };
-            Sp sp[6];
+            static const int SPMAX = 2064;
+            static Sp sp[SPMAX];
             int nsp = 0;
-            sp[nsp++] = { cpp_sect_start, cpp_sect_end };
-            const uint8_t *clo[4], *chi[4];
-            int nc = battle_pools::nochecksum_spans(clo, chi, 4);
-            for (int i = 0; i < nc && nsp < 6; ++i)
+            static const uint8_t *clo[SPMAX], *chi[SPMAX];  // sim-thread only
+            int nc = battle_pools::nochecksum_spans(clo, chi, SPMAX - 1);
+            for (int i = 0; i < nc && nsp < SPMAX; ++i)
                 if (clo[i] >= trailer2_start && chi[i] <= p)
                     sp[nsp++] = { clo[i], chi[i] };
-            for (int i = 0; i < nsp; ++i)
-                for (int j = i + 1; j < nsp; ++j)
-                    if (sp[j].lo < sp[i].lo) { Sp t = sp[i]; sp[i] = sp[j]; sp[j] = t; }
+            if (nsp < SPMAX) sp[nsp++] = { cpp_sect_start, cpp_sect_end };
+            for (int i = 1; i < nsp; ++i) {           // insertion sort by .lo
+                Sp k = sp[i]; int j = i - 1;
+                while (j >= 0 && sp[j].lo > k.lo) { sp[j + 1] = sp[j]; --j; }
+                sp[j + 1] = k;
+            }
             uint32_t a = 0xFFFFFFFFu;
             const uint8_t* cur = trailer2_start;
             for (int i = 0; i < nsp; ++i) {
@@ -1974,6 +2053,32 @@ void advance_one_frame() {
                                    cpp_arena::sim_thread_id(),
                                    cpp_arena::gameloop_thread_id(),
                                    cpp_arena::bg_thread_id());
+                        // Endless-rollback-cycle vs blocked-thread discriminator:
+                        // sample the advance counters twice, 2s apart. rb_n
+                        // climbing with fwd_n frozen = the CYCLE (session yields
+                        // only rollback re-sims; forward progress starved — dump
+                        // gekko's view). Both frozen = blocked thread (read the
+                        // stack dump).
+                        {
+                            uint32_t f0 = g_wd_adv_fwd_n, r0 = g_wd_adv_rb_n;
+                            int      a0 = g_wd_last_adv_frame;
+                            Sleep(2000);
+                            uint32_t f1 = g_wd_adv_fwd_n, r1 = g_wd_adv_rb_n;
+                            float ahead = g_session ? gekko_frames_ahead(g_session)
+                                                    : -999.f;
+                            log_printf("[watchdog] adv counters over 2s: fwd %u->%u "
+                                       "(+%u) rb %u->%u (+%u) last_adv=f%d(rb=%d) "
+                                       "frames_ahead=%.2f => %s\n",
+                                       f0, f1, f1 - f0, r0, r1, r1 - r0,
+                                       g_wd_last_adv_frame, g_wd_last_adv_rb,
+                                       ahead,
+                                       (r1 != r0 && f1 == f0)
+                                           ? "ENDLESS-ROLLBACK CYCLE (fwd starved)"
+                                       : (r1 == r0 && f1 == f0)
+                                           ? "SIM THREAD BLOCKED (see stacks)"
+                                           : "slow-but-progressing (not a hang?)");
+                            (void)a0;
+                        }
                         crash_handler::dump_all_thread_stacks("hang watchdog");
                         log_flush();
                         Sleep(600);
@@ -2219,14 +2324,14 @@ bool init_solo() {
 
 // Read ::battle.state from the Squirrel VM. Returns false if the table
 // or field is not reachable yet.
-static bool read_battle_state(int* out) {
+static bool read_battle_int(const SQChar* field, int* out) {
     if (!v) return false;
     SQInteger top = sq_gettop(v);
     sq_pushroottable(v);
     sq_pushstring(v, _SC("battle"), -1);
     bool ok = SQ_SUCCEEDED(sq_get(v, -2));
     if (ok) {
-        sq_pushstring(v, _SC("state"), -1);
+        sq_pushstring(v, field, -1);
         ok = SQ_SUCCEEDED(sq_get(v, -2));
         if (ok) {
             SQInteger st = 0;
@@ -2237,6 +2342,7 @@ static bool read_battle_state(int* out) {
     sq_settop(v, top);
     return ok;
 }
+static bool read_battle_state(int* out) { return read_battle_int(_SC("state"), out); }
 
 // Deferred-arm parameters. g_watch_dual selects init() vs init_solo();
 // the *_dual fields carry init()'s args captured at watch time.
@@ -3006,6 +3112,9 @@ bool tick() {
                                e->data.adv.frame, (int)e->data.adv.rolling_back,
                                inputs[0], inputs[1]);
                 }
+                g_wd_last_adv_frame = e->data.adv.frame;
+                g_wd_last_adv_rb    = (int)e->data.adv.rolling_back;
+                if (e->data.adv.rolling_back) ++g_wd_adv_rb_n; else ++g_wd_adv_fwd_n;
                 // Log only rollback resims + an occasional heartbeat.
                 if (e->data.adv.rolling_back) {
                     static uint32_t rb_log = 0;
@@ -3064,6 +3173,24 @@ bool tick() {
     if (g_session_started && g_solo && !no_disarm) {
         int st = 0;
         if (read_battle_state(&st) && st != 8) {
+            disarm_for_round_end();
+            return advanced;
+        }
+        // PRE-BURST BARRIER (the 0xEAC9 round-end crash class): the round-end
+        // effect mass-destroy STARTS BEFORE battle.state leaves 8 (KO hitstop /
+        // timer-end cinematics run under state 8), so the state-flip disarm
+        // above lands several churn-frames too late — rollbacks straddle the
+        // destroy and latch corpse references into member-internal lists that
+        // no scrub can fully cover (six containment variants each moved the
+        // window; see eft_freer_log). The stress rig's rounds end by TIMER
+        // (SQUIROLL_ROUND_FRAMES -> battle.time hits 0 at a fixed frame — why
+        // the crash was always f≈2231), so disarm when the clock is nearly
+        // out: the burst then runs on the vanilla forward loop only. Netplay
+        // will need the KO/HP analogue + a round-end sync barrier.
+        int bt = 0;
+        if (read_battle_int(_SC("time"), &bt) && bt > 0 && bt <= 20) {
+            log_printf("[gekko_bridge] battle.time=%d — pre-burst disarm "
+                       "(round-end barrier)\n", bt);
             disarm_for_round_end();
             return advanced;
         }

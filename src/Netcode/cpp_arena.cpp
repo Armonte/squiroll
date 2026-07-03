@@ -99,6 +99,11 @@ static bool     g_installed = false;
 static bool     g_armed     = false;   // route operator new -> arena only while a match is armed
 static bool     g_resim     = false;   // a rollback re-simulation advance is in progress
 static uint32_t g_warn      = 8;
+// Render-region dispatch-signal blocks (create_and_bind 0x56AB5) — payload
+// offsets, registered at alloc; forward-state-pinned across every restore by
+// snapshot_ring (see the note at the registration site in arena_alloc).
+static uint32_t g_dispatch_sig[64];
+static int      g_dispatch_sig_n = 0;
 static uint32_t g_resim_skips = 0;     // real-heap frees suppressed during re-sim
 static uint32_t g_xthr_skips  = 0;     // arena frees from a non-sim thread, leaked
 static DWORD    g_sim_tid   = 0;       // simulation thread; once set, ONLY this
@@ -671,6 +676,19 @@ static void* arena_alloc(size_t n, bool is_render) {
     h->magic     = HDR_MAGIC;
     g_meta->live_bytes += (uint32_t)n;
     trace_rec(1, (uint32_t)n, h->link, off);
+    // DISPATCH-SIGNAL REGISTRY: render-region signal objects created by
+    // create_and_bind (0x56AB5 — the DrawCommandSlot render-dispatch signals,
+    // e.g. 0x37000870/910/9B0, 0x14 bytes {slot-list head, shared_count, ...}).
+    // They are FORWARD-ONLY (the headless re-sim never dispatches render), but
+    // they live in the restored render region — a rollback rewinds their
+    // head/sc pointers to control blocks the forward game-loop thread already
+    // released during the per-frame reconnect churn at ROUND END -> double-
+    // release / stale deref -> the 0xEAC9 f2233 crash. snapshot_ring::restore
+    // forward-state-pins every registered block (save live bytes before the
+    // rewind, re-apply after, identity-checked) — same pattern as gl_pin.
+    if (h->link == 0x56AB5 && off + sizeof(Hdr) >= RENDER_BASE
+        && g_dispatch_sig_n < (int)(sizeof(g_dispatch_sig) / sizeof(*g_dispatch_sig)))
+        g_dispatch_sig[g_dispatch_sig_n++] = off + sizeof(Hdr);
     LeaveCriticalSection(&g_lock);
     return g_base + off + sizeof(Hdr);
 }
@@ -1253,7 +1271,18 @@ void trace_alloc(uint32_t addr) {
     }
 }
 
-void     set_armed(bool on) { g_armed = on; }
+void     set_armed(bool on) {
+    if (on && !g_armed) g_dispatch_sig_n = 0;   // fresh battle -> fresh registry
+    g_armed = on;
+}
+
+// Render-region dispatch-signal payload offsets (see g_dispatch_sig). Returns
+// count; snapshot_ring forward-state-pins each across restore.
+int dispatch_signal_offsets(uint32_t* out, int maxn) {
+    int n = g_dispatch_sig_n < maxn ? g_dispatch_sig_n : maxn;
+    for (int i = 0; i < n; ++i) out[i] = g_dispatch_sig[i];
+    return n;
+}
 bool     is_armed()         { return g_armed; }
 void     set_render_pass(bool on) { g_render_pass = on; }
 bool     is_excluded_page(uint32_t pg) {           // TF4_Number HUD digit-geometry pages

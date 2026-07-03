@@ -247,6 +247,19 @@ static int collect(Region* r) {
             { (uintptr_t)(0x4DAE00_R), (uintptr_t)(0x4DAEB8_R)        }, // D3D/render/window state (forward-only)
             { (uintptr_t)(0x4DAEB8_R), (uintptr_t)(0x4DAEB8_R) + 20   }, // DirectInput device buffer
             { (uintptr_t)(0x4DB004_R), (uintptr_t)(0x4DB004_R) + 4    }, // g_engine_loop_tick
+            // Effect-param registration state (Manbow::Focus::eft_param_register_
+            // by_id 0xC7B40, reset each Ew_sTask::UpdateAll): pair count 0x4DB0B4,
+            // last-owner cache 0x4DB06C, and the pairbuf begin/end ptrs 0x4DBBE0/4
+            // (heap buffer, regrows when count crosses a power of two). Effect
+            // params are registered per visual-effect spawn, and those spawn at
+            // PROVEN-diverging counts fwd-vs-resim (bitmapfont damage numbers /
+            // EF_* sparks) — 0xEAC9 ENG@2233 diverged at 0x4DB0B4 fwd=0x0A
+            // resim=0x0B once the bp render pointers were masked. The pair
+            // CONTENTS live in cpp_arena (already excluded). Carved here,
+            // RESTORED via rng_collect (restore-but-not-checksum) so the re-sim
+            // registers params against a coherent buffer.
+            { (uintptr_t)(0x4DB06C_R), (uintptr_t)(0x4DB06C_R) + 4    }, // g_eft_param_last_owner_ptr
+            { (uintptr_t)(0x4DB0B4_R), (uintptr_t)(0x4DB0B4_R) + 4    }, // g_eft_param_pair_count
             // bg-task condvar/mutex/thread block: originally [+0xA8) but the
             // block extends further — 0x4DB3C0 holds a WORKER THREAD ID (fwd
             // 0x7A8C vs re-sim -1) that flagged the f=347 false desync, and the
@@ -269,6 +282,27 @@ static int collect(Region* r) {
             // [1649]=0x4DB8D0 (28-dword stride x2).
             { (uintptr_t)(0x4DB750_R), (uintptr_t)(0x4DB750_R) + 0xC0 }, // 24-dword sync buffers p0+p1
             { (uintptr_t)(0x4DB8D0_R), (uintptr_t)(0x4DB8D0_R) + 0xE0 }, // 28-dword sync buffers p0+p1
+            // Font/UI boost-pool structs (FontPool 0x4DC790, BitmapFont 0x4DC7B0
+            // and 0x4DD0A0; 0x20 bytes each, first pair contiguous). Their BLOCKS
+            // were always excluded from the bp capture ("render-side"), but the
+            // pool STRUCTS sat in the checksummed .data run — and their free-list
+            // heads point into cpp_arena, where bitmapfont damage-number spawns
+            // are PROVEN to diverge in count fwd-vs-resim (see the rng_collect
+            // comment; 0xEAC9 ENG@502/529 diverged at 0x4DD0A0+0). Carved out of
+            // the checksum here, RESTORED via rng_collect (restore-but-not-
+            // checksum: they must stay coherent with the rolled-back cpp blocks;
+            // full exclusion would leave the head pointing at rewound nodes).
+            { (uintptr_t)(0x4DBBE0_R), (uintptr_t)(0x4DBBE0_R) + 8    }, // g_eft_param_pairbuf begin/end (heap ptrs; see eft-param note above)
+            // g_gfx_active_transfer_byte_offset — the GPU dynamic vertex-buffer
+            // transfer cursor (writer: TF4_gfx_map_dynamic_vertex_buffer). Pure
+            // render, forward-only: the headless re-sim never maps GPU buffers,
+            // so it stays frozen while forward advances it (0xEAC9 round-2 f=2
+            // ENG desync fwd=0x1000 resim=0x1600, surfaced once the pre-burst
+            // barrier changed the round-end effect population). Forward-live:
+            // excluded from capture AND restore, like the D3D block above.
+            { (uintptr_t)(0x4DC320_R), (uintptr_t)(0x4DC320_R) + 4    }, // gfx vertex-transfer cursor (render, forward-only)
+            { (uintptr_t)(0x4DC790_R), (uintptr_t)(0x4DC790_R) + 0x40 }, // FontPool + BitmapFont pool structs
+            { (uintptr_t)(0x4DD0A0_R), (uintptr_t)(0x4DD0A0_R) + 0x20 }, // BitmapFont glyph pool struct
         };
         // DEFENSIVE: add_data requires exr ascending by .lo. Sort so an
         // out-of-order literal entry can never silently drop an exclusion again.
@@ -419,9 +453,17 @@ static int collect(Region* r) {
     // way that diverges from cpp_arena-restored state; the rest of
     // sEffect (locks, shared_ptrs, counters) is set up at boot and
     // persistent for the battle.
-    if (void* seffect = *G_EW_SEFFECT) {
-        add((uint8_t*)seffect + 0xEC, 12);  // begin/end/cap
-    }
+    //
+    // MOVED to rng_collect (RESTORE-BUT-NOT-CHECKSUM): every
+    // CreateEffectGroup caller is visual (bitmapfont damage numbers,
+    // script SetEffect EF_* sparks, layer tasks), and those spawn at
+    // diverging counts fwd-vs-resim (proven — see the sRandom note
+    // above), so the live-group COUNT (the end pointer at +0xF0)
+    // legitimately differs while the gameplay sim matches byte-for-byte
+    // (0xEAC9 ENG@782: +0xF0 off by one group, bp identical). It must
+    // still restore — the group pointers live in cpp_arena and the
+    // triple has to stay coherent with the rolled-back arena — but it
+    // must not fold into the desync checksum. Same class as cpp_arena.
 
     // Ew::sTask — the job-scheduler singleton (0x1AAC8 bytes total).
     // Same surgical approach: only the per-frame counters around
@@ -434,10 +476,20 @@ static int collect(Region* r) {
         // by DispatchWorkerTask (render/worker path) FORWARD-ONLY, frozen in the
         // headless re-sim -> false eng desync on effect-spawning matchups (0x9999
         // f=2). Captured via rng_collect (restore-but-not-checksum) instead, so
-        // it still restores but never checksums. The LAYER triples + FLAGS are
-        // real sim state and STAY checksummed (moving them hung 0xBEEF/0xF00D).
-        add((uint8_t*)stask + STASK_LAYER_BASE_OFF,
-            STASK_LAYER_COUNT * STASK_LAYER_TRIPLE);
+        // it still restores but never checksums.
+        //
+        // The 32 LAYER TRIPLES (+0x18024, 0x180B) also moved to rng_collect
+        // (2026-07-03). Evidence: 0xEAC9 ENG@2235 diverged ONLY at sTask+0x18028
+        // (layer 0's member-vector END ptr, off by one prim) while the entire bp
+        // gameplay sim matched byte-for-byte — and Phase 0 proved the ONLY member
+        // types stepping through these layers are the visual Ew::tEft* primitives
+        // (Particle/Ring/Shine/Spark), whose spawn counts legitimately diverge
+        // fwd-vs-resim. The earlier "moving them hung 0xBEEF/0xF00D" burn is
+        // attributed to the rng region-capacity overflow of that era (a dropped
+        // region is silently NOT RESTORED -> stale vector heads -> hang), fixed
+        // by the 96-region capacity + the n_rng cache latch. If those seeds hang
+        // again, revert this move — the attribution would be wrong.
+        // The FLAGS stay checksummed (real sim state).
         add((uint8_t*)stask + STASK_FLAGS_OFF, STASK_FLAGS_BYTES);
     }
 
@@ -520,7 +572,10 @@ struct NcRegion { uint32_t addr, len; };
 // (the dominant sblob cost). Resolve once (first save where the RNG exists),
 // cache the (addr,len) list, and just copy from it thereafter. A new battle
 // re-arms the snapshot which resets g_nc_cached, so stale addresses can't leak.
-static NcRegion g_nc_cache[32];
+// 64: RNG states (one per live cRandom) + STASK_FRAME + TLS + sEffect triple +
+// 3 font pool structs, with headroom. A region dropped by overflow is NOT
+// restored — that's a stale-pointer hang, not a desync — so keep this generous.
+static NcRegion g_nc_cache[96];
 static int      g_nc_cached = -1;   // -1 = not resolved yet
 static int rng_collect(NcRegion* r, int maxn) {
     if (g_nc_cached >= 0) {          // fast path: reuse the resolved list
@@ -528,7 +583,7 @@ static int rng_collect(NcRegion* r, int maxn) {
         for (int i = 0; i < n; ++i) r[i] = g_nc_cache[i];
         return n;
     }
-    int n = 0;
+    int n = 0, n_rng = 0;
     void* mgr = *(void**)(0x4DB0C4_R);
     if (mgr && region_ok(mgr, 12)) {
         uint32_t begin = ((uint32_t*)mgr)[0], end = ((uint32_t*)mgr)[1];
@@ -538,15 +593,58 @@ static int rng_collect(NcRegion* r, int maxn) {
             uint32_t wrapper = *(uint32_t*)(uintptr_t)(crandom + 4);
             if (!wrapper || !region_ok((void*)(uintptr_t)wrapper, 8)) continue;
             uint32_t state = *(uint32_t*)(uintptr_t)(wrapper + 4);
-            if (state && region_ok((void*)(uintptr_t)state, 0x9C8))
+            if (state && region_ok((void*)(uintptr_t)state, 0x9C8)) {
                 r[n++] = { state, 0x9C8 };
+                ++n_rng;
+            }
         }
     }
     if (void* stask = *G_EW_STASK) {
         uint32_t a = (uint32_t)(uintptr_t)stask + STASK_FRAME_OFF;
         if (n < maxn && region_ok((void*)(uintptr_t)a, STASK_FRAME_BYTES))
             r[n++] = { a, STASK_FRAME_BYTES };   // worker-frame head counter
+        // The 32 effect-layer member-vector triples (+0x18024, 0x180B): moved
+        // from collect() — visual-prim counts diverge fwd-vs-resim (see the
+        // evidence note in collect()). Restored (coherent with the rolled-back
+        // cpp_arena members), not checksummed.
+        uint32_t lt = (uint32_t)(uintptr_t)stask + STASK_LAYER_BASE_OFF;
+        uint32_t lb = STASK_LAYER_COUNT * STASK_LAYER_TRIPLE;
+        if (n < maxn && region_ok((void*)(uintptr_t)lt, lb))
+            r[n++] = { lt, lb };
     }
+    // Ew::sEffect live-groups vector triple (+0xEC begin/end/cap, 12B) — moved
+    // here from collect(): visual effect-group COUNT legitimately diverges
+    // fwd-vs-resim (all CreateEffectGroup callers are visual; 0xEAC9 ENG@782),
+    // so restore it (coherent with the rolled-back cpp_arena groups) but keep
+    // it out of the checksum. Honors the same SQUIROLL_SNAP_EFFECT=0 A/B gate.
+    {
+        static int s_eff = -1;
+        if (s_eff < 0) {
+            char b[8] = {0};
+            DWORD got = GetEnvironmentVariableA("SQUIROLL_SNAP_EFFECT", b, sizeof b);
+            s_eff = (got == 0 || b[0] != '0') ? 1 : 0;
+        }
+        void* seffect = s_eff ? *G_EW_SEFFECT : nullptr;
+        if (seffect && n < maxn && region_ok((uint8_t*)seffect + 0xEC, 12))
+            r[n++] = { (uint32_t)(uintptr_t)((uint8_t*)seffect + 0xEC), 12 };
+    }
+    // Font/UI boost-pool structs (FontPool/BitmapFont; carved out of the
+    // checksummed .data run by exr[] — see collect()). Their free-list heads
+    // point into cpp_arena where bitmapfont spawns diverge in count, so:
+    // restored (coherent with the rolled-back cpp blocks), not checksummed.
+    for (uint32_t rva : { 0x4DC790u, 0x4DC7B0u, 0x4DD0A0u }) {
+        uint32_t a = (uint32_t)(rva + base_address);
+        if (n < maxn) r[n++] = { a, 0x20 };
+    }
+    // Effect-param registration state (carved by exr[] — see collect()): last-
+    // owner cache, pair count, and the pairbuf begin/end heap pointers. Restored
+    // so re-sim effect-param registration starts coherent with the restored
+    // cpp_arena pair buffer; not checksummed (visual-effect counts diverge).
+    for (uint32_t rva : { 0x4DB06Cu, 0x4DB0B4u }) {
+        uint32_t a = (uint32_t)(rva + base_address);
+        if (n < maxn) r[n++] = { a, 4 };
+    }
+    if (n < maxn) r[n++] = { (uint32_t)(0x4DBBE0u + base_address), 8 };
     // TLS slot 0 (see note in collect()): restore the sim thread's C++
     // thread-infra chunk so re-sim static-init guards match forward, but keep
     // it out of the checksum. rng_collect runs on the sim thread (save/restore
@@ -557,9 +655,11 @@ static int rng_collect(NcRegion* r, int maxn) {
         if (tlsa && tlsa[0] && n < maxn && region_ok(tlsa[0], 256))
             r[n++] = { (uint32_t)(uintptr_t)tlsa[0], 256 };
     }
-    // Cache only once the graph is fully built (RNG present) so we don't latch
-    // an empty list during boot. Until then, resolve every call (cheap: empty).
-    if (n > 0) {
+    // Cache only once the graph is fully built (RNG states resolved) so we don't
+    // latch a boot-time list. The always-present .data entries (font pool
+    // structs) would otherwise make n>0 from the first call and freeze out the
+    // late-appearing RNG/sEffect regions. Until then, resolve every call.
+    if (n_rng > 0) {
         for (int i = 0; i < n; ++i) g_nc_cache[i] = r[i];
         g_nc_cached = n;
     }
@@ -570,8 +670,8 @@ static int rng_collect(NcRegion* r, int maxn) {
 void rng_reset_cache() { g_nc_cached = -1; g_col_cached = -1; }
 
 uint32_t rng_save(uint8_t* out, uint32_t cap) {
-    NcRegion r[24];
-    int n = rng_collect(r, 24);
+    NcRegion r[96];
+    int n = rng_collect(r, 96);
     uint8_t* p = out; uint8_t* e = out + cap;
     auto put = [&](const void* s, uint32_t l) -> bool {
         if (p + l > e) return false; memcpy(p, s, l); p += l; return true;

@@ -82,6 +82,13 @@ void diff_locate(int frame, int rb);
 // budget-capped. Reports pool / live-slot real address / field offset.
 void diff_live(int frame, int rb);
 
+// DESYNC REPORT ("DesyncUtil", GDC-style): annotated walk of a forward/re-sim
+// bp-section pair — names every diverging slot (pool / slot addr /
+// desync_registry type) and verdicts each dword KNOWN-RENDER vs UNKNOWN.
+// Called from the desync-abort path on the stashed pair so a single run's log
+// contains the complete analysis.
+void diff_report(const uint8_t* fwd, const uint8_t* re, uint32_t len);
+
 } // namespace battle_pools
 
 #endif // BATTLE_POOLS_H

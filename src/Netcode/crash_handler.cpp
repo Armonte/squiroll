@@ -92,6 +92,24 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
     if (code == (DWORD)EXCEPTION_SINGLE_STEP) {
         if (g_wp_addr && (ep->ContextRecord->Dr6 & 0xFu)) {
             uint32_t v = *(volatile uint32_t*)g_wp_addr;
+            // SQUIROLL_WP_NONIMG=1: log ONLY writes whose new value is OUTSIDE
+            // the th155 image. For a vtable-dword watch this silences the
+            // legitimate traffic (ctor/dtor vtable stores + restore memcpys all
+            // write image addresses — thousands of hits across a match) and
+            // fires solely on the CORRUPTING write (a heap value smeared over
+            // the vtable — the 0xEAC9 round-end crash writer).
+            static int nonimg = -1;
+            if (nonimg < 0) { char b[4] = {0};
+                nonimg = (GetEnvironmentVariableA("SQUIROLL_WP_NONIMG", b, sizeof b) > 0
+                          && b[0] != '0') ? 1 : 0; }
+            if (nonimg) {
+                uint32_t lo = (uint32_t)base_address + 0x1000;
+                uint32_t hi = (uint32_t)base_address + 0x500000;
+                if (v >= lo && v < hi) {           // legit image-range value
+                    ep->ContextRecord->Dr6 = 0;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
             // Log every write while quota lasts. The previous \"only when v
             // changed\" filter hid the case where a re-sim writer writes the
             // same value repeatedly — exactly the f=15 sq-arena pattern we

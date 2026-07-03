@@ -14,7 +14,7 @@
 #include "crash_handler.h" // watchpoint_arm — corruptor hunt
 #include "sync_pin.h"      // pin() — register inlined-ctor mutexes on first use
 
-namespace gekko_bridge { extern int g_trace_rb; }
+namespace gekko_bridge { extern int g_trace_rb; extern int g_trace_frame; }
 
 namespace cl_iter_guard {
 
@@ -65,6 +65,31 @@ namespace cl_iter_guard {
 //     [runone] rb=1 stall), and dead streams re-release their resource handle
 //     every re-sim (refcount underflow). Fix: skip the pump when rb != 0.
 #define SOUND_STREAM_WRITE_CHUNK_SLOT (0x16C060_R)
+// remove_id_from_buffer_threadsafe (0xECF40): WaitForSingleObject(mutex@this+12,
+// INFINITE) -> scan/remove a 32-bit id from the manager's buffer -> ReleaseMutex.
+// Called from the effect-particle destructor during Ew_sTask::StepLayers32. Under
+// deep rollback, the re-sim can destroy a particle whose group/manager DIVERGED
+// (StepLayers32's IDA note: the group's +0x308 ref to a destroyed prim is not
+// cleared -> stale group ref), so `this` points at a stale/contended manager and
+// the INFINITE wait never returns -> the rare distance=10 hang (sim thread parked
+// here, g_rollback_cs free). Guard: during re-sim only, probe the mutex with a
+// short timeout; if it can't be taken (the divergent case), SKIP the removal
+// rather than block forever. Win32 mutexes are recursive, so on success we own it
+// and the original's own acquire returns immediately -> zero behaviour change in
+// the normal (free-mutex) case; a genuine stuck mutex becomes a skipped op (at
+// worst a detectable desync) instead of a 20s freeze.
+#define REMOVE_ID_FROM_BUFFER (0xECF40_R)
+// update_effect_state (0x10B810, sole caller Ew_tEftElect vtable[2] worker job,
+// dispatched via Ew_sTask::DispatchWorkerTask under SYNC_WORKERS): reads the
+// state's LINKED PARTICLE ptr at this+4 and calls through its vtable (+0x1C).
+// Vanilla ordering guarantees the job never runs after the particle detaches
+// (Ew_tEftParticle::DetachFromOwnerGroup zeroes member back-ptrs); a rollback
+// re-sim replays the job against a state whose linked particle was already
+// detached/NULLed -> NULL+0x1C deref -> the clguard universal skip then turned
+// it into EXEC-at-NULL + a wild WRITE (the 0xEAC9 round-end crash, captured
+// x_crash_1). Guard: NULL linked particle -> return 0 ("effect terminated"),
+// which is semantically what a detached effect is.
+#define UPDATE_EFFECT_STATE (0x10B810_R)
 // Healthy boost::signals2 grouped_list connection counts are O(100).
 // Set the cap well above any realistic count but well below "infinite"
 // so a corrupted-cycle walk bails in milliseconds.
@@ -76,10 +101,14 @@ static SafetyHookInline g_h{};
 static SafetyHookInline g_h_walk{};
 static SafetyHookInline g_h_callfn{};
 static SafetyHookInline g_h_sndslot{};
+static SafetyHookInline g_h_removeid{};
+static SafetyHookInline g_h_updeff{};
+static std::atomic<uint64_t> g_updeff_skips{0};
 static std::atomic<uint64_t> g_walk_bailouts{0};
 static std::atomic<uint64_t> g_walk_total{0};
 static std::atomic<uint64_t> g_callfn_skips{0};
 static std::atomic<uint64_t> g_sndslot_skips{0};
+static std::atomic<uint64_t> g_removeid_skips{0};
 
 static inline bool is_arena_base(uintptr_t v) {
     if (!v) return false;
@@ -181,6 +210,47 @@ static void cdecl sndslot_hook(int* pwriter, uint32_t* hres) {
     g_h_sndslot.unsafe_ccall<void>(pwriter, hres);
 }
 
+// __thiscall(this) -> bool "still active". See UPDATE_EFFECT_STATE above.
+static char thiscall updeff_hook(int self) {
+    if (self >= 0x10000 && *(uint32_t*)(uintptr_t)(self + 4) == 0) {
+        uint64_t n = g_updeff_skips.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 4 || (n & 0x3F) == 0)
+            log_printf("[updeff] NULL linked particle this=%08X f=%d rb=%d -> "
+                       "terminated (#%llu)\n", (uint32_t)self,
+                       gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
+                       (unsigned long long)n);
+        return 0;   // detached effect = done; caller reaps it cleanly
+    }
+    return g_h_updeff.unsafe_thiscall<char>(self);
+}
+
+// __thiscall(this, target_id) -> BOOL. See REMOVE_ID_FROM_BUFFER above.
+static int thiscall removeid_hook(int self, int target_id) {
+    if (gekko_bridge::g_trace_rb && self >= 0x10000) {
+        HANDLE h = *(HANDLE*)(uintptr_t)(self + 12);
+        if (h) {
+            // Probe with a short timeout (free mutex -> returns instantly, so no
+            // behaviour change; a stuck/stale-manager mutex times out -> skip).
+            DWORD r = WaitForSingleObject(h, 30);
+            if (r == WAIT_TIMEOUT) {
+                uint64_t n = g_removeid_skips.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((n & 0x3F) == 1)
+                    log_printf("[removeid] re-sim skip: mutex %p stuck (stale "
+                               "effect manager) this=%08X (#%llu)\n",
+                               h, (uint32_t)self, (unsigned long long)n);
+                return 0;   // skip the buffer removal rather than block forever
+            }
+            // We now own the (recursive) mutex; the original re-acquires it
+            // without blocking, does the removal, releases once. Release our
+            // extra hold afterward so the net count is unchanged.
+            int ret = g_h_removeid.unsafe_thiscall<int>(self, target_id);
+            ReleaseMutex(h);
+            return ret;
+        }
+    }
+    return g_h_removeid.unsafe_thiscall<int>(self, target_id);
+}
+
 } // namespace
 
 void install() {
@@ -192,6 +262,10 @@ void install() {
                                            (void*)callfn_hook);
     g_h_sndslot = safetyhook::create_inline((void*)SOUND_STREAM_WRITE_CHUNK_SLOT,
                                             (void*)sndslot_hook);
+    g_h_removeid = safetyhook::create_inline((void*)REMOVE_ID_FROM_BUFFER,
+                                             (void*)removeid_hook);
+    g_h_updeff = safetyhook::create_inline((void*)UPDATE_EFFECT_STATE,
+                                           (void*)updeff_hook);
     log_printf("[clguard] hook concurrent_list_iter_step @ 0x%X %s, "
                "concurrent_list_walk_visit @ 0x%X %s (cap=%u), "
                "call_boost__function_3 @ 0x%X %s, "
@@ -205,6 +279,12 @@ void install() {
                g_h_callfn.enabled() ? "OK" : "FAIL",
                (uint32_t)SOUND_STREAM_WRITE_CHUNK_SLOT,
                g_h_sndslot.enabled() ? "OK" : "FAIL");
+    log_printf("[clguard] remove_id_from_buffer_threadsafe @ 0x%X %s, "
+               "update_effect_state @ 0x%X %s\n",
+               (uint32_t)REMOVE_ID_FROM_BUFFER,
+               g_h_removeid.enabled() ? "OK" : "FAIL",
+               (uint32_t)UPDATE_EFFECT_STATE,
+               g_h_updeff.enabled() ? "OK" : "FAIL");
 }
 
 } // namespace cl_iter_guard

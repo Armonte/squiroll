@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "battle_pools.h"
+#include "desync_registry.h" // render-only field registry: spans + report annotation
 #include "cpp_arena.h"     // trace_alloc — malloc call-site attribution
 #include "patch_utils.h"   // _R address literal
 #include "util.h"          // thiscall
@@ -164,7 +165,12 @@ void reserve_anim_vectors() {
     const uint32_t kVtable = (uint32_t)(0x445E10_R);  // Manbow::AnimationController2D
     typedef void* (*opnew_t)(size_t);
     opnew_t op_new = (opnew_t)(0x2E15AB_R);            // operator new (cpp_arena-hooked)
-    static const uint32_t VEC_OFF[3] = { 0x88, 0x94, 0xA0 };  // 3 vectors, slot offsets
+    // slot offsets of the collision-box shared_ptr std::vectors to re-home into
+    // cpp_arena: 0x88/0x94/0xA0 = base+0x78/0x84/0x90 (col/hit/hurt boxes).
+    // NOTE: do NOT add the sprites vector (base+0x224) here — re-homing that live
+    // RENDER vector broke HUD rendering (health bar sprites). Its address
+    // divergence is handled by a checksum-exclusion span in save() instead.
+    static const uint32_t VEC_OFF[3] = { 0x88, 0x94, 0xA0 };
     static const uint32_t CAP = 256;                  // sprite count is u8 -> <= 255
     int homed = 0, skipped = 0;
     for_each_block(pl, [&](uint32_t blk, uint32_t bsize) {
@@ -214,15 +220,42 @@ static constexpr uint32_t MAXSLOT = 65536;
 static uint8_t g_freebits[MAXSLOT / 8];
 
 // Checksum-exempt spans of the LAST save(): byte ranges (absolute, into the
-// caller's dest buffer) of render-tainted pools. Consumed immediately by
-// gekko_bridge's desync-checksum walk over the same buffer.
-static const uint8_t* g_ncs_lo[4];
-static const uint8_t* g_ncs_hi[4];
+// caller's dest buffer) that the desync checksum must skip. Two producers:
+//  - whole render-tainted pool records (Camera2D/3D — the renderer writes into
+//    those objects), a handful of spans; and
+//  - the desync_registry render-only fields of each live slot (matched by
+//    object vtable, masked by offset — see the slot loop in save()). Those
+//    fields hold pointers into the OS-placed render heap and re-allocate at a
+//    different address when their owner is destroyed+recreated inside the
+//    rollback window, flagging FALSE desyncs while the gameplay sim matches
+//    byte-for-byte (0xEAC9 f2231). Emitted as byte-exact spans because the
+//    slot's field grid is only known at save time; a word-mask over the whole
+//    variable-length blob cannot align, and value-range classification broke
+//    when the heap base moved between sessions.
+// Consumed by snapshot_ring::capture()'s masked fold (the ACTIVE checksum) and
+// by the fallback trailer2 walk. Spans are emitted in ascending blob order. On
+// overflow the excess fields stay checksummed (logged once) — safe: worst case
+// is a false desync, never a missed real one.
+static const int NCS_MAX = 2048;
+static const uint8_t* g_ncs_lo[NCS_MAX];
+static const uint8_t* g_ncs_hi[NCS_MAX];
 static int g_ncs_n = 0;
+static bool g_ncs_overflowed = false;
 int nochecksum_spans(const uint8_t** lo, const uint8_t** hi, int maxn) {
     int n = (g_ncs_n < maxn) ? g_ncs_n : maxn;
     for (int i = 0; i < n; ++i) { lo[i] = g_ncs_lo[i]; hi[i] = g_ncs_hi[i]; }
     return n;
+}
+// Append [lo,hi) to the span list, merging with the previous span when adjacent
+// (vector begin/end/cap triples produce runs of consecutive dwords).
+static void ncs_push(const uint8_t* lo, const uint8_t* hi) {
+    if (g_ncs_n > 0 && g_ncs_hi[g_ncs_n - 1] == lo) { g_ncs_hi[g_ncs_n - 1] = hi; return; }
+    if (g_ncs_n < NCS_MAX) { g_ncs_lo[g_ncs_n] = lo; g_ncs_hi[g_ncs_n] = hi; ++g_ncs_n; return; }
+    if (!g_ncs_overflowed) {
+        g_ncs_overflowed = true;
+        log_printf("[battle_pools] nochecksum span overflow (>%d) — excess render "
+                   "ptrs stay checksummed\n", NCS_MAX);
+    }
 }
 
 uint32_t save(uint8_t* out, uint32_t cap) {
@@ -276,16 +309,37 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         for (uint32_t b = 0; b < nblk; ++b)
             if (!put(&blk[b].addr, 4) || !put(&blk[b].size, 4)) return 0;
 
-        // Every allocated slot, in full.
+        // Every allocated slot, in full. Render-only fields inside the slots
+        // (desync_registry: e.g. AnimationController2D font handle + sprites
+        // vector backing) diverge across rollback while the sim matches, so each
+        // registered field gets a byte-exact nochecksum span (see ncs_push).
+        // Matching is by OBJECT VTABLE + field OFFSET — value-independent, so the
+        // span sets are identical on both timelines by construction (a value-
+        // range scan broke when the OS-placed render heap moved between sessions).
+        // Slots are make_shared records: object (and its vtable) at slot+0x10.
+        // Render-tainted pools skip this — their whole record is excluded below
+        // (inner spans first would also break the span list's ascending order).
         if (p + 4 > end) return 0;
         uint32_t* nlive = (uint32_t*)p; p += 4;
         uint32_t live = 0;
+        const bool try_registry = !g_pool_rva[i].render_tainted && ss >= 0x14;
         for (uint32_t b = 0; b < nblk; ++b) {
             for (uint32_t j = 0; j < blk[b].nslots; ++j) {
                 uint32_t idx = blk[b].base_idx + j;
                 if (g_freebits[idx >> 3] & (1u << (idx & 7))) continue;  // free
                 uint32_t sa = blk[b].addr + j * ss;
                 if (!put(&sa, 4) || !put((const void*)(uintptr_t)sa, ss)) return 0;
+                if (try_registry) {
+                    const uint8_t* content = p - ss;      // slot bytes in the blob
+                    if (const auto* t = desync_registry::match_slot(
+                            content, ss, (uint32_t)base_address)) {
+                        for (int f = 0; f < t->nfields; ++f) {
+                            uint32_t lo = t->hdr + t->fields[f].obj_off;
+                            uint32_t hi = lo + t->fields[f].len;
+                            if (hi <= ss) ncs_push(content + lo, content + hi);
+                        }
+                    }
+                }
                 ++live;
             }
         }
@@ -981,6 +1035,106 @@ void bplive_decode(const uint8_t* fwd, const uint8_t* re, uint32_t len) {
     }
 }
 }  // namespace
+
+// DESYNC REPORT (the GDC-style "DesyncUtil", built in): walk a forward/re-sim
+// bp-section pair and print EVERY diverging live slot with everything named —
+// pool, slot address, object vtable -> registry type, field offset -> registry
+// field — and a verdict per dword: KNOWN-RENDER (excluded from the checksum,
+// expected to differ) vs UNKNOWN (new divergence: the thing to triage). Called
+// automatically from the desync-abort path on the stashed pair, so a single
+// run's log contains the complete analysis (no offline cmp/xxd/IDA loop).
+void diff_report(const uint8_t* fwd, const uint8_t* re, uint32_t len) {
+    if (!fwd || !re || len < 8) { log_printf("[bpreport] no stash pair\n"); return; }
+    log_printf("[bpreport] ==== bp divergence report (%u bytes) ====\n", len);
+    uint32_t off = 8;  // skip [magic][npool]
+    int slots_reported = 0, unknown_dwords = 0, known_dwords = 0;
+    for (int i = 0; i < NPOOL; ++i) {
+        if (off + sizeof(Pool) + 4 > len) break;
+        const Pool* pl = (const Pool*)(fwd + off);
+        uint32_t ss = pl->slot_size ? pl->slot_size : 1;
+        const char* nm = g_pool_rva[i].name;
+        off += sizeof(Pool);
+        uint32_t nblk = *(const uint32_t*)(fwd + off); off += 4 + nblk * 8;
+        if (off + 4 > len) break;
+        uint32_t nlive = *(const uint32_t*)(fwd + off); off += 4;
+        for (uint32_t s = 0; s < nlive; ++s) {
+            if (off + 4 > len) goto done;
+            uint32_t sa = *(const uint32_t*)(fwd + off);
+            uint32_t c0 = off + 4;                     // slot content start
+            if (c0 + ss > len) goto done;
+            off = c0 + ss;
+            bool div = memcmp(fwd + c0, re + c0, ss) != 0;
+            if (!div) continue;
+            // Identify the slot's object type (make_shared: object at +hdr,
+            // per-type — Actor2D +0xC, AnimCtrl2D +0x10).
+            const desync_registry::SlotType* t =
+                desync_registry::match_slot(fwd + c0, ss, (uint32_t)base_address);
+            if (slots_reported < 24) {
+                ++slots_reported;
+                if (t) {
+                    log_printf("[bpreport] pool='%s' slot=%08X type=%s\n",
+                               nm, sa, t->type_name);
+                } else {
+                    // unknown: print both plausible object-vtable probes so the
+                    // registry extension is a single IDA lookup.
+                    uint32_t vc = 0, v10 = 0;
+                    if (ss >= 0x10) memcpy(&vc,  fwd + c0 + 0x0C, 4);
+                    if (ss >= 0x14) memcpy(&v10, fwd + c0 + 0x10, 4);
+                    log_printf("[bpreport] pool='%s' slot=%08X type=UNKNOWN "
+                               "(vt? +0xC rva %05X / +0x10 rva %05X)\n",
+                               nm, sa, (uint32_t)(vc - base_address),
+                               (uint32_t)(v10 - base_address));
+                }
+                for (uint32_t k = 0; k + 4 <= ss; k += 4) {
+                    uint32_t fv, rv;
+                    memcpy(&fv, fwd + c0 + k, 4);
+                    memcpy(&rv, re  + c0 + k, 4);
+                    if (fv == rv) continue;
+                    const desync_registry::Field* fld =
+                        (t && k >= t->hdr)
+                            ? desync_registry::find_field(t, k - t->hdr)
+                            : nullptr;
+                    if (fld) ++known_dwords; else ++unknown_dwords;
+                    log_printf("[bpreport]   +0x%03X (obj+0x%03X) fwd=%08X "
+                               "resim=%08X  %s%s\n",
+                               k, (t && k >= t->hdr) ? k - t->hdr : k, fv, rv,
+                               fld ? "KNOWN-RENDER: " : "** UNKNOWN **",
+                               fld ? fld->name : "");
+                }
+            } else {
+                // past the print cap: still tally verdicts for the summary
+                for (uint32_t k = 0; k + 4 <= ss; k += 4) {
+                    uint32_t fv, rv;
+                    memcpy(&fv, fwd + c0 + k, 4);
+                    memcpy(&rv, re  + c0 + k, 4);
+                    if (fv == rv) continue;
+                    const desync_registry::Field* fld =
+                        (t && k >= t->hdr)
+                            ? desync_registry::find_field(t, k - t->hdr)
+                            : nullptr;
+                    if (fld) ++known_dwords; else ++unknown_dwords;
+                }
+            }
+        }
+        if (off + 4 > len) break;
+        uint32_t nfree = *(const uint32_t*)(fwd + off);
+        uint32_t fl0 = off + 4;
+        off = fl0 + nfree * 4;
+        // Free-list divergence = allocation-ORDER divergence (real sim signal).
+        if (off <= len && memcmp(fwd + fl0, re + fl0, nfree * 4) != 0) {
+            ++unknown_dwords;
+            log_printf("[bpreport] pool='%s' FREE-LIST diverges (%u entries) — "
+                       "allocation-order nondeterminism ** UNKNOWN **\n",
+                       nm, nfree);
+        }
+    }
+done:
+    log_printf("[bpreport] ==== verdict: %d KNOWN-RENDER dword(s), %d UNKNOWN "
+               "dword(s)%s ====\n", known_dwords, unknown_dwords,
+               unknown_dwords == 0 ? " — divergence fully explained by the "
+               "registry (checksum should NOT have fired; check span plumbing)"
+               : "");
+}
 
 void diff_live(int frame, int rb) {
     if (frame < 18 || frame > 45) return;   // the bp divergence window (f=24..31)

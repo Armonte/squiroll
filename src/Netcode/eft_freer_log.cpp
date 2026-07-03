@@ -11,7 +11,31 @@
 
 #include "eft_freer_log.h"
 
+namespace gekko_bridge { extern int g_trace_rb; }
+
 namespace eft_freer_log {
+
+// A live Ew object's vtable pointer is always inside the th155 image (its
+// .rdata). Used by the PRE-STEP / PRE-PRUNE scrubs as the validity invariant.
+static inline bool vtable_in_image(const uint32_t* vt) {
+    uint32_t v = (uint32_t)(uintptr_t)vt;
+    uint32_t lo = (uint32_t)base_address + 0x1000;
+    uint32_t hi = (uint32_t)base_address + 0x500000;
+    return v >= lo && v < hi;
+}
+// A member is DEAD or invalid for dispatch: NULL/zeroed, out-of-image vtable,
+// or the Ew::Object base vtable (0x448418 — dtor unwinding ends there; it has
+// ONE slot, the bytes after it are the string "JobThreadCount", so ANY slot>0
+// dispatch executes ASCII: wp-run crash eip=0x746E7570 = "unt"). CRUCIAL: the
+// image-range check alone PASSES Ew::Object — this predicate is the one every
+// dispatch guard must use (the v4/v5 silent-guard failures were exactly this).
+static inline bool member_undispatchable(const void* obj) {
+    if (!obj) return true;
+    uint32_t vt = *(const uint32_t*)obj;
+    if (vt == 0) return true;
+    if (vt == (uint32_t)(0x448418_R)) return true;      // Ew::Object corpse
+    return !vtable_in_image((const uint32_t*)(uintptr_t)vt);
+}
 
 // IDB addresses (RVA, IDB image-base 0).
 //   0xEC130  Manbow__EwCEftGroupMgr__PruneAndDispatchCallbacks  size 0x14B
@@ -42,6 +66,34 @@ namespace eft_freer_log {
 #define EFT_GROUP_DTOR_ADDR     (0xECB00_R)
 #define STEP_LAYER_MEMBER_ADDR  (0xE5470_R)
 #define STEP_LAYERS32_ADDR      (0xE5FE0_R)
+// Ew_sTask__ProcessInsertQueue (0xE5F40): StepLayers32 calls ProcessRebucketQueue
+// then THIS before its 32-layer loop — i.e. AFTER our entry scan. A corrupt prim
+// arriving via the insert queue lands in the layer vectors post-scan and gets
+// stepped/destroyed unchecked (v3_crash_1: StepLayers32's destroy call jumped
+// through a heap-ptr vtable with invariant_hits=0 — the scan never saw it). Hook:
+// run the original, then RE-SCAN the vectors so freshly-inserted corpses are
+// memmove-reaped (never dtor'd through their corrupt vtable).
+#define PROCESS_INSERT_QUEUE    (0xE5F40_R)
+// Ew_sTask__UpdatePass2 (0xE61A0): iterates the SAME 32 layer member vectors as
+// StepLayers32 and dispatches member vtable[3] (+ a one-shot vtable[1]/[2] init
+// pair). Deaths DURING pass-1 (a member's step triggering a group dtor that
+// destroys SIBLING prims still in the vectors) leave Ew::Object corpses that no
+// earlier scan can have seen — pass-2 then dispatches vtable[3] on them, which
+// on the 1-slot Ew::Object vtable executes the adjacent "JobThreadCount" string
+// bytes (wp-run crash eip=0x746E7570="unt"). Hook: scan again at pass-2 entry.
+#define UPDATE_PASS2            (0xE61A0_R)
+// Ew_tEftElect__vftable_3 (0x10AE90) — the elect/particle BASE pass-2 update
+// (tEftParticle vftable_3 0xEE0A0 calls straight into it). It iterates TWO
+// member-internal arrays no external scan can see:
+//   +320..+324  state objects — dispatches state->vtable[5] when the state's
+//               status byte (+12) is -1/4 (v6_crash_1: that dispatch on an
+//               Ew::Object corpse executed the "JobThreadCount" string bytes,
+//               eip=0x746E7570, ebx=corpse 0x36FFF230),
+//   +344..+348  linked prims — interlocked writes into +96 of each.
+// At the round-end mass-destroy a group dtor destroys prims/states that remain
+// referenced here. Hook: scrub BOTH arrays (member_undispatchable) before the
+// original runs.
+#define ELECT_VFT3              (0x10AE90_R)
 #define G_EW_EFT_GROUP_MGR_ADDR (0x4DB0C8_R)
 #define G_EW_EFT_RES_CHAIN_ADDR (0x4DB0B8_R)
 #define EFT_VEC_BEGIN_OFF       0xEC
@@ -202,8 +254,26 @@ static void pre_step_scan(void* res_chain_this) {
                 bad = true; reason = "nullptr-in-slot";
             } else if (ep < 0x1000u || ep >= 0xFFFF0000u) {
                 bad = true; reason = "non-canonical-ptr";
-            } else if (*(void**)entry == nullptr) {
-                bad = true; reason = "vtable-zeroed";
+            } else if (!vtable_in_image(*(uint32_t**)entry)) {
+                // THE INVARIANT (0xEAC9 round-end crash family): a live member's
+                // vtable ptr is ALWAYS inside the th155 image (.rdata). Anything
+                // else is a corpse or corruption:
+                //  - NULL / zeroed object (the original checks),
+                //  - Ew::Object 0x448418 = fully-DESTROYED prim (dtor unwinding
+                //    ends at the 1-slot base vtable whose "slot 3" is the ASCII
+                //    string "JobThreadCount" -> UpdatePass2's vtable[3] wild-
+                //    jumped into ole32; g2_crash_2) — group-initiated
+                //    destruction (prune -> group dtor -> +0x308 prims) never
+                //    removes the prim from these layer vectors,
+                //  - a HEAP pointer overwriting the vtable dword (s2_crash_1:
+                //    0x9D5BBA98 = that run's render heap; StepLayers32's own
+                //    vtable[0] destroy call jumped to it) — stale cross-writes
+                //    during the round-end mass-destroy + rollback overlap.
+                // Ew::Object is still listed separately below for log clarity.
+                bad = true;
+                reason = (*(void**)entry == (void*)(0x448418_R))
+                           ? "dtor'd (Ew::Object vtable)"
+                           : "vtable-not-in-image (corrupt/reused)";
             }
 
             if (bad) {
@@ -251,6 +321,58 @@ static void thiscall layers_hook(void* res_chain_this) {
     g_h_layers.unsafe_thiscall<void>(res_chain_this);
 }
 
+// ProcessInsertQueue hook — see PROCESS_INSERT_QUEUE: re-scan AFTER the queue
+// drains into the layer vectors (StepLayers32 processes the queues after our
+// entry scan), so freshly-inserted corpses are reaped before the layer loop.
+static SafetyHookInline g_h_insertq{};
+static void thiscall insertq_hook(void* stask_this) {
+    g_h_insertq.unsafe_thiscall<void>(stask_this);
+    pre_step_scan(stask_this);
+}
+
+// UpdatePass2 hook — see UPDATE_PASS2: reap corpses created DURING pass-1
+// before pass-2 dispatches vtable[3] on the same vectors.
+static SafetyHookInline g_h_pass2{};
+static char thiscall pass2_hook(void* stask_this) {
+    pre_step_scan(stask_this);
+    return g_h_pass2.unsafe_thiscall<char>(stask_this);
+}
+
+// Elect base-update hook — see ELECT_VFT3: scrub the member's INTERNAL state
+// (+320) and linked-prim (+344) pointer arrays before the original iterates
+// them. memmove removal, same style as pre_step_scan; corpses never dispatched.
+static SafetyHookInline g_h_elect3{};
+static std::atomic<uint64_t> g_elect_scrubbed{0};
+static void scrub_ptr_array(char* self, uint32_t begin_off, const char* tag) {
+    void** begin = *(void***)(self + begin_off);
+    void** end   = *(void***)(self + begin_off + 4);
+    if (!begin || begin >= end) return;
+    if ((uintptr_t)end - (uintptr_t)begin > 0x10000u) return;   // implausible
+    void** p = begin;
+    while (p != end) {
+        if (member_undispatchable(*p)) {
+            uint64_t n = g_elect_scrubbed.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 6 || (n & 0x3F) == 0)
+                log_printf("[eftfreer] ELECT %s corpse entry=%p vt=%p — reap "
+                           "#%llu\n", tag, *p, *p ? *(void**)*p : nullptr,
+                           (unsigned long long)n);
+            if (p + 1 < end)
+                memmove(p, p + 1, (size_t)((char*)end - (char*)(p + 1)));
+            --end;
+            *(void***)(self + begin_off + 4) = end;
+            continue;
+        }
+        ++p;
+    }
+}
+static void thiscall elect3_hook(char* self) {
+    if (self && !member_undispatchable(self)) {
+        scrub_ptr_array(self, 320, "state");   // dispatches vtable[5] on these
+        scrub_ptr_array(self, 344, "link");    // interlocked writes into these
+    }
+    g_h_elect3.unsafe_thiscall<void>(self);
+}
+
 // Hook on StepLayerMember (sub_E5470). __thiscall: this = layer_member_ptr.
 //
 // Original signature: char(float*) — returns 1 if the member is still
@@ -262,17 +384,85 @@ static void thiscall layers_hook(void* res_chain_this) {
 // Logging: per-distinct-caller first hit, then every 64th. The caller
 // is always StepLayers32 (sub_E5FE0), but the call site within it pins
 // which loop iteration we're in (StepLayers32 has multiple inlined calls).
+// RESIM_NEVER visual-effect vtables (Phase 0: the only member types that step
+// through the layer system are Ew::tEft{Particle,Ring,Shine,Spark} — all visual).
+// Identified by RVA so this survives ASLR-off/on. Unknown vtables that step in
+// re-sim are logged (Phase 0 always-on) so a new effect type can't slip through.
+static inline bool is_visual_eft_vtable(uint32_t vt) {
+    uint32_t rva = (uint32_t)to_rva(vt);
+    return rva == 0x448874    // Ew::tEftParticle
+        || rva == 0x4489EC    // Ew::tEftRing
+        || rva == 0x448A5C    // Ew::tEftShine
+        || rva == 0x448C5C;   // Ew::tEftSpark
+}
+static std::atomic<uint64_t> g_resim_never_skips{0};
+
 static char thiscall step_member_hook(float* this_) {
     uint64_t total = ++g_step_total;
     if (total == 1) {
         log_printf("[eftfreer] step_member_hook FIRST fire this=%p\n", this_);
     }
 
+    // RESIM_NEVER — during a rollback re-sim, protect the visual effect
+    // primitives from the destruction hazard. The IDA note on CreateEffectGroup
+    // proves the hang/UAF is a re-sim *destruction* artifact (dual ownership:
+    // sTask layer vector + cEftGroup+0x308, neither removes from the other, so a
+    // rollback leaves a stale ptr that the re-sim dtor then trips on). So the
+    // hazard is destruction, not advancement.
+    //   mode 1 (A): skip the step entirely, return alive — no destruction, but
+    //               the effect freezes -> visual lag proportional to rollback
+    //               depth (ugly at distance=10, minor pop at real depths).
+    //   mode 2 (B): STEP the effect (advance -> correct visuals, no lag) but
+    //               never report it dead, so the caller never runs the dtor ->
+    //               no remove_id mutex hang, no dual-ownership UAF. Destruction
+    //               happens on the forward frame only.
+    // GATED behind SQUIROLL_EFFECT_RESIM_NEVER (0=off default, 1=A, 2=B). Off =
+    // no behaviour change until proven by the desync oracle + a visual check.
+    {
+        static int rn = -1;
+        if (rn < 0) { char b[4] = {0};
+            rn = (GetEnvironmentVariableA("SQUIROLL_EFFECT_RESIM_NEVER", b, sizeof b) > 0)
+                 ? (b[0] - '0') : 0;
+            if (rn < 0 || rn > 2) rn = (b[0] != '0') ? 1 : 0; }
+        if (rn && gekko_bridge::g_trace_rb && this_ && *(void**)this_
+            && is_visual_eft_vtable(*(uint32_t*)this_)) {
+            uint64_t n = g_resim_never_skips.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & 0x3FFF) == 1)
+                log_printf("[resimnever] mode %d visual-effect in re-sim (#%llu)\n",
+                           rn, (unsigned long long)n);
+            if (rn == 2) {
+                // B: advance the effect, but never let it be destroyed in re-sim.
+                g_h_step.unsafe_thiscall<char>(this_);
+                return 1;
+            }
+            return 1;   // A: keep the slot; effect frozen during re-sim
+        }
+    }
+
+    // CORRUPT-VTABLE guard (v3_crash_1): a member whose vtable ptr is outside
+    // the th155 image (heap value overwriting the vtable dword, or any other
+    // corruption shape) must be SKIPPED with "alive" (return 1) — NOT 0:
+    // StepLayers32's dead path calls the deleting dtor THROUGH that same
+    // corrupt vtable ((**vtable)(member,1)) and wild-jumps. Returning 1 leaves
+    // the slot untouched; the pre-step / post-insert-queue scans memmove-reap
+    // it without ever dispatching through it.
+    if (this_ && *(void**)this_ != nullptr
+        && member_undispatchable(this_)) {
+        static std::atomic<uint64_t> s_corrupt{0};
+        uint64_t n = s_corrupt.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 6 || (n & 0x3F) == 0)
+            log_printf("[eftfreer] StepLayerMember DEAD/CORRUPT vtable=%p "
+                       "this=%p — skip (scan will reap) #%llu\n",
+                       *(void**)this_, this_, (unsigned long long)n);
+        return 1;
+    }
+
     // Extended NULL guard: this can be non-NULL but POINT TO a zeroed
     // object (vtable == 0). The faulting site at e5537 reads
     // `[eax+0x20]` where `eax = *(this)`, so a NULL vtable faults at
-    // address 0x20. Treat both as dead, so the caller (StepLayers32)
-    // memmove-removes the slot.
+    // address 0x20. NOTE: return 1 (not 0) — same reason as the corrupt-
+    // vtable guard above: the caller's dead path destroys through the
+    // (NULL) vtable. The scans reap the slot without dispatch.
     if (this_ && *(void**)this_ == nullptr) {
         uint64_t n = ++g_step_null_this;
         if (n <= 4 || (n & 0x3F) == 0) {
@@ -300,7 +490,7 @@ static char thiscall step_member_hook(float* this_) {
                        (uint32_t)caller, (uint32_t)to_rva(caller),
                        (unsigned long long)n);
         }
-        return 0;
+        return 1;   // keep slot: dead-path destroy would deref the NULL vtable
     }
 
     if (!this_) {
@@ -353,7 +543,64 @@ static char thiscall step_member_hook(float* this_) {
                    (unsigned long long)g_step_null_this.load());
     }
 
-    return g_h_step.unsafe_thiscall<char>(this_);
+    // PHASE 0 (RESIM_NEVER classification, pure logging): record each DISTINCT
+    // member vtable that flows through the effect layer step, and how often it
+    // steps during a re-sim (g_trace_rb). The vtable identifies the member TYPE
+    // (Ew_tEftParticle = visual, vs camera/other) — look each RVA up in IDA.
+    // Members that step during re-sim AND are visual are the RESIM_NEVER targets.
+    // SQUIROLL_EFT_PHASE0=1 enables (off by default; zero cost otherwise).
+    {
+        static int on = -1;
+        if (on < 0) { char b[4] = {0};
+            on = (GetEnvironmentVariableA("SQUIROLL_EFT_PHASE0", b, sizeof b) > 0
+                  && b[0] != '0') ? 1 : 0; }
+        if (on && this_) {
+            uint32_t vt = *(uint32_t*)this_;
+            static struct { uint32_t vt; uint64_t n, resim; } tax[64];
+            static int ntax = 0;
+            int idx = -1;
+            for (int i = 0; i < ntax; ++i) if (tax[i].vt == vt) { idx = i; break; }
+            if (idx < 0 && ntax < 64) {
+                idx = ntax++;
+                tax[idx].vt = vt; tax[idx].n = 0; tax[idx].resim = 0;
+                log_printf("[eftphase0] NEW member vtable=%08X (RVA %05X) — "
+                           "distinct type #%d\n",
+                           vt, (uint32_t)to_rva(vt), ntax);
+            }
+            if (idx >= 0) {
+                ++tax[idx].n;
+                if (gekko_bridge::g_trace_rb) ++tax[idx].resim;
+                if ((tax[idx].n & 0x3FFF) == 0)
+                    log_printf("[eftphase0] vtable=%08X (RVA %05X) steps=%llu "
+                               "resim=%llu\n", vt, (uint32_t)to_rva(vt),
+                               (unsigned long long)tax[idx].n,
+                               (unsigned long long)tax[idx].resim);
+            }
+        }
+    }
+
+    // POST-STEP RE-VALIDATION (v4_crash_1, third identical dump): the entry
+    // checks above see a VALID vtable, but the member can die DURING its own
+    // step — and that death path writes a heap pointer over the vtable dword
+    // (same prim addr 0x36FFD070 across runs; fixed arenas make it exactly
+    // reproducible). The step then returns 0 and StepLayers32's dead path
+    // destroys through the corrupt vtable ((**vtable)(member,1) at 0xE608D) ->
+    // wild jump. Re-check after the call: dead + corrupt vtable -> report 1
+    // ("alive") so the destroy never dispatches; the pre-step/post-insert
+    // scans reap the slot by memmove. Leaks the corpse's sub-objects — fine,
+    // recycle is off (everything leaks by design); correctness first.
+    char alive = g_h_step.unsafe_thiscall<char>(this_);
+    if (alive == 0 && this_
+        && member_undispatchable(this_)) {
+        static std::atomic<uint64_t> s_poststep{0};
+        uint64_t n = s_poststep.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 6 || (n & 0x3F) == 0)
+            log_printf("[eftfreer] POST-STEP corrupt vtable=%p this=%p — "
+                       "suppressing destroy (scan will reap) #%llu\n",
+                       *(void**)this_, this_, (unsigned long long)n);
+        return 1;
+    }
+    return alive;
 }
 
 // Hook on PruneAndDispatchCallbacks (sub_EC130). __thiscall: this = mgr.
@@ -407,8 +654,14 @@ static void pre_prune_scan(void* mgr_this) {
             bad = true; reason = "nullptr-in-slot";
         } else if (gp < 0x1000u || gp >= 0xFFFF0000u) {
             bad = true; reason = "non-canonical-ptr";
-        } else if (*(void**)group == nullptr) {
-            bad = true; reason = "vtable-zeroed";
+        } else if (!vtable_in_image(*(uint32_t**)group)) {
+            // Same invariant as the PRE-STEP layer scrub: a live group's vtable
+            // is always in the th155 image; Ew::Object = fully-destroyed, any
+            // heap value = corruption. See the PRE-STEP comment for evidence.
+            bad = true;
+            reason = (*(void**)group == (void*)(0x448418_R))
+                       ? "dtor'd (Ew::Object vtable)"
+                       : "vtable-not-in-image (corrupt/reused)";
         }
 
         if (bad) {
@@ -587,6 +840,18 @@ void install() {
                                           (void*)step_member_hook);
     g_h_layers = safetyhook::create_inline((void*)STEP_LAYERS32_ADDR,
                                            (void*)layers_hook);
+    g_h_insertq = safetyhook::create_inline((void*)PROCESS_INSERT_QUEUE,
+                                            (void*)insertq_hook);
+    g_h_pass2 = safetyhook::create_inline((void*)UPDATE_PASS2,
+                                          (void*)pass2_hook);
+    g_h_elect3 = safetyhook::create_inline((void*)ELECT_VFT3,
+                                           (void*)elect3_hook);
+    log_printf("[eftfreer] hook ProcessInsertQueue @ 0x%X %s (post-drain re-scan), "
+               "UpdatePass2 @ 0x%X %s (pre-pass2 re-scan)\n",
+               (uint32_t)PROCESS_INSERT_QUEUE,
+               g_h_insertq.enabled() ? "OK" : "FAIL",
+               (uint32_t)UPDATE_PASS2,
+               g_h_pass2.enabled() ? "OK" : "FAIL");
     log_printf("[eftfreer] hook PruneAndDispatchCallbacks @ 0x%X %s, "
                "cEftGroup dtor @ 0x%X %s, StepLayerMember @ 0x%X %s, "
                "StepLayers32 @ 0x%X %s; "

@@ -7,6 +7,7 @@
 #include "bullet_arena.h"
 #include "cpp_arena.h"
 #include "tf4_arena.h"       // arenas 3/4 — the two engine-private TF4 mspace pools
+#include "battle_pools.h"    // nochecksum_spans — render-ptr fields masked from the fold
 #include "sync_pin.h"        // lock pinning across restore (locks never roll back)
 #include "crash_handler.h"   // watchpoint_arm — auto-attribute first divergence
 #include "patch_utils.h"     // base_address (vtable -> RVA resolution in the f=15 probe)
@@ -690,7 +691,43 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
     // Exclude the restore-but-not-checksum tail (the RNG section) from the fold:
     // it is stored+restored above but its bytes are render-contaminated.
     uint32_t csum_len = (nocsum_tail <= sblob_len) ? sblob_len - nocsum_tail : sblob_len;
-    uint32_t cs = fold_checksum(sblob, csum_len);
+    // Render-heap (0x1a) pointer fields inside the bp section are restore-only:
+    // battle_pools::save() emitted byte-exact nochecksum spans into this very
+    // sblob (font / sprite-backing / effect-resource handles — they re-allocate
+    // at a different 0x1a address when their owner is destroyed+recreated inside
+    // the rollback window, while the gameplay sim matches byte-for-byte; 0xEAC9
+    // BP@2231). The blob must keep the REAL bytes (it is the restore image), so
+    // hash a scratch copy with the span bytes zeroed. Zeroing — not skipping —
+    // keeps the strided fold byte-aligned identically on both timelines.
+    static uint8_t* s_csum_scratch = nullptr;   // sim-thread only
+    static uint32_t s_csum_cap = 0;
+    const uint8_t* fold_src = sblob;
+    {
+        static const int SPX = 2064;
+        static const uint8_t *lo[SPX], *hi[SPX];
+        int nc = battle_pools::nochecksum_spans(lo, hi, SPX);
+        bool any = false;
+        for (int i = 0; i < nc; ++i)
+            if (lo[i] >= sblob && hi[i] <= sblob + csum_len) { any = true; break; }
+        if (any) {
+            if (s_csum_cap < csum_len) {
+                if (s_csum_scratch) VirtualFree(s_csum_scratch, 0, MEM_RELEASE);
+                s_csum_cap = (csum_len + 0xFFFFFu) & ~0xFFFFFu;   // 1MB granularity
+                s_csum_scratch = (uint8_t*)VirtualAlloc(nullptr, s_csum_cap,
+                                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (!s_csum_scratch) s_csum_cap = 0;
+            }
+            if (s_csum_scratch) {
+                memcpy(s_csum_scratch, sblob, csum_len);
+                for (int i = 0; i < nc; ++i)
+                    if (lo[i] >= sblob && hi[i] <= sblob + csum_len)
+                        memset(s_csum_scratch + (lo[i] - sblob), 0,
+                               (size_t)(hi[i] - lo[i]));
+                fold_src = s_csum_scratch;
+            }
+        }
+    }
+    uint32_t cs = fold_checksum(fold_src, csum_len);
     LARGE_INTEGER pt2; QueryPerformanceCounter(&pt2);
 
     // PHASH TRIPWIRE (ungated, write-once): bp+eng are byte-identical at the
@@ -1104,6 +1141,16 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
     // NB: capture-before-restore here was WORSE (4/8 vs 2/8) — the graph snapshot isn't the
     // residual; the alloc COLLISION is (forward copy-on-write render blocks land above the
     // bump where the re-sim reuses the slots). Snapshot stays at the stable RunOneFrame-end.
+
+    // NB: a DISPATCH-SIGNAL forward-state pin (create_and_bind 0x56AB5 blocks,
+    // saved live here / re-applied after the reverse-apply, gl_pin-style) was
+    // tried 2026-07-03 and REVERTED: those signals are NOT purely forward-only —
+    // the SIM touches them on effect-creation connect, so pinning forward state
+    // changed what a re-sim's connect allocates (one 0x40 connection node) ->
+    // the whole sim-region alloc stream shifted 0x40 -> instant f≈47 desync
+    // (caught by [bpreport]: every render field shifted +0x40, eng boost-pool
+    // heads shifted +0x40). Evidence first — the round-end crash root was the
+    // tEftElect NULL-linked-particle job (cl_iter_guard updeff hook), not these.
 
     // The game-loop slot-list shared_count (use/weak) is a LIVE boost::signals2 iteration
     // refcount — it counts shared_ptr temporaries that live on the STACK/registers, which the
