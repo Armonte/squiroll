@@ -471,8 +471,13 @@ FF_HOOK(4, "abort")
 static SafetyHookInline g_h_exit{}, g_h_term{}, g_h_raiseff{};
 
 static void __stdcall hook_exitprocess(UINT code) {
-    log_fastfail_stack("ExitProcess");
-    crash_logf("  exit code = 0x%08X\r\n", code);
+    // A clean exit(0) — the harness's CSS idle-exit and normal shutdown — is
+    // not a crash; logging a FASTFAIL stack for it makes a non-empty crash log
+    // that reads as a failure in a sweep. Only dump for a non-zero (error) code.
+    if (code != 0) {
+        log_fastfail_stack("ExitProcess");
+        crash_logf("  exit code = 0x%08X\r\n", code);
+    }
     g_h_exit.unsafe_stdcall<void>(code);
 }
 static BOOL __stdcall hook_terminateprocess(HANDLE h, UINT code) {

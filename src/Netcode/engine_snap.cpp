@@ -220,7 +220,14 @@ static int collect(Region* r) {
             // in this same table (Actor2D 0x49B370/390, Camera2D 0x49B410) MUST
             // still roll back -- do NOT widen this to a range.
             { (uintptr_t)(0x49B310_R), (uintptr_t)(0x49B310_R) + 0x20  }, // D3D11VertexBuffer pool (render, forward-only)
-            { (uintptr_t)(0x49AF04_R), (uintptr_t)(0x49AF04_R) + 8    }, // _Wndproc window/input state (more)
+            // Async window/mouse/focus block: Point (0x49AF04, mouse cursor,
+            // 8B), __window_height/__window_width (0x49AF0C/10), and
+            // g_focus_update_mask (0x49AF14 — window-focus state). All OS/window
+            // async, not sim. The old exclusion was only the 8-byte Point, but
+            // the distance=10 desyncs (0x9999 f=1150, 0x5555 f=1023) land in
+            // this block at deep re-sim depth. Widen to 0x14 to cover the whole
+            // thing (window dims are constant so excluding them is harmless).
+            { (uintptr_t)(0x49AF04_R), (uintptr_t)(0x49AF04_R) + 0x14 }, // Point + window dims + focus mask (async OS)
             { (uintptr_t)(0x4DAD10_R), (uintptr_t)(0x4DAD10_R) + 4    }, // _Wndproc window/input state
             { (uintptr_t)(0x4DAEB8_R), (uintptr_t)(0x4DAEB8_R) + 20   }, // DirectInput device buffer
             { (uintptr_t)(0x4DB004_R), (uintptr_t)(0x4DB004_R) + 4    }, // g_engine_loop_tick
@@ -336,15 +343,13 @@ static int collect(Region* r) {
     // the same frame sees `guard <= epoch` and SKIPS the init — a
     // different code path that diverges the simulation (proven by
     // btDbvtBroadphase_createProxy firing only on forward, never re-sims).
-    {
-        // TIB layout (32-bit): offset 0x2C = ThreadLocalStoragePointer.
-        // Capture a generous chunk of TLS slot 0 to cover thread-local state
-        // (C++ static-init epoch, std::execution thread data, ...) regardless
-        // of exact field offsets in this MSVC build. region_ok in add()
-        // bounds-checks; an over-large add is safely truncated.
-        void** tlsa = (void**)__readfsdword(0x2C);
-        if (tlsa && tlsa[0]) add(tlsa[0], 256);
-    }
+    // TLS slot 0 (C++ thread-infra: static-init epoch, std::execution data, EH)
+    // is RESTORE-BUT-NOT-CHECKSUM — captured in rng_collect below, NOT here.
+    // It must restore (so the re-sim's static-init guards take the same branch
+    // as forward) but must NOT fold into the desync checksum: at deep re-sim
+    // depth this thread-plumbing state legitimately differs from forward (the
+    // distance=10 TLS-heap desyncs, 0x2222 f=6 / 0xF00D f=818). Same class as
+    // the Ew::sRandom SFMT state and STASK_FRAME.
 
     // DirectInput keyboard state table (see KBD_STATE_ADDR above).
     add(KBD_STATE_ADDR, KBD_STATE_BYTES);
@@ -515,6 +520,16 @@ static int rng_collect(NcRegion* r, int maxn) {
         uint32_t a = (uint32_t)(uintptr_t)stask + STASK_FRAME_OFF;
         if (n < maxn && region_ok((void*)(uintptr_t)a, STASK_FRAME_BYTES))
             r[n++] = { a, STASK_FRAME_BYTES };   // worker-frame head counter
+    }
+    // TLS slot 0 (see note in collect()): restore the sim thread's C++
+    // thread-infra chunk so re-sim static-init guards match forward, but keep
+    // it out of the checksum. rng_collect runs on the sim thread (save/restore
+    // path), so __readfsdword reads the sim thread's TEB; the address is stable
+    // per-match and safely cached with the rest.
+    {
+        void** tlsa = (void**)__readfsdword(0x2C);
+        if (tlsa && tlsa[0] && n < maxn && region_ok(tlsa[0], 256))
+            r[n++] = { (uint32_t)(uintptr_t)tlsa[0], 256 };
     }
     // Cache only once the graph is fully built (RNG present) so we don't latch
     // an empty list during boot. Until then, resolve every call (cheap: empty).
