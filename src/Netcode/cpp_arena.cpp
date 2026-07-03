@@ -330,6 +330,15 @@ static void probe_render_region_dispatch(int self, const char* who) {
 // capture/restore nest harmlessly on one thread.
 static CRITICAL_SECTION g_rollback_cs;
 static bool             g_rollback_cs_init = false;
+// HANG DIAGNOSTIC: who currently holds g_rollback_cs (0 = free) + a label, and
+// the game-loop thread id. The watchdog prints these so the all-thread hangdump
+// can be read by tid: if the game-loop thread holds the lock and is parked in a
+// WaitForSingleObject, that's the deadlock (it waits on something the blocked
+// sim must produce).
+static volatile DWORD       g_rbcs_owner_tid   = 0;
+static const char* volatile g_rbcs_owner_label = "";
+static volatile DWORD       g_gameloop_tid     = 0;
+static volatile DWORD       g_bg_tid           = 0;
 
 static SafetyHookInline g_h_runone{};
 static void thiscall runone_hook(int self) {
@@ -389,10 +398,21 @@ static void thiscall runone_hook(int self) {
     // thread's serialization comes from capture()/restore() holding the lock —
     // NOT from its own advance — so excluding 0x49B01C is correct and safe.
     bool sim_api = ((uint32_t)self == *(uint32_t*)(0x49B01C_R));
-    if (!sim_api && g_rollback_cs_init) EnterCriticalSection(&g_rollback_cs);
+    bool gl_api  = ((uint32_t)self == *(uint32_t*)(0x49AFBC_R));
+    DWORD tid = GetCurrentThreadId();
+    if (gl_api) g_gameloop_tid = tid;
+    else if (!sim_api) g_bg_tid = tid;   // background ScriptAPI thread
+    if (!sim_api && g_rollback_cs_init) {
+        EnterCriticalSection(&g_rollback_cs);
+        g_rbcs_owner_tid = tid;
+        g_rbcs_owner_label = gl_api ? "gameloop-runone" : "bg-runone";
+    }
     g_h_runone.unsafe_thiscall<int>(self);
-    if ((uint32_t)self == *(uint32_t*)(0x49AFBC_R)) snapshot_ring::gl_capture();
-    if (!sim_api && g_rollback_cs_init) LeaveCriticalSection(&g_rollback_cs);
+    if (gl_api) snapshot_ring::gl_capture();
+    if (!sim_api && g_rollback_cs_init) {
+        g_rbcs_owner_tid = 0; g_rbcs_owner_label = "";
+        LeaveCriticalSection(&g_rollback_cs);
+    }
 }
 
 // DIAG (SQUIROLL_EFTTRACE): Ew_sEffect__CreateEffectGroup (0xEBEB0) — count
@@ -1247,8 +1267,23 @@ uint32_t gameloop_addr() {                         // *0x49AFBC = game-loop rend
 // restore/capture so a concurrent game-loop/bg-thread RunOneFrame can't walk the
 // arena connection lists mid-rewrite. Defined here (external linkage) —
 // g_rollback_cs itself is anon-namespace but visible in this translation unit.
-void rollback_lock()   { if (g_rollback_cs_init) EnterCriticalSection(&g_rollback_cs); }
-void rollback_unlock() { if (g_rollback_cs_init) LeaveCriticalSection(&g_rollback_cs); }
+void rollback_lock() {
+    if (!g_rollback_cs_init) return;
+    EnterCriticalSection(&g_rollback_cs);
+    g_rbcs_owner_tid = GetCurrentThreadId();
+    g_rbcs_owner_label = "restore";
+}
+void rollback_unlock() {
+    if (!g_rollback_cs_init) return;
+    g_rbcs_owner_tid = 0; g_rbcs_owner_label = "";
+    LeaveCriticalSection(&g_rollback_cs);
+}
+// Hang-diagnostic accessors (see g_rbcs_owner_*).
+uint32_t    rollback_cs_owner_tid()   { return (uint32_t)g_rbcs_owner_tid; }
+const char* rollback_cs_owner_label() { return g_rbcs_owner_label; }
+uint32_t    gameloop_thread_id()      { return (uint32_t)g_gameloop_tid; }
+uint32_t    bg_thread_id()            { return (uint32_t)g_bg_tid; }
+uint32_t    sim_thread_id()           { return (uint32_t)g_sim_tid; }
 
 bool describe_block(uint32_t addr, uint32_t* alloc_rva, uint32_t* reqsize,
                     uint32_t* payload) {

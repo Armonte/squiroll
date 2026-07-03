@@ -1963,6 +1963,17 @@ void advance_one_frame() {
                         log_printf("[watchdog] FORWARD frame STUCK at f=%d for 20s "
                                    "(g_trace_frame=%d rb=%d) — dumping stacks\n",
                                    f, g_trace_frame, g_trace_rb);
+                        // Hang attribution: name the key threads + who holds the
+                        // rollback lock so the all-thread dump can be read by tid.
+                        // If owner==gameloop/bg and that tid is parked in a Wait,
+                        // it's holding g_rollback_cs while waiting -> deadlock.
+                        log_printf("[watchdog] rollback_cs owner tid=%u label=%s | "
+                                   "sim_tid=%u gameloop_tid=%u bg_tid=%u\n",
+                                   cpp_arena::rollback_cs_owner_tid(),
+                                   cpp_arena::rollback_cs_owner_label(),
+                                   cpp_arena::sim_thread_id(),
+                                   cpp_arena::gameloop_thread_id(),
+                                   cpp_arena::bg_thread_id());
                         crash_handler::dump_all_thread_stacks("hang watchdog");
                         log_flush();
                         Sleep(600);

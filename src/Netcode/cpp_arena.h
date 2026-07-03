@@ -137,6 +137,13 @@ uint32_t capacity();    // arena reservation
 // lists mid-rewrite. Recursive (CRITICAL_SECTION). See cpp_arena.cpp.
 void rollback_lock();
 void rollback_unlock();
+// Hang diagnostic: who holds g_rollback_cs (0=free) + a label, and the
+// game-loop / bg ScriptAPI thread ids. The watchdog prints these.
+uint32_t    rollback_cs_owner_tid();
+const char* rollback_cs_owner_label();
+uint32_t    gameloop_thread_id();
+uint32_t    bg_thread_id();
+uint32_t    sim_thread_id();
 size_t   live_bytes();  // currently-handed-out payload bytes
 
 // DIAGNOSTIC: find which th155 malloc() call produced the block containing
