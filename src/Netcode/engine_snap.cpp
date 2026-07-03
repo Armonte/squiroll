@@ -203,6 +203,23 @@ static int collect(Region* r) {
         //                  half-consumed slot is also the null-boost::function
         //                  the re-sim kept invoking (clguard rva 0x32425 skips).
         const struct { uintptr_t lo, hi; } exr[] = {
+            // D3D11VertexBuffer NetworkNode pool struct (head @+0, block-list
+            // fields follow, 0x20 bytes). It's a RENDER resource pool: the
+            // per-frame mesh update (update_renderable_mesh_and_transform ->
+            // TF4::MeshVertex::StoreStreamWithStride -> real GPU CreateBuffer)
+            // pops/pushes nodes forward-only, but the nodes live in a real-heap
+            // region NOT covered by any snapshot. Rolling back the head (it sits
+            // in th155 .data, so it WAS captured) restored it to a node forward
+            // had since reused as a live D3D11VertexBuffer (its first dword now
+            // the refcount-obj vtable 0x842ACC) -> next pool pop writes v3[1]=1
+            // to read-only rdata -> the distance=10 round-2 WRITE crash at
+            // th155+0x3AB1A (crash-log ebx alloc_rva=0x301F2, deep rollback only
+            // -- distance=2 stayed in lockstep). Exclude so the head stays
+            // forward-live (consistent with its non-rolled-back nodes) and is
+            // not checksummed (forward-only render churn != desync). SIM pools
+            // in this same table (Actor2D 0x49B370/390, Camera2D 0x49B410) MUST
+            // still roll back -- do NOT widen this to a range.
+            { (uintptr_t)(0x49B310_R), (uintptr_t)(0x49B310_R) + 0x20  }, // D3D11VertexBuffer pool (render, forward-only)
             { (uintptr_t)(0x49AF04_R), (uintptr_t)(0x49AF04_R) + 8    }, // _Wndproc window/input state (more)
             { (uintptr_t)(0x4DAD10_R), (uintptr_t)(0x4DAD10_R) + 4    }, // _Wndproc window/input state
             { (uintptr_t)(0x4DAEB8_R), (uintptr_t)(0x4DAEB8_R) + 20   }, // DirectInput device buffer

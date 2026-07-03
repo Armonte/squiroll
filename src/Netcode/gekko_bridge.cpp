@@ -1922,6 +1922,20 @@ void advance_one_frame() {
         if (!wd) {
             wd = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
                 int last = -1; DWORD since = GetTickCount();
+                // CSS idle-exit: once a full match has completed (g_disarm_count
+                // >= 2 = match-end reached), the game sits DISARMED on CSS with
+                // no rollback running — pure dead time for a determinism sweep.
+                // If it stays disarmed that long, exit clean(0). SQUIROLL_CSS_IDLE_EXIT
+                // = seconds (0/unset = disabled, so interactive runs stay on CSS).
+                // The threshold must exceed a normal between-rounds transition
+                // (win pose + intro, ~3s) so a 2-1 match's round-2->3 gap doesn't
+                // trip it; re-arm sets g_session_started -> resets the timer.
+                DWORD css_idle = 0;
+                { char b[8] = {0};
+                  if (GetEnvironmentVariableA("SQUIROLL_CSS_IDLE_EXIT", b, sizeof b) > 0)
+                      for (const char* s = b; *s >= '0' && *s <= '9'; ++s)
+                          css_idle = css_idle*10 + (DWORD)(*s-'0'); }
+                DWORD disarm_since = GetTickCount();
                 for (;;) {
                     Sleep(3000);
                     // Paused while no gekko session is driving frames: the round
@@ -1930,7 +1944,19 @@ void advance_one_frame() {
                     // advancing there. Firing then was a false positive that
                     // KILLED the game mid-transition (never reaching the win
                     // screen). Only watch an armed, started session.
-                    if (!g_session_started) { last = -1; since = GetTickCount(); continue; }
+                    if (!g_session_started) {
+                        last = -1; since = GetTickCount();
+                        if (css_idle && g_disarm_count >= 2
+                            && GetTickCount() - disarm_since >= css_idle * 1000) {
+                            log_printf("[watchdog] match complete + disarmed %us "
+                                       "(on CSS) — clean exit(0)\n", css_idle);
+                            log_flush();
+                            Sleep(300);
+                            ExitProcess(0);
+                        }
+                        continue;
+                    }
+                    disarm_since = GetTickCount();   // armed -> reset idle timer
                     int f = g_wd_fwd_frame;
                     if (f != last) { last = f; since = GetTickCount(); continue; }
                     if (GetTickCount() - since >= 20000) {
@@ -2121,13 +2147,15 @@ bool init_solo() {
     // Roll back check_distance frames every frame: the stress session
     // re-simulates current-N .. current each tick, so save + load + advance
     // all run N+1x per displayed frame. 8 = the pathological determinism/perf
-    // rig; SQUIROLL_DISTANCE=N lowers it for a smooth, closer-to-real-rollback
-    // playthrough (e.g. 2 to actually watch full rounds without the 9x crawl).
+    // rig; SQUIROLL_DISTANCE=N adjusts it — lower for a smooth watchable run
+    // (2 ≈ 60fps), higher for DEEP desync hunting (10+). Ceiling 14: the
+    // snapshot ring holds RING=16 slots and restore() needs the full reverse
+    // chain [target+1 .. cur] present, so distance ≤ RING - 2.
     config.check_distance = 8;
     { char b[8] = {0};
       if (GetEnvironmentVariableA("SQUIROLL_DISTANCE", b, sizeof b) > 0) {
           uint32_t v = 0; for (const char* s = b; *s >= '0' && *s <= '9'; ++s) v = v*10 + (*s-'0');
-          if (v >= 1 && v <= 8) config.check_distance = v; } }
+          if (v >= 1 && v <= 14) config.check_distance = v; } }
 
     gekko_start(g_session, &config);
 
