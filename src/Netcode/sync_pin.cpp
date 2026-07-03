@@ -14,10 +14,19 @@
 // CRT std::mutex internals (static CRT, fixed RVAs, verified in IDA):
 //   __Mtx_init_in_situ(_Mtx_t, int)  0x2C3E70 — every std::mutex ctor lands here
 //   __Mtx_destroy_in_situ(_Mtx_t)    0x2C3E20
+//   __Mtx_lock(_Mtx_t)               0x2C3E91 — EVERY lock goes through here
 // _Mtx_internal_imp_t on x86 MSVC14 is 0x30 bytes (type, stl_critical_section
 // vtable+SRWLOCK, thread_id, count) — pin the whole struct.
+//
+// The init hook alone is NOT sufficient: LTCG INLINES some std::mutex ctors
+// (no init_in_situ call), leaving those imps unregistered — a rollback then
+// rewinds a live mutex -> _Mtx_lock error -> _Throw_C_error inside a noexcept
+// dispatch -> abort (the sound-stream writer was the first caught instance;
+// the game-loop signal walk abort is the same class). Registering at FIRST
+// LOCK closes the hole for every mutex that is ever actually used.
 #define MTX_INIT_IN_SITU    (0x2C3E70_R)
 #define MTX_DESTROY_IN_SITU (0x2C3E20_R)
+#define MTX_LOCK            (0x2C3E91_R)
 #define MTX_IMP_SIZE        0x30u
 // Raw Win32 CRITICAL_SECTIONs (engine code: ScriptAPI signal locks, ...):
 // IAT slots verified in IDA. CRITICAL_SECTION is 24 bytes on x86.
@@ -38,6 +47,35 @@ static uint32_t         g_warn      = 4;
 
 static SafetyHookInline g_h_mtx_init{};
 static SafetyHookInline g_h_mtx_destroy{};
+static SafetyHookInline g_h_mtx_lock{};
+
+// Fast already-seen filter for the _Mtx_lock hook — it fires thousands of
+// times per frame, so the O(n) registry scan in reg() must be reached only
+// ONCE per mutex. Open-addressed hash set, no deletion (a freed+reused imp
+// just re-enters reg(), which dedupes properly).
+static constexpr uint32_t SEEN_SZ   = 8192;        // power of two
+static constexpr uint32_t SEEN_TOMB = 0xFFFFFFFFu; // destroyed-mutex tombstone
+static uint32_t g_seen[SEEN_SZ];
+static inline bool seen_or_insert(uint32_t addr) {
+    uint32_t h = (addr * 2654435761u) >> 19;  // 13 bits
+    uint32_t* free_slot = nullptr;
+    for (uint32_t i = 0; i < 64; ++i) {
+        uint32_t& slot = g_seen[(h + i) & (SEEN_SZ - 1)];
+        if (slot == addr) return true;
+        if (slot == SEEN_TOMB) { if (!free_slot) free_slot = &slot; continue; }
+        if (slot == 0) { (free_slot ? *free_slot : slot) = addr; return false; }
+    }
+    if (free_slot) { *free_slot = addr; return false; }
+    return false;   // probe cluster full — fall through to reg() (dedupes)
+}
+static inline void seen_clear(uint32_t addr) {
+    uint32_t h = (addr * 2654435761u) >> 19;
+    for (uint32_t i = 0; i < 64; ++i) {
+        uint32_t& slot = g_seen[(h + i) & (SEEN_SZ - 1)];
+        if (slot == addr) { slot = SEEN_TOMB; return; }
+        if (slot == 0) return;
+    }
+}
 typedef void (WINAPI* initcs_t)(LPCRITICAL_SECTION);
 typedef BOOL (WINAPI* initcs_spin_t)(LPCRITICAL_SECTION, DWORD);
 typedef void (WINAPI* delcs_t)(LPCRITICAL_SECTION);
@@ -88,7 +126,13 @@ static void cdecl mtx_init_hook(void* mtx, int type) {
 }
 static void cdecl mtx_destroy_hook(void* mtx) {
     unreg((uint32_t)(uintptr_t)mtx);
+    seen_clear((uint32_t)(uintptr_t)mtx);   // reuse at same addr re-registers
     g_h_mtx_destroy.unsafe_ccall<void>(mtx);
+}
+static int cdecl mtx_lock_hook(void* mtx) {
+    uint32_t a = (uint32_t)(uintptr_t)mtx;
+    if (a && !seen_or_insert(a)) reg(a, MTX_IMP_SIZE);
+    return g_h_mtx_lock.unsafe_ccall<int>(mtx);
 }
 static void WINAPI initcs_hook(LPCRITICAL_SECTION cs) {
     reg((uint32_t)(uintptr_t)cs, CS_SIZE);
@@ -126,12 +170,15 @@ void install() {
                                                 (void*)mtx_init_hook);
     g_h_mtx_destroy = safetyhook::create_inline((void*)MTX_DESTROY_IN_SITU,
                                                 (void*)mtx_destroy_hook);
+    g_h_mtx_lock    = safetyhook::create_inline((void*)MTX_LOCK,
+                                                (void*)mtx_lock_hook);
     g_real_initcs      = (initcs_t)     patch_iat(IAT_INIT_CS,      (void*)initcs_hook);
     g_real_initcs_spin = (initcs_spin_t)patch_iat(IAT_INIT_CS_SPIN, (void*)initcs_spin_hook);
     g_real_delcs       = (delcs_t)      patch_iat(IAT_DELETE_CS,    (void*)delcs_hook);
 
-    log_printf("[sync_pin] install: mtx=%d/%d iat cs=%d spin=%d del=%d\n",
+    log_printf("[sync_pin] install: mtx=%d/%d lock=%d iat cs=%d spin=%d del=%d\n",
                (int)g_h_mtx_init.enabled(), (int)g_h_mtx_destroy.enabled(),
+               (int)g_h_mtx_lock.enabled(),
                g_real_initcs != nullptr, g_real_initcs_spin != nullptr,
                g_real_delcs != nullptr);
 }

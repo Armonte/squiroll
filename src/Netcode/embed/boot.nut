@@ -221,6 +221,67 @@ function Initialize() {
             ::vs.Initialize(param);
             ::setting.network.gekko_watch_for_fight_solo();
             ::print("[squiroll boot] solo: watching for Round_Fight to arm gekko\n");
+
+            // TALK MONITOR: the win quote (a ::talk) doesn't auto-advance even
+            // though ::input_talk.b0==1 provably pulses (native-side). Log the
+            // talk's script-visible state per half-second while active: which
+            // command line it's on, whether a sync task blocks it, and what
+            // b0 the SCRIPT reads — pins the stuck command.
+            // MUTATION-FREE: this task runs on the forward-only ::loop pump, so
+            // it must not write ANY script state while the rollback is armed (a
+            // private n++ counter desynced the sq checksum at f=240). Reads
+            // only; throttle derives from ::battle.count (battle's own state).
+            local tmon = { dismissed = false };
+            tmon.Update <- function ()
+            {
+                if (!("talk" in getroottable())) return;
+                // Re-arm the one-shot latch once the next fight starts.
+                if (dismissed && "battle" in getroottable() && ::battle.state == 8)
+                {
+                    dismissed = false;
+                }
+                if (!::talk.is_active) return;
+                // RESULT AUTO-DISMISS: the win-quote talk's final command calls
+                // ::battle.BeginResultEnd(), whose update polls the TEAM battle
+                // inputs (b0..b4) to leave — but those are netcode-owned and go
+                // dead when the gekko session is torn down at match end, so
+                // nothing (keyboard mash included) can ever dismiss the result.
+                // When the talk has consumed every line (quote fully shown) and
+                // no sync task is pending, perform the dismissal the button
+                // press would have: replay.Confirm(null) + battle.End() -> CSS.
+                // state 32 = win/result; never fires mid-fight (state 8).
+                // ONE-SHOT: firing every frame until the scene flipped popped
+                // straight past CSS to the main menu (repeated End() calls).
+                if (!dismissed && "battle" in getroottable() && ::battle.state == 32
+                    && ::talk.current_line >= ::talk.command_line.len()
+                    && ::talk.sync_task.len() == 0)
+                {
+                    dismissed = true;
+                    ::print("[talkmon] result complete -> auto-dismiss (Confirm + battle.End)\n");
+                    ::replay.Confirm(null);
+                    ::battle.End();
+                    return;
+                }
+                if ("battle" in getroottable() && (::battle.count % 30) != 0) return;
+                local a = "";
+                foreach( k, v in ::talk.async_task )
+                {
+                    a += k + ":" + v.getstatus() + " ";
+                }
+                local t0 = ::battle.team[0].input;
+                local t1 = ::battle.team[1].input;
+                ::print("[talkmon] line=" + ::talk.current_line
+                        + "/" + ::talk.command_line.len()
+                        + " sync=" + ::talk.sync_task.len()
+                        + " async=" + ::talk.async_task.len()
+                        + " b0=" + ::input_talk.b0
+                        + " b2=" + ::input_talk.b2
+                        + " st=" + ::battle.state
+                        + " t0b=" + t0.b0 + "," + t0.b1 + "," + t0.b2
+                        + " t1b=" + t1.b0 + "," + t1.b1 + "," + t1.b2
+                        + " [" + a + "]\n");
+            };
+            ::loop.AddTask(tmon);
             return;
         }
 

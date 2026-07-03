@@ -122,6 +122,9 @@ static bool          g_match_setup_done = false; // one-time per-MATCH setup (pr
                                                  // worker at round-2 f=2). Reset on full
                                                  // shutdown (real match end / menu return).
 static bool          g_watch_for_fight = false; // solo: armed by boot.nut, pre_arm_poll
+// Soft disarms this match: 1 = round 1->2 transition, 2 = MATCH END (win
+// quote/result). Win-quote-only diagnostics gate on >= 2. Reset in shutdown().
+static int           g_disarm_count = 0;
                                                  // creates the session at Round_Fight
 static uint32_t      g_evt_trace = 0;            // diagnostic: # of Save/Load/
                                                  // Advance events to trace with
@@ -2263,8 +2266,35 @@ void watch_for_fight_dual(uint16_t local_port, uint16_t remote_port,
 // hook below uses this to mash a menu-confirm key so the CPU-vs-CPU win quote /
 // result screens auto-advance to CSS instead of sitting forever waiting for a
 // human.
+// True while a talk (the win quote) is on screen: root.talk.is_active. The
+// mash exists ONLY to advance talk message waits — anywhere else (CSS, menus)
+// the Z/X/C spam confirm/cancel-thrashes the UI. battle.state can't gate this
+// (it persists as 32 after battle.End()), but battle.Release() clears
+// talk.is_active during the fade-out, before CSS accepts input.
+static bool read_talk_active() {
+    if (!v) return false;
+    SQInteger top = sq_gettop(v);
+    sq_pushroottable(v);
+    sq_pushstring(v, _SC("talk"), -1);
+    bool active = false;
+    if (SQ_SUCCEEDED(sq_get(v, -2))) {
+        sq_pushstring(v, _SC("is_active"), -1);
+        if (SQ_SUCCEEDED(sq_get(v, -2))) {
+            SQBool b = SQFalse;
+            if (SQ_SUCCEEDED(sq_getbool(v, -1, &b))) active = (b != SQFalse);
+        }
+    }
+    sq_settop(v, top);
+    return active;
+}
+
 bool menu_mash_active() {
-    return g_fake_input && g_match_setup_done && !g_session_started;
+    if (!(g_fake_input && g_match_setup_done && !g_session_started)) return false;
+    // Cache the VM read per real frame — this is called ~10x/frame from hooks.
+    static uint32_t last_f = ~0u; static bool last_v = false;
+    uint32_t f = sim_real_frame();
+    if (f != last_f) { last_f = f; last_v = read_talk_active(); }
+    return last_v;
 }
 
 // The win quote / result menus read ::input_all.b1 = keyboard (byte_4DAF00) +
@@ -2273,12 +2303,24 @@ bool menu_mash_active() {
 // __keyboard_device_get_state (0x3B850) fills each frame. Hook it: after the
 // real poll, OR the confirm keys in during the disarmed transition. Mashed
 // on/off (~every 4 real frames) so the menu sees distinct presses, not a hold.
+// SQUIROLL_NO_MASH=1: keep ALL transition diagnostics but inject nothing —
+// lets a human mash the real keyboard at the win quote so the logs capture the
+// GROUND-TRUTH input path (which hooks fire, what b0 does, what advances it).
+static bool g_no_mash = false;
 static SafetyHookInline g_h_kbd_poll{};
 static void kbd_poll_hook() {
     g_h_kbd_poll.call();   // original: GetDeviceState -> byte_4DAF00[256]
     if (!menu_mash_active()) return;   // fight: no injection, no log
     static uint32_t nmash = 0; ++nmash;
     uint8_t* kbd = (uint8_t*)(0x4DAF00_R);   // DirectInput 256-byte DIK state
+    if (g_no_mash) {
+        // Manual-mash mode: observe only. Log the REAL keyboard confirm keys
+        // every 16th poll so the user's presses are visible in the log.
+        if ((nmash & 0xF) == 0)
+            log_printf("[kbdreal] Z=%02X X=%02X C=%02X frame=%u\n",
+                       kbd[0x2C], kbd[0x2D], kbd[0x2E], sim_real_frame());
+        return;
+    }
     // Toggle the confirm key per REAL FRAME (4 on / 4 off) so ::input_talk.b0
     // sees a fresh 0->1 press every 8 frames. The menus advance on b0 == 1 (a
     // hold-counter that equals 1 only on the press frame, talk_command.nut:194),
@@ -2357,13 +2399,77 @@ static int thiscall inputsingle_update_hook(int self) {
     if (menu_mash_active()) {
         int dev = *(int*)(uintptr_t)(self + 232);
         if (dev == -1) {
+            // One-shot per device: dump its ASSIGNED key codes (devmap copy at
+            // +232: device,up,down,left,right,b0..b11) — identifies WHICH
+            // script object each single is (input_talk kbd = b0:44 b1:45 b2:46,
+            // input_function = b0:59.., user-config maps = whatever key config).
+            static uint32_t seen[8] = {0}; static int nseen = 0;
+            bool newdev = true;
+            for (int i = 0; i < nseen; ++i) if (seen[i] == (uint32_t)self) { newdev = false; break; }
+            if (newdev && nseen < 8) {
+                seen[nseen++] = (uint32_t)self;
+                const int* m = (const int*)(uintptr_t)(self + 236);
+                log_printf("[talkmap] self=%08X dev=%d up=%d down=%d left=%d right=%d "
+                           "b0=%d b1=%d b2=%d b3=%d b4=%d\n",
+                           (uint32_t)self, dev, m[0], m[1], m[2], m[3],
+                           m[4], m[5], m[6], m[7], m[8]);
+            }
             static int n = 0;
-            if (n < 150) { ++n;
-                log_printf("[talkdiag2] IS::Update dev=-1 self=%08X b0=%d b2=%d "
-                           "kbdZ=%02X frame=%u\n",
-                           (uint32_t)self, *(int*)(uintptr_t)(self + 12),
-                           *(int*)(uintptr_t)(self + 20),
-                           *(uint8_t*)(0x4DAF00_R + 0x2C), sim_real_frame()); }
+            // Manual-mash sessions need a long window; only log CHANGES in b0
+            // after the first 60 lines so a held/idle key doesn't eat the cap.
+            static int last_b0 = -999;
+            int b0 = *(int*)(uintptr_t)(self + 12);
+            if (n < 60 || b0 != last_b0) {
+                if (n < 2000) { ++n;
+                    log_printf("[talkdiag2] IS::Update dev=-1 self=%08X b0=%d b2=%d "
+                               "kbdZ=%02X frame=%u\n",
+                               (uint32_t)self, b0, *(int*)(uintptr_t)(self + 20),
+                               *(uint8_t*)(0x4DAF00_R + 0x2C), sim_real_frame()); }
+            }
+            last_b0 = b0;
+        }
+    }
+    return r;
+}
+// DIAG 4: Manbow::InputMulti::Update (0x6F360) — after updating children it
+// runs a MERGE lambda producing the multi's OWN counters (b0 at this+12 ...)
+// which is what ::input_talk.b0 in script actually reads. Log the merged
+// counters during mash: if a single pulses b0==1 but the multi never does,
+// the merge (e.g. a joystick child held) is eating the press.
+static SafetyHookInline g_h_imu{};
+static int thiscall inputmulti_update_hook(int self) {
+    int r = g_h_imu.unsafe_thiscall<int>(self);
+    // Only at the MATCH END (2nd disarm = win quote/result), and only log
+    // per-multi b0 CHANGES — the round-1->2 transition ate a flat cap before.
+    if (menu_mash_active() && g_disarm_count >= 2) {
+        static uint32_t sel[8]; static int lastb0[8]; static int nsel = 0;
+        int b0 = *(int*)(uintptr_t)(self + 12);
+        int idx = -1;
+        for (int i = 0; i < nsel; ++i) if (sel[i] == (uint32_t)self) { idx = i; break; }
+        if (idx < 0 && nsel < 8) {
+            idx = nsel++; sel[idx] = (uint32_t)self; lastb0[idx] = -999;
+            // One-shot: dump this multi's CHILD device list (head at +216,
+            // node = {next, prev, device*}) — identifies ::input_talk (the
+            // multi whose child is the Z-mapped talk keyboard single).
+            uint32_t head = *(uint32_t*)(uintptr_t)(self + 216);
+            char buf[160]; int off = 0;
+            uint32_t node = head ? *(uint32_t*)(uintptr_t)head : 0;
+            for (int k = 0; k < 8 && node && node != head; ++k) {
+                uint32_t dev = *(uint32_t*)(uintptr_t)(node + 8);
+                off += snprintf(buf + off, sizeof buf - off, " %08X", dev);
+                if (off > (int)sizeof buf - 12) break;
+                node = *(uint32_t*)(uintptr_t)node;
+            }
+            log_printf("[multikids] self=%08X children:%s\n", (uint32_t)self,
+                       off ? buf : " (none)");
+        }
+        if (idx >= 0 && b0 != lastb0[idx]) {
+            lastb0[idx] = b0;
+            static int n = 0;
+            if (n < 1500) { ++n;
+                log_printf("[multidiag] IM::Update self=%08X b0=%d b1=%d b2=%d frame=%u\n",
+                           (uint32_t)self, b0, *(int*)(uintptr_t)(self + 16),
+                           *(int*)(uintptr_t)(self + 20), sim_real_frame()); }
         }
     }
     return r;
@@ -2372,10 +2478,19 @@ static void install_menu_mash_hook() {
     static bool done = false;
     if (done) return;
     done = true;
+    {
+        char b[8] = {0};
+        g_no_mash = (GetEnvironmentVariableA("SQUIROLL_NO_MASH", b, sizeof b) > 0
+                     && b[0] != '0');
+        if (g_no_mash)
+            log_printf("[gekko_bridge] NO_MASH: manual-mash observation mode "
+                       "(diagnostics on, injection off)\n");
+    }
     g_h_kbd_poll = safetyhook::create_inline((void*)(0x3B850_R), (void*)kbd_poll_hook);
     g_h_iskeydown = safetyhook::create_inline((void*)(0x697F0_R), (void*)iskeydown_hook);
     g_h_condrange = safetyhook::create_inline((void*)(0x6A720_R), (void*)condrange_hook);
     g_h_isu = safetyhook::create_inline((void*)(0x168510_R), (void*)inputsingle_update_hook);
+    g_h_imu = safetyhook::create_inline((void*)(0x6F360_R), (void*)inputmulti_update_hook);
     log_printf("[gekko_bridge] menu-mash keyboard hook @0x3B850 %s, IsKeyDown @0x697F0 %s, "
                "hold-counter @0x6A720 %s\n",
                g_h_kbd_poll.enabled() ? "OK" : "FAIL",
@@ -2410,6 +2525,7 @@ void shutdown() {
     g_solo = false;
     g_watch_for_fight = false;
     g_match_setup_done = false;   // full teardown — next match re-runs one-time setup
+    g_disarm_count = 0;
     // Flush any actors held by defer-release so the engine can actually
     // reclaim their slots once we're done with the session.
     live_actors::set_defer_release(false);
@@ -2429,6 +2545,15 @@ bool is_session_started(){ return g_session_started; }
 // A best-of-3 match therefore arms/disarms 1-3 times; if the match has
 // ended, state never returns to 8 and the re-armed watch simply idles.
 static void disarm_for_round_end() {
+    ++g_disarm_count;
+    // The trace flags are only written per gekko AdvanceEvent, so whatever the
+    // LAST advance was (usually a re-sim in stress mode) sticks for the whole
+    // transition: g_trace_rb=1 kept the sound-pump skip active (BGM/voice dead
+    // at the win quote) and cpp_arena's re-sim free-suppression swallowing
+    // every real-heap free. The transition is forward wall-clock time — clear
+    // them.
+    g_trace_rb = 0;
+    cpp_arena::set_resim(false);
     // SOFT disarm: tear down ONLY the gekko rollback session so the cosmetic
     // transition (KO/time-up demo, win pose, next-round intro) runs un-rolled-back
     // on the vanilla loop. KEEP the arena armed + the pools/vectors/objpools frozen
