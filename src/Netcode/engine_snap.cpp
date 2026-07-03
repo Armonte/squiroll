@@ -233,6 +233,18 @@ static int collect(Region* r) {
             // still roll back -- do NOT widen this to a range.
             { (uintptr_t)(0x49B310_R), (uintptr_t)(0x49B310_R) + 0x20  }, // D3D11VertexBuffer pool (render, forward-only)
             { (uintptr_t)(0x4DAD10_R), (uintptr_t)(0x4DAD10_R) + 4    }, // _Wndproc window/input state
+            // D3D / render / window state block [0x4DAE00, 0x4DAEB8): a render-
+            // state cache (0x4DAE00-0x4DAE74, written only by render funcs
+            // render_reset_state_and_set_target / render_map_dynamic_vertex_buffer
+            // / setup_render_target / __init_blendstates / render_clear_to_color
+            // ...), the D3D swapchain descriptor, the D3D device/context/swapchain
+            // pointers, and render config/viewport dims. ALL forward-only
+            // presentation — the headless re-sim never renders so it stays frozen
+            // while forward advances it -> desync (0x8BAD consistently at
+            // 0x4DAE44, fwd=0x1D00 resim=0x1D80). Contiguous with the mouse
+            // buffer exclusion below. No sim state here (device dims/pointers are
+            // constant; the cache is pure render).
+            { (uintptr_t)(0x4DAE00_R), (uintptr_t)(0x4DAEB8_R)        }, // D3D/render/window state (forward-only)
             { (uintptr_t)(0x4DAEB8_R), (uintptr_t)(0x4DAEB8_R) + 20   }, // DirectInput device buffer
             { (uintptr_t)(0x4DB004_R), (uintptr_t)(0x4DB004_R) + 4    }, // g_engine_loop_tick
             // bg-task condvar/mutex/thread block: originally [+0xA8) but the

@@ -544,7 +544,15 @@ struct RollbackGuard {
 
 uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint32_t nocsum_tail) {
     if (!g_armed) return 0;
-    RollbackGuard _rb;
+    // NB: capture does NOT hold g_rollback_cs (unlike restore). Capture only
+    // READS the arena; a concurrent game-loop/bg RunOneFrame walking its own
+    // connection list is fine (both readers, and cpp is excluded from the desync
+    // checksum, so a mid-write render node in the snapshot can't desync). Locking
+    // it was over-serialization: the game-loop thread holds g_rollback_cs across
+    // its whole RunOneFrame, so a capture ~10x/frame at distance=10 would block
+    // on it, and if that RunOneFrame waits on an event the blocked sim must
+    // signal -> the intermittent WaitForSingleObject hang (0xC0DE/0x1234/0xFACE).
+    // Only RESTORE (which rewrites the arena) needs the mutual exclusion.
     Slot& S = g_ring[frame % RING];
     // Detect "the slot already holds this frame" BEFORE we overwrite S.frame
     // below — this is how the per-frame phash-snap diagnostic distinguishes
