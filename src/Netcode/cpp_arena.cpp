@@ -407,14 +407,26 @@ static void thiscall runone_hook(int self) {
     DWORD tid = GetCurrentThreadId();
     if (gl_api) g_gameloop_tid = tid;
     else if (!sim_api) g_bg_tid = tid;   // background ScriptAPI thread
-    if (!sim_api && g_rollback_cs_init) {
+    // Lock by THREAD, not by ScriptAPI pointer: the lock's whole purpose is to
+    // keep OTHER threads out of the arena while the SIM THREAD's restore
+    // rewrites it — the sim thread can never race its own restore. Locking a
+    // non-sim-pointer dispatch that happens to run ON the sim thread (round-2
+    // setup runs other ScriptAPIs there, incl. render slots doing D3D uploads)
+    // deadlocks: sim thread holds g_rollback_cs -> blocks in the NVIDIA driver
+    // waiting on GPU work only the game-loop thread can complete -> game-loop
+    // thread is parked HERE on EnterCriticalSection (fs_hang_0xEAC9, round-2
+    // f=201: owner=sim tid labeled bg-runone, gl thread at ntdll+0x7B00C from
+    // Netcode+0x17F50).
+    bool on_sim_thread = (g_sim_tid != 0 && tid == g_sim_tid);
+    bool take_lock = !sim_api && !on_sim_thread && g_rollback_cs_init;
+    if (take_lock) {
         EnterCriticalSection(&g_rollback_cs);
         g_rbcs_owner_tid = tid;
         g_rbcs_owner_label = gl_api ? "gameloop-runone" : "bg-runone";
     }
     g_h_runone.unsafe_thiscall<int>(self);
     if (gl_api) snapshot_ring::gl_capture();
-    if (!sim_api && g_rollback_cs_init) {
+    if (take_lock) {
         g_rbcs_owner_tid = 0; g_rbcs_owner_label = "";
         LeaveCriticalSection(&g_rollback_cs);
     }
