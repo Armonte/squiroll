@@ -202,32 +202,36 @@ static int collect(Region* r) {
         //                  count 0x4DB6B0) — same wall-clock class; a rolled-back
         //                  half-consumed slot is also the null-boost::function
         //                  the re-sim kept invoking (clguard rva 0x32425 skips).
-        const struct { uintptr_t lo, hi; } exr[] = {
+        // NOTE: add_data (below) carves these out of the .data run assuming they
+        // are ASCENDING by .lo — it walks the run once, advancing a cursor. An
+        // out-of-order entry is silently SKIPPED (advancing the cursor past a
+        // lower .lo -> `r.hi <= cur` -> continue). That exact bug hid the focus
+        // block for several commits once the higher-addressed 0x49B310 pool was
+        // added ahead of it. Kept address-sorted here AND defensively sorted at
+        // runtime so a future out-of-order insert can't re-break it.
+        struct ExRange { uintptr_t lo, hi; };
+        ExRange exr[] = {
+            // Async window/mouse/focus block: Point (0x49AF04, mouse cursor,
+            // 8B), __window_height/__window_width (0x49AF0C/10), and
+            // g_focus_update_mask (0x49AF14 — window-focus state). All OS/window
+            // async, not sim -> checksumming them false-desyncs whenever the
+            // mouse/focus differs fwd-vs-resim (intermittent, mouse-dependent:
+            // 0x9999/0x5555/0xBEEF/0x1234/0xFACE at distance=10). 0x14 covers it.
+            { (uintptr_t)(0x49AF04_R), (uintptr_t)(0x49AF04_R) + 0x14 }, // Point + window dims + focus mask (async OS)
             // D3D11VertexBuffer NetworkNode pool struct (head @+0, block-list
-            // fields follow, 0x20 bytes). It's a RENDER resource pool: the
-            // per-frame mesh update (update_renderable_mesh_and_transform ->
+            // fields follow, 0x20 bytes). RENDER resource pool: the per-frame
+            // mesh update (update_renderable_mesh_and_transform ->
             // TF4::MeshVertex::StoreStreamWithStride -> real GPU CreateBuffer)
             // pops/pushes nodes forward-only, but the nodes live in a real-heap
             // region NOT covered by any snapshot. Rolling back the head (it sits
             // in th155 .data, so it WAS captured) restored it to a node forward
-            // had since reused as a live D3D11VertexBuffer (its first dword now
-            // the refcount-obj vtable 0x842ACC) -> next pool pop writes v3[1]=1
-            // to read-only rdata -> the distance=10 round-2 WRITE crash at
-            // th155+0x3AB1A (crash-log ebx alloc_rva=0x301F2, deep rollback only
-            // -- distance=2 stayed in lockstep). Exclude so the head stays
-            // forward-live (consistent with its non-rolled-back nodes) and is
-            // not checksummed (forward-only render churn != desync). SIM pools
-            // in this same table (Actor2D 0x49B370/390, Camera2D 0x49B410) MUST
+            // had since reused as a live D3D11VertexBuffer (first dword now the
+            // refcount-obj vtable 0x842ACC) -> next pool pop writes v3[1]=1 to
+            // read-only rdata -> the distance=10 round-2 WRITE crash at
+            // th155+0x3AB1A. Exclude so the head stays forward-live. SIM pools in
+            // this same table (Actor2D 0x49B370/390, Camera2D 0x49B410) MUST
             // still roll back -- do NOT widen this to a range.
             { (uintptr_t)(0x49B310_R), (uintptr_t)(0x49B310_R) + 0x20  }, // D3D11VertexBuffer pool (render, forward-only)
-            // Async window/mouse/focus block: Point (0x49AF04, mouse cursor,
-            // 8B), __window_height/__window_width (0x49AF0C/10), and
-            // g_focus_update_mask (0x49AF14 — window-focus state). All OS/window
-            // async, not sim. The old exclusion was only the 8-byte Point, but
-            // the distance=10 desyncs (0x9999 f=1150, 0x5555 f=1023) land in
-            // this block at deep re-sim depth. Widen to 0x14 to cover the whole
-            // thing (window dims are constant so excluding them is harmless).
-            { (uintptr_t)(0x49AF04_R), (uintptr_t)(0x49AF04_R) + 0x14 }, // Point + window dims + focus mask (async OS)
             { (uintptr_t)(0x4DAD10_R), (uintptr_t)(0x4DAD10_R) + 4    }, // _Wndproc window/input state
             { (uintptr_t)(0x4DAEB8_R), (uintptr_t)(0x4DAEB8_R) + 20   }, // DirectInput device buffer
             { (uintptr_t)(0x4DB004_R), (uintptr_t)(0x4DB004_R) + 4    }, // g_engine_loop_tick
@@ -254,6 +258,16 @@ static int collect(Region* r) {
             { (uintptr_t)(0x4DB750_R), (uintptr_t)(0x4DB750_R) + 0xC0 }, // 24-dword sync buffers p0+p1
             { (uintptr_t)(0x4DB8D0_R), (uintptr_t)(0x4DB8D0_R) + 0xE0 }, // 28-dword sync buffers p0+p1
         };
+        // DEFENSIVE: add_data requires exr ascending by .lo. Sort so an
+        // out-of-order literal entry can never silently drop an exclusion again.
+        {
+            const int nexr = (int)(sizeof(exr) / sizeof(exr[0]));
+            for (int i = 1; i < nexr; ++i) {
+                ExRange k = exr[i]; int j = i - 1;
+                while (j >= 0 && exr[j].lo > k.lo) { exr[j + 1] = exr[j]; --j; }
+                exr[j + 1] = k;
+            }
+        }
 
         // Emit committed run [a,e) as snapshot region(s), carving out every exr[].
         auto add_data = [&](uintptr_t a, uintptr_t e) {
