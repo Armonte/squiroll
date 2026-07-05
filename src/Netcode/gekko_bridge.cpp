@@ -3441,6 +3441,30 @@ bool tick() {
 
     count = 0;
     GekkoGameEvent** uevents = gekko_update_session(g_session, &count);
+    // [evorder] one-shot audit (dual): the raw event batch order for the
+    // first ticks. Gekko's contract is AdvanceEvent(F) THEN SaveEvent(F)
+    // (save = post-advance state; rollback loads save(min-1) and re-runs
+    // from min). If our batches ever show Save(F) BEFORE Advance(F), our
+    // ring captures pre-advance state and every restore is one frame
+    // stale — the persistent one-frame counter-shift desync class.
+    if (!g_solo && count > 0) {
+        static int ev_batches = 12;
+        if (ev_batches > 0) {
+            --ev_batches;
+            char line[256]; int ln = 0;
+            for (int i = 0; i < count && ln < 220; ++i) {
+                GekkoGameEvent* ev = uevents[i];
+                char t = ev->type == GekkoSaveEvent ? 'S'
+                       : ev->type == GekkoLoadEvent ? 'L'
+                       : ev->type == GekkoAdvanceEvent ? 'A' : '?';
+                int fr = ev->type == GekkoSaveEvent ? ev->data.save.frame
+                       : ev->type == GekkoLoadEvent ? ev->data.load.frame
+                       : ev->type == GekkoAdvanceEvent ? ev->data.adv.frame : -1;
+                ln += wsprintfA(line + ln, " %c%d", t, fr);
+            }
+            log_printf("[evorder]%s\n", line);
+        }
+    }
     bool advanced = false;
     for (int i = 0; i < count; ++i) {
         GekkoGameEvent* e = uevents[i];
