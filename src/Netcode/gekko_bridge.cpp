@@ -679,9 +679,18 @@ static SQInteger gekko_vec3_register(HSQUIRRELVM vm) {
                        (const void*)g_inputglobal_class, up,
                        g ? g[0] : 0, g ? g[1] : 0, g ? g[2] : 0);
         } else if (kind == 2) {
-            // P1's InputGlobal payload (probe only; the Dr0 slot is now on
-            // the LOCAL recorder device's read_idx — armed in init()).
+            // P1's InputGlobal payload. Dr0 on its y counter (payload+8):
+            // during a re-sim burst the visible P1 InputGlobal freezes while
+            // its queue cursor advances — if the game's decode writer
+            // (0x1699E1-region) fires here during rb=1, the tick landed and
+            // was undone; if silent, the pop targets ANOTHER object after
+            // restore (stale queue->state pairing).
             g_ig_probe2 = (const int32_t*)up;
+            if (up) {
+                actor2d_log::watch_arm((uint32_t)(uintptr_t)(g_ig_probe2 + 2));
+                log_printf("[gekko_bridge] Dr0 armed on P1 InputGlobal y @%p\n",
+                           (const void*)(g_ig_probe2 + 2));
+            }
         } else {
             g_vec3_class = inst->cls;
             const float* f = (const float*)up;
@@ -924,6 +933,7 @@ static std::string g_sqtext[SQTEXT_RING];
 static uint32_t    g_sqtext_frame[SQTEXT_RING] = {0};
 static uint32_t    g_sqtext_cs[SQTEXT_RING]    = {0};
 static uint8_t     g_sqtext_rb[SQTEXT_RING]    = {0};   // saved during re-sim?
+static uint8_t     g_sqtext_n[SQTEXT_RING]     = {0};   // saves of this frame
 static int32_t     g_sqtext_bcount[SQTEXT_RING] = {0};
 static uint16_t    g_sqtext_in[SQTEXT_RING][2] = {{0}};
 
@@ -1271,6 +1281,13 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                 // gameplay field that split (the whole point of a canonical
                 // structural format).
                 uint32_t ri = frame % SQTEXT_RING;
+                // Save-count per frame: >1 means the frame was RE-SAVED after
+                // a rollback correction; 1 at a corrected frame means gekko
+                // never re-saved it and the exchanged checksum is the stale
+                // pre-correction one (the f3744 question).
+                g_sqtext_n[ri] = (g_sqtext_frame[ri] == frame &&
+                                  !g_sqtext[ri].empty())
+                                     ? (uint8_t)(g_sqtext_n[ri] + 1) : 1;
                 g_sqtext[ri].assign((const char*)sqscratch, sqn);
                 g_sqtext_frame[ri] = frame;
                 g_sqtext_cs[ri]    = final_cs;
@@ -2290,24 +2307,38 @@ void advance_one_frame() {
     // display (read in window_render, outside advance) is unaffected.
     uint32_t saved_fps = sim_get_fps();
     sim_set_fps(60);
-    if (g_ig_probe && !g_solo && g_trace_frame <= 8)
-        log_printf("[igx] f=%d rb=%d PRE-run   x=%d y=%d b0=%d\n",
+    // [igx] P0-InputGlobal probe. g[3] = the bit4/0x10 hold counter (the
+    // field every sustained desync split on). Logged early frames + EVERY
+    // re-sim advance (rb=1): restored -> PRE-run -> POST-run shows whether
+    // the corrected input's pop ticks the counter during the re-advance.
+    bool igx_on = g_ig_probe && !g_solo && (g_trace_frame <= 8 || g_trace_rb);
+    if (igx_on)
+        log_printf("[igx] f=%d rb=%d PRE-run   p0(x=%d y=%d b1=%d) p1(x=%d y=%d b1=%d)\n",
                    g_trace_frame, g_trace_rb,
-                   g_ig_probe[1], g_ig_probe[2], g_ig_probe[3]);
+                   g_ig_probe[1], g_ig_probe[2], g_ig_probe[3],
+                   g_ig_probe2 ? g_ig_probe2[1] : -1,
+                   g_ig_probe2 ? g_ig_probe2[2] : -1,
+                   g_ig_probe2 ? g_ig_probe2[3] : -1);
     update_related(*MAIN_SCRIPTAPI_PTR);                    // RunOneFrame(g_main), once
-    if (g_ig_probe && !g_solo && g_trace_frame <= 8)
-        log_printf("[igx] f=%d rb=%d POST-run  x=%d y=%d b0=%d\n",
+    if (igx_on)
+        log_printf("[igx] f=%d rb=%d POST-run  p0(x=%d y=%d b1=%d) p1(x=%d y=%d b1=%d)\n",
                    g_trace_frame, g_trace_rb,
-                   g_ig_probe[1], g_ig_probe[2], g_ig_probe[3]);
+                   g_ig_probe[1], g_ig_probe[2], g_ig_probe[3],
+                   g_ig_probe2 ? g_ig_probe2[1] : -1,
+                   g_ig_probe2 ? g_ig_probe2[2] : -1,
+                   g_ig_probe2 ? g_ig_probe2[3] : -1);
     sim_set_fps(saved_fps);
     log_state_fingerprint(g_trace_frame, g_trace_rb, "post-run");
     if (rb_diag_enabled()) battle_pools::log_fingerprint("post-run");
     if (trace) log_printf("[gekko_bridge] advance: -> ScriptAPI::Update\n");
     Act_ScriptAPI_ptr->vftable->Update(Act_ScriptAPI_ptr);  // Act::ScriptAPI::Update
-    if (g_ig_probe && !g_solo && g_trace_frame <= 8)
-        log_printf("[igx] f=%d rb=%d POST-act  x=%d y=%d b0=%d\n",
+    if (igx_on)
+        log_printf("[igx] f=%d rb=%d POST-act  p0(x=%d y=%d b1=%d) p1(x=%d y=%d b1=%d)\n",
                    g_trace_frame, g_trace_rb,
-                   g_ig_probe[1], g_ig_probe[2], g_ig_probe[3]);
+                   g_ig_probe[1], g_ig_probe[2], g_ig_probe[3],
+                   g_ig_probe2 ? g_ig_probe2[1] : -1,
+                   g_ig_probe2 ? g_ig_probe2[2] : -1,
+                   g_ig_probe2 ? g_ig_probe2[3] : -1);
     // DUAL round-end latch (see g_roundend_latch): evaluated INSIDE the
     // deterministic sim so both peers latch the identical gekko frame.
     // Conditions: the fight left state 8 (KO demo / transition started),
@@ -3339,15 +3370,15 @@ bool tick() {
                                  (unsigned)g_local_idx);
                         FILE* cf = fopen(pth, "wb");
                         if (cf) {
-                            fprintf(cf, "frame,rb,bcount,cs,in0,in1\n");
+                            fprintf(cf, "frame,rb,bcount,cs,in0,in1,nsaves\n");
                             for (int fr = df - (int)SQTEXT_RING + 1; fr <= df; ++fr) {
                                 if (fr < 0) continue;
                                 uint32_t ri = (uint32_t)fr % SQTEXT_RING;
                                 if (g_sqtext_frame[ri] != (uint32_t)fr) continue;
-                                fprintf(cf, "%d,%u,%d,0x%08x,0x%04x,0x%04x\n",
+                                fprintf(cf, "%d,%u,%d,0x%08x,0x%04x,0x%04x,%u\n",
                                         fr, g_sqtext_rb[ri], g_sqtext_bcount[ri],
                                         g_sqtext_cs[ri], g_sqtext_in[ri][0],
-                                        g_sqtext_in[ri][1]);
+                                        g_sqtext_in[ri][1], g_sqtext_n[ri]);
                             }
                             fclose(cf);
                         }
@@ -3621,6 +3652,15 @@ bool tick() {
                                    e->data.load.state_len, blobcs);
                     }
                 }
+                // [igx] post-restore counter value — pairs with PRE/POST-run
+                // probes on the subsequent rb=1 advances.
+                if (!g_solo && g_ig_probe)
+                    log_printf("[igx] LOAD f=%d p0(x=%d y=%d b1=%d) p1(x=%d y=%d b1=%d)\n",
+                               (int)e->data.load.frame, g_ig_probe[1],
+                               g_ig_probe[2], g_ig_probe[3],
+                               g_ig_probe2 ? g_ig_probe2[1] : -1,
+                               g_ig_probe2 ? g_ig_probe2[2] : -1,
+                               g_ig_probe2 ? g_ig_probe2[3] : -1);
                 g_last_load_frame = (int)e->data.load.frame;  // rollback target
                 {
                     LARGE_INTEGER _tl0; QueryPerformanceCounter(&_tl0);
