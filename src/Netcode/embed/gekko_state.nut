@@ -418,8 +418,38 @@
     return ::__gekko_state._ser_out(out);
 };
 
+::__gekko_state._vec3_registered <- false;
+
 ::__gekko_state.save_battle <- function (frame = 0) {
     if (::__gekko_state._bisect_level == 0) return "";
+    // One-shot: hand the native walker a live Vector3 sample so it can
+    // recognize every Vector3 by class pointer and emit x/y/z VALUES
+    // (they're Sqrat native accessors — invisible to the member walk —
+    // but they carry the actors' velocity vectors: real gameplay state
+    // the cross-peer checksum must cover).
+    if (!::__gekko_state._vec3_registered &&
+        "__gekko_vec3_register" in ::getroottable())
+    {
+        try {
+            local m = ::battle.team[0].master;
+            if (m != null && m.va != null) {
+                local ok = ::__gekko_vec3_register(m.va, 0);
+                // InputGlobal: the per-player decoded device the command
+                // reservations key on (device.bN==2 press edges) — emit its
+                // C++ payload so an input-edge divergence shows in the text
+                // diff at the frame it happens.
+                if (m.command != null && m.command.device != null) {
+                    ::__gekko_vec3_register(m.command.device, 1);
+                }
+                // P1's device: Dr0 write-watch target (writer attribution).
+                local m1 = ::battle.team[1].master;
+                if (m1 != null && m1.command != null && m1.command.device != null) {
+                    ::__gekko_vec3_register(m1.command.device, 2);
+                }
+                ::__gekko_state._vec3_registered = ok;
+            }
+        } catch (_e) {}
+    }
     ::__gekko_state._seen = {};
     ::__gekko_state._next_id = 1;
     ::__gekko_state._cur_depth = 0;

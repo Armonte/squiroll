@@ -279,3 +279,12 @@ if [ -d "$DEPLOY_DIR" ]; then
   done
   [ "$deployed" = "1" ] && echo "Deployed to $DEPLOY_DIR"
 fi
+
+# thcrap/bin is the REAL/normal play chain (th155 (en).lnk -> thcrap loads
+# Netcode.dll from here). Must stay in sync with the th155/ harness copy or
+# the English/normal launch runs a stale build. See project_aocf_layout memory.
+THCRAP_BIN="/mnt/c/dev/aocf/thcrap/bin"
+if [ -d "$THCRAP_BIN" ] && [ Netcode.dll -nt "$THCRAP_BIN/Netcode.dll" ]; then
+  cp -f Netcode.dll "$THCRAP_BIN/Netcode.dll"
+  echo "Deployed Netcode.dll to $THCRAP_BIN"
+fi

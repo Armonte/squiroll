@@ -45,12 +45,26 @@ struct Pool {
 // (Manbow::InputGlobal, 0x128-byte body: x/y/b0..b11/s0..s9 — exactly
 // what each actor's Squirrel InputCommand.Update reads as `device`);
 // InputCommand (0x214 body) is the per-player command-detector with the
-// b0..b5 reservation timers + input-history ring. These were wrongly
-// grouped with the network pools — they are per-frame battle state read
-// every frame by actor scripts, so they MUST roll back. (Verified via
-// the New stubs @0x6D5F0/0x6EA20/0x702A0/0x75480, each of which
-// references its std::_Ref_count_obj_alloc<...TPoolAllocator> vtable.)
-struct PoolRef { uint32_t rva; const char* name; bool render_tainted; };
+// b0..b5 reservation timers + input-history ring. These are per-frame
+// battle state read every frame by actor scripts, so they MUST roll back
+// (they stay in the blob, restored on every load). (Verified via the New
+// stubs @0x6D5F0/0x6EA20/0x702A0/0x75480, each of which references its
+// std::_Ref_count_obj_alloc<...TPoolAllocator> vtable.)
+//
+// peer_local: InputSingle/InputMulti/InputCommand are excluded from the
+// desync CHECKSUM (but kept in restore, like render_tainted). In DUAL
+// netplay each peer instantiates input-device objects for ITS OWN local
+// player only (host=slot0, client=slot1), so these pools hold a DIFFERENT
+// NUMBER of live objects on each side — a structural, per-peer difference
+// that made gekko's frame-0 checksum disagree (cross-peer blob diff: ONLY
+// these 3 pools diverged; InputGlobal + every actor/anim/physics pool
+// matched byte-for-byte). This is why the SOLO stress rig was clean (one
+// process, no cross-peer compare) but dual desynced immediately. Excluding
+// them is safe: the actor-facing decoded input (InputGlobal) stays
+// checksummed AND matches, and all DOWNSTREAM gameplay state (actors/anim/
+// physics/sq) stays checksummed — so any real gameplay divergence still
+// aborts, only the per-peer input infrastructure is walked around.
+struct PoolRef { uint32_t rva; const char* name; bool render_tainted; bool peer_local; };
 static const PoolRef g_pool_rva[] = {
     { 0x49B370, "Actor2DManager/World2D" },
     { 0x49B390, "Actor2DProcGroup" },
@@ -71,9 +85,9 @@ static const PoolRef g_pool_rva[] = {
     { 0x49B770, "ActorCollisionData" },
     { 0x49B790, "EwActor" },
     { 0x49B450, "InputGlobal" },
-    { 0x49B4B0, "InputSingle" },
-    { 0x49B4D0, "InputMulti" },
-    { 0x49B510, "InputCommand" },
+    { 0x49B4B0, "InputSingle",  false, true },
+    { 0x49B4D0, "InputMulti",   false, true },
+    { 0x49B510, "InputCommand", false, true },
 };
 static constexpr int NPOOL = sizeof(g_pool_rva) / sizeof(g_pool_rva[0]);
 
@@ -322,7 +336,8 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         if (p + 4 > end) return 0;
         uint32_t* nlive = (uint32_t*)p; p += 4;
         uint32_t live = 0;
-        const bool try_registry = !g_pool_rva[i].render_tainted && ss >= 0x14;
+        const bool try_registry = !g_pool_rva[i].render_tainted &&
+                                  !g_pool_rva[i].peer_local && ss >= 0x14;
         for (uint32_t b = 0; b < nblk; ++b) {
             for (uint32_t j = 0; j < blk[b].nslots; ++j) {
                 uint32_t idx = blk[b].base_idx + j;
@@ -364,7 +379,8 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         // spans (gekko_bridge save_state_to_buf), exactly like the cpp span.
         // The authoritative sim camera state (::camera table: target/zoom/
         // shake) lives in sq_arena and remains fully checksummed.
-        if (g_pool_rva[i].render_tainted && g_ncs_n < (int)(sizeof(g_ncs_lo) / sizeof(*g_ncs_lo))) {
+        if ((g_pool_rva[i].render_tainted || g_pool_rva[i].peer_local) &&
+            g_ncs_n < (int)(sizeof(g_ncs_lo) / sizeof(*g_ncs_lo))) {
             g_ncs_lo[g_ncs_n] = pool_rec_start;
             g_ncs_hi[g_ncs_n] = p;
             ++g_ncs_n;

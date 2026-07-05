@@ -87,6 +87,12 @@ function Initialize() {
 function Terminate() {
 	::menu.network.timeout = 0;
 	received_request = null;
+	// Rollback: clear any armed-but-unfired gekko watch (and tear down a live
+	// session) so a cancelled/aborted online match can't arm gekko on a later
+	// LOCAL fight. Safe no-op when nothing is armed.
+	if (::setting.network.gekko_enabled) {
+		try { ::setting.network.gekko_shutdown(); } catch (_e) {}
+	}
 	if (upnp_port > 0)
 	{
 		try
@@ -428,7 +434,17 @@ function Disconnect( scene = true ) {
 }
 
 function GetDelay() {
-	return func_get_delay();
+	// Defensive: func_get_delay resolves to inst.GetChildDelay/GetParentDelay,
+	// which don't exist on the auto_connect test-rig connection (and can be
+	// unset before a real match fully binds). ping_display.Update polls this
+	// every frame; an uncaught throw here halts the game on the Squirrel
+	// exception break. Return 0 when the delay source isn't available.
+	if (func_get_delay == null) return 0;
+	try {
+		return func_get_delay();
+	} catch (_e) {
+		return 0;
+	}
 }
 
 function BeginMatch(table) {
@@ -460,6 +476,22 @@ function BeginMatch(table) {
 		}
 		::discord.rpc_set_details("VS Online");
 		::menu.network.Suspend();
+		// ROLLBACK (real-flow arm, client = slot 1): the REAL online path now
+		// arms the gekko watch — CSS + the vs intro stay on the vanilla delay
+		// netcode (BeginSyncInput creates the ManbowNetworkInputSession gekko
+		// hijacks); the GekkoGameSession is created at Round_Fight by
+		// pre_arm_poll. rand_seed is already peer-synced by this handshake.
+		// Round ends soft-disarm gekko and the transition falls back to the
+		// delay lockstep (the while(SyncInput()) gate in loop.nut) — delay for
+		// menus, rollback for battle. peer_ip/peer_port come from ::setting
+		// for now (two-local-instance testing); the punched-endpoint resolve
+		// is the next step.
+		if (::setting.network.gekko_enabled) {
+			local gk_port_base = ::setting.network.peer_port;
+			::setting.network.gekko_watch_for_fight_dual(
+				gk_port_base + 11, gk_port_base + 10, 1,
+				::setting.network.peer_ip);
+		}
 		::menu.character_select.Initialize(1);
 	});
 }
@@ -514,6 +546,13 @@ function AcceptMatch() {
 		}
 		::discord.rpc_set_details("VS online");
 		::menu.network.Suspend();
+		// ROLLBACK (real-flow arm, host = slot 0) — see the BeginMatch note.
+		if (::setting.network.gekko_enabled) {
+			local gk_port_base = ::setting.network.peer_port;
+			::setting.network.gekko_watch_for_fight_dual(
+				gk_port_base + 10, gk_port_base + 11, 0,
+				::setting.network.peer_ip);
+		}
 		::menu.character_select.Initialize(1);
 	})
 }

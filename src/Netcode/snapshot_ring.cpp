@@ -328,8 +328,15 @@ static const uint32_t BUMP_OFF[NARENA] = { 0, 4, 4, 0, 0 };
 // input). See ROLLBACK_NETCODE_PLAN.md "cpp_arena render divergence".
 static constexpr int CPP_ARENA = 2;
 
+// Cross-peer diagnosis: the last fold's per-component sub-hashes. Comparing
+// these between two peers at the same gekko frame says WHICH component
+// (sq_arena / bullet_arena / small blob) diverged, instead of just "the
+// combined checksum differs". Written on every fold_checksum call.
+static uint32_t g_sub_sq = 0, g_sub_bt = 0, g_sub_sblob = 0;
+
 static uint32_t fold_checksum(const uint8_t* sblob, uint32_t sblob_len) {
     uint32_t h = 2166136261u;
+    uint32_t sub[2] = { 2166136261u, 2166136261u };  // per-arena (sq, bullet)
     for (int a = 0; a < NARENA; ++a) {
         // Skip cpp (render state) AND the tf4 pools (3,4): the sim checksum is
         // sq(0)+bullet(1)+sblob only. cpp/tf4 legitimately differ fwd-vs-resim.
@@ -340,8 +347,12 @@ static uint32_t fold_checksum(const uint8_t* sblob, uint32_t sblob_len) {
         for (uint32_t pg = 0; pg < upg; ++pg) {
             h ^= g_ar[a].phash[pg];
             h *= 16777619u;
+            sub[a] ^= g_ar[a].phash[pg];
+            sub[a] *= 16777619u;
         }
     }
+    g_sub_sq = sub[0];
+    g_sub_bt = sub[1];
     static constexpr uint64_t P64 = 1099511628211ull;
     uint64_t g0 = 1469598103934665603ull, g1 = 1469598103934665603ull;
     uint32_t nw = sblob_len >> 3;
@@ -355,11 +366,19 @@ static uint32_t fold_checksum(const uint8_t* sblob, uint32_t sblob_len) {
     for (uint32_t b = nw << 3; b < sblob_len; ++b)
         g0 = (g0 ^ sblob[b]) * P64;
     uint64_t g = g0 ^ g1;
+    g_sub_sblob = (uint32_t)g ^ (uint32_t)(g >> 32);
     h ^= (uint32_t)g;        h *= 16777619u;
     h ^= (uint32_t)(g >> 32); h *= 16777619u;
     return h;
 }
 } // namespace
+
+// Cross-peer sub-checksum accessor (see g_sub_* above).
+void last_subchecksums(uint32_t* sq, uint32_t* bt, uint32_t* sblob) {
+    if (sq) *sq = g_sub_sq;
+    if (bt) *bt = g_sub_bt;
+    if (sblob) *sblob = g_sub_sblob;
+}
 
 // ---- COMPLETE forward-state pin of the game-loop (render-dispatch) ScriptAPI graph ----
 // The game-loop ScriptAPI (cpp_arena::gameloop_addr, *0x49AFBC) is FORWARD-ONLY render
@@ -697,19 +716,39 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
     // at a different 0x1a address when their owner is destroyed+recreated inside
     // the rollback window, while the gameplay sim matches byte-for-byte; 0xEAC9
     // BP@2231). The blob must keep the REAL bytes (it is the restore image), so
-    // hash a scratch copy with the span bytes zeroed. Zeroing — not skipping —
-    // keeps the strided fold byte-aligned identically on both timelines.
+    // hash a scratch copy with the excluded spans removed.
+    //
+    // COMPACT (skip), not zero-in-place: the peer_local input pools
+    // (InputSingle/Multi/Command) hold a DIFFERENT number of live objects on
+    // each peer (each side sets up its own local player's input devices), so
+    // their excluded byte range has a DIFFERENT LENGTH cross-peer. Zeroing keeps
+    // that differing length, which shifts every trailing checksummed byte and
+    // leaves the fold diverging. Copying only the KEPT bytes drops the excluded
+    // regions entirely, so the compacted stream is identical cross-peer. For
+    // constant-length exclusions (render fields) compaction is equivalent to the
+    // old zeroing (both timelines drop the same-length range), so solo
+    // determinism is unchanged. Spans arrive in ascending order (save() emits
+    // them in serialization order); sort defensively and merge-skip.
     static uint8_t* s_csum_scratch = nullptr;   // sim-thread only
     static uint32_t s_csum_cap = 0;
     const uint8_t* fold_src = sblob;
+    uint32_t fold_len = csum_len;
     {
         static const int SPX = 2064;
         static const uint8_t *lo[SPX], *hi[SPX];
         int nc = battle_pools::nochecksum_spans(lo, hi, SPX);
-        bool any = false;
+        // Keep only valid, non-empty, in-range spans; index-sort ascending by lo.
+        static int ord[SPX];
+        int m = 0;
         for (int i = 0; i < nc; ++i)
-            if (lo[i] >= sblob && hi[i] <= sblob + csum_len) { any = true; break; }
-        if (any) {
+            if (lo[i] >= sblob && hi[i] <= sblob + csum_len && lo[i] < hi[i])
+                ord[m++] = i;
+        for (int a = 1; a < m; ++a) {           // insertion sort (near-sorted, small)
+            int k = ord[a], b = a - 1;
+            while (b >= 0 && lo[ord[b]] > lo[k]) { ord[b + 1] = ord[b]; --b; }
+            ord[b + 1] = k;
+        }
+        if (m > 0) {
             if (s_csum_cap < csum_len) {
                 if (s_csum_scratch) VirtualFree(s_csum_scratch, 0, MEM_RELEASE);
                 s_csum_cap = (csum_len + 0xFFFFFu) & ~0xFFFFFu;   // 1MB granularity
@@ -718,16 +757,25 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
                 if (!s_csum_scratch) s_csum_cap = 0;
             }
             if (s_csum_scratch) {
-                memcpy(s_csum_scratch, sblob, csum_len);
-                for (int i = 0; i < nc; ++i)
-                    if (lo[i] >= sblob && hi[i] <= sblob + csum_len)
-                        memset(s_csum_scratch + (lo[i] - sblob), 0,
-                               (size_t)(hi[i] - lo[i]));
+                uint32_t w = 0;
+                const uint8_t* cur = sblob;
+                const uint8_t* endp = sblob + csum_len;
+                for (int a = 0; a < m; ++a) {
+                    const uint8_t* L = lo[ord[a]];
+                    const uint8_t* H = hi[ord[a]];
+                    if (L < cur) L = cur;                    // overlap: clamp
+                    if (L > cur) { memcpy(s_csum_scratch + w, cur, (size_t)(L - cur));
+                                   w += (uint32_t)(L - cur); }
+                    if (H > cur) cur = H;                    // advance past the hole
+                }
+                if (cur < endp) { memcpy(s_csum_scratch + w, cur, (size_t)(endp - cur));
+                                  w += (uint32_t)(endp - cur); }
                 fold_src = s_csum_scratch;
+                fold_len = w;
             }
         }
     }
-    uint32_t cs = fold_checksum(fold_src, csum_len);
+    uint32_t cs = fold_checksum(fold_src, fold_len);
     LARGE_INTEGER pt2; QueryPerformanceCounter(&pt2);
 
     // PHASH TRIPWIRE (ungated, write-once): bp+eng are byte-identical at the

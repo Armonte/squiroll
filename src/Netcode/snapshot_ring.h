@@ -56,6 +56,12 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len);
 // No-op unless SQUIROLL_GL_PIN is set and the session is armed.
 void gl_capture();
 
+// Cross-peer diagnosis: per-component sub-hashes from the last fold_checksum
+// (sq_arena / bullet_arena / small blob). Comparing these between two peers at
+// the same gekko frame localises a desync to one component. Any out-ptr may be
+// null.
+void last_subchecksums(uint32_t* sq, uint32_t* bt, uint32_t* sblob);
+
 } // namespace snapshot_ring
 
 #endif // SNAPSHOT_RING_H

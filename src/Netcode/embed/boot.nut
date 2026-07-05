@@ -49,6 +49,12 @@ function OverrideCSSForAutoConnect() {
         // Host is player slot 0 (master in vanilla parlance), client is
         // slot 1. is_client is set by BeginMatch on the client side; the
         // host never calls BeginMatch so its is_client stays false.
+        // Host is player slot 0 (master in vanilla parlance), client is
+        // slot 1. is_client is set by BeginMatch on the client side; the
+        // host never calls BeginMatch so its is_client stays false.
+        // NOTE: symmetric device_id was tested (both peers [0,1]) and did NOT
+        // converge the sq/bt arena checksums — the divergence is per-process
+        // arena pointer layout, not this setup asymmetry. Kept as-is.
         local our_slot = ::network.is_client ? 1 : 0;
         param.device_id[our_slot]   = ::network.local_device_id;
         param.device_id[1 - our_slot] = -1;

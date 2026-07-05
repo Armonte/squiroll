@@ -423,6 +423,47 @@ static void raw_ser_table(RawSer& c, const SqTable* t) {
     c.out += '}';
 }
 
+// Sqrat-bound math vector classes (Vector3 in script; C++ SqVector3 payload
+// {float x,y,z} at instance userpointer +0/+4/+8 — verified by the va.x Dr0
+// watch, plugin.cpp __gekko_watch_va reads *(float*)up). These carry the
+// actors' velocity/position vectors (this.va / this.vf / this.vfBaria), i.e.
+// REAL gameplay state, but their x/y/z are native Sqrat accessors (method
+// slots) so the member walk emits them EMPTY — a detection hole: two peers
+// could diverge in va while the structural checksum stays equal. Registered
+// once from save_battle via ::__gekko_vec3_register(sample_va) — matched by
+// CLASS POINTER. Emitted as I<id>:3:{x,y,z} — deser()-compatible.
+static const SqClass* g_vec3_class = nullptr;
+// Manbow::InputGlobal (Sqrat): the per-player decoded input device the
+// scripts read as `command.device` — C++ payload 0x128 bytes, leading with
+// int32 x, y, b0..b11 (hold/edge counters; b==2 is the fresh-press edge the
+// command reservations key on). Like Vector3, its fields are native
+// accessors — invisible to the member walk — but they ARE the gameplay
+// input state; emitting the leading 14 ints makes an input-edge divergence
+// show up in the text diff AT the frame it happens.
+static const SqClass* g_inputglobal_class = nullptr;
+// [igx] probe: P0's InputGlobal C++ payload (vtable at +0; x,y,b0.. at
+// +4,+8,+12...). Sampled at fixed points inside advance() to pin WHICH
+// phase updates the decoded input state and at what cadence.
+static const int32_t* g_ig_probe  = nullptr;
+// P1's payload — Dr0 write-watch target: the cross-peer diffs keep landing
+// on a player's device counters being 1 frame AHEAD on their own peer, so
+// the watch names the WRITER (recorder-replay path vs a raw local-input
+// path that bypasses the injected cadence).
+static const int32_t* g_ig_probe2 = nullptr;
+// Squirrel 3.0.6 SQInstance: ..., _class @0x1C, _userpointer @0x20, _hook,
+// _memsize, _values @0x2C — matches the SqInstance mirror above.
+static inline void* sq_inst_userptr(const SqInstance* inst) {
+    return *(void**)((const char*)inst + 0x20);
+}
+
+static void raw_emit_float(std::string& out, float f) {
+    char b[40];
+    int len = snprintf(b, sizeof(b), "%.17g", (double)f);
+    out += 'f';
+    if (len > 0) out.append(b, (size_t)len);
+    out += ';';
+}
+
 static void raw_ser_instance(RawSer& c, const SQObject& o) {
     const SqInstance* inst = (const SqInstance*)o._unVal.pInstance;
 
@@ -435,6 +476,49 @@ static void raw_ser_instance(RawSer& c, const SQObject& o) {
     }
     int my_id = c.next_id++;
     c.seen[inst] = my_id;
+
+    // Vector3: emit component VALUES from the C++ payload.
+    if (g_vec3_class && inst && inst->cls == g_vec3_class) {
+        const float* v = (const float*)sq_inst_userptr(inst);
+        c.out += 'I';
+        raw_ser_append_int(c.out, my_id);
+        if (v) {
+            c.out += ":3:{";
+            c.out += "s1:x;"; raw_emit_float(c.out, v[0]);
+            c.out += "s1:y;"; raw_emit_float(c.out, v[1]);
+            c.out += "s1:z;"; raw_emit_float(c.out, v[2]);
+            c.out += '}';
+        } else {
+            c.out += ":0:{}";
+        }
+        return;
+    }
+
+    // InputGlobal: emit x, y, b0..b11 (leading 14 int32s of the payload).
+    if (g_inputglobal_class && inst && inst->cls == g_inputglobal_class) {
+        const int32_t* g = (const int32_t*)sq_inst_userptr(inst);
+        c.out += 'I';
+        raw_ser_append_int(c.out, my_id);
+        if (g) {
+            c.out += ":14:{";
+            static const char* NM[14] = { "x","y","b0","b1","b2","b3","b4",
+                "b5","b6","b7","b8","b9","b10","b11" };
+            for (int i = 0; i < 14; ++i) {
+                c.out += 's';
+                raw_ser_append_int(c.out, (long long)strlen(NM[i]));
+                c.out += ':';
+                c.out += NM[i];
+                c.out += ';';
+                c.out += 'i';
+                raw_ser_append_int(c.out, (long long)g[i]);
+                c.out += ';';
+            }
+            c.out += '}';
+        } else {
+            c.out += ":0:{}";
+        }
+        return;
+    }
 
     const SqClass* cls     = inst ? inst->cls : nullptr;
     const SqTable* members = cls  ? cls->members : nullptr;
@@ -561,6 +645,50 @@ static SQInteger gekko_cpp_ser(HSQUIRRELVM vm) {
     }
 }
 
+// ::__gekko_vec3_register(sample_instance, kind) — capture a Sqrat class
+// pointer from a live sample so raw_ser_instance can recognize instances by
+// class and emit their C++ payload values. kind: 0 = Vector3 (e.g.
+// ::battle.team[0].master.va), 1 = InputGlobal (…master.command.device).
+// Called once per match from save_battle. Idempotent.
+static SQInteger gekko_vec3_register(HSQUIRRELVM vm) {
+    HSQOBJECT o;
+    sq_resetobject(&o);
+    SQInteger kind = 0;
+    sq_getinteger(vm, 3, &kind);
+    if (SQ_FAILED(sq_getstackobj(vm, 2, &o)) || o._type != OT_INSTANCE) {
+        sq_pushbool(vm, SQFalse);
+        return 1;
+    }
+    const SqInstance* inst = (const SqInstance*)o._unVal.pInstance;
+    if (inst && inst->cls) {
+        const void* up = sq_inst_userptr(inst);
+        if (kind == 1) {
+            g_inputglobal_class = inst->cls;
+            g_ig_probe = (const int32_t*)up;   // P0's payload — [igx] probe
+            const int32_t* g = (const int32_t*)up;
+            log_printf("[gekko_bridge] InputGlobal class registered cls=%p "
+                       "up=%p sample x=%d y=%d b0=%d\n",
+                       (const void*)g_inputglobal_class, up,
+                       g ? g[0] : 0, g ? g[1] : 0, g ? g[2] : 0);
+        } else if (kind == 2) {
+            // P1's InputGlobal payload (probe only; the Dr0 slot is now on
+            // the LOCAL recorder device's read_idx — armed in init()).
+            g_ig_probe2 = (const int32_t*)up;
+        } else {
+            g_vec3_class = inst->cls;
+            const float* f = (const float*)up;
+            log_printf("[gekko_bridge] Vector3 class registered cls=%p up=%p "
+                       "sample=(%.3f, %.3f, %.3f)\n",
+                       (const void*)g_vec3_class, up,
+                       f ? f[0] : 0.f, f ? f[1] : 0.f, f ? f[2] : 0.f);
+        }
+        sq_pushbool(vm, SQTrue);
+        return 1;
+    }
+    sq_pushbool(vm, SQFalse);
+    return 1;
+}
+
 // Register ::__gekko_cpp_ser on the root table. Idempotent; called from
 // init()/init_solo() once the Squirrel VM is up.
 static void register_cpp_ser() {
@@ -570,6 +698,7 @@ static void register_cpp_ser() {
     SQInteger top = sq_gettop(v);
     sq_pushroottable(v);
     sq_setfunc(v, _SC("__gekko_cpp_ser"), &gekko_cpp_ser);
+    sq_setfunc(v, _SC("__gekko_vec3_register"), &gekko_vec3_register);
     sq_settop(v, top);
     log_printf("[gekko_bridge] registered __gekko_cpp_ser (native walker)\n");
 }
@@ -754,6 +883,16 @@ static bool g_arena_rollback = true;
 // input-recorder snapshot section (defined after inject_forced_inputs).
 static uint32_t input_rec_save(uint8_t* out, uint32_t cap);
 static void     input_rec_load(const uint8_t* blob, uint32_t len);
+// Bumped by input_rec_load so the cursor-anomaly detector can tell a legit
+// rollback rewind from an EXTERNAL (vanilla netcode) cursor touch.
+static uint32_t g_irec_load_gen = 0;
+
+// Per-advance consume record ring (see the CONSUME RING block in advance()).
+struct IcRec { int f; uint8_t rb; uint32_t ri0, ri1;
+               uint16_t v0, v1, f0, f1; };
+static constexpr uint32_t ICRING = 1024;
+static IcRec   g_icring[ICRING];
+static uint32_t g_icring_n = 0;
 
 // perf probe — accumulate QPC ticks spent in save / load / advance, logged
 // as average microseconds per call. Shows whether the stress-rig frame time
@@ -762,6 +901,22 @@ static uint64_t g_perf_save = 0, g_perf_load = 0, g_perf_adv = 0;
 static uint32_t g_perf_nsave = 0, g_perf_nload = 0, g_perf_nadv = 0;
 // save split: small-section serialization vs snapshot_ring::capture.
 static uint64_t g_perf_sblob = 0, g_perf_cap = 0;
+
+// STRUCTURAL TEXT RING — the canonical save_battle text per frame (dual only;
+// last save of each frame wins = exactly what the gekko checksum compared).
+// On DesyncDetected both peers dump the whole ring to sqtext_p{idx}_f{N}.txt
+// plus sqring_p{idx}.csv (per-save metadata: rb depth, bcount, inputs) — the
+// frame-by-frame field walk + input correlation that pins WHERE two peers
+// split and whether a rollback re-sim was involved.
+static bool read_battle_int(const SQChar* field, int* out);  // defined below
+
+static constexpr uint32_t SQTEXT_RING = 64;
+static std::string g_sqtext[SQTEXT_RING];
+static uint32_t    g_sqtext_frame[SQTEXT_RING] = {0};
+static uint32_t    g_sqtext_cs[SQTEXT_RING]    = {0};
+static uint8_t     g_sqtext_rb[SQTEXT_RING]    = {0};   // saved during re-sim?
+static int32_t     g_sqtext_bcount[SQTEXT_RING] = {0};
+static uint16_t    g_sqtext_in[SQTEXT_RING][2] = {{0}};
 
 // DESYNC BYTE-DIFF STASH — per-frame copies of the bp ("pools") save section,
 // one ring per timeline ([0]=forward rb==0, [1]=re-sim rb>0). The gekko desync
@@ -1055,10 +1210,72 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         LARGE_INTEGER _c1; QueryPerformanceCounter(&_c1);
         uint32_t cs = snapshot_ring::capture(frame, smb,
                                              (uint32_t)(sp - smb), rng_tail);
+        // CROSS-PEER sblob dump (frames 0-2, first save each): the WHOLE
+        // checksummed small blob (bp/mp/eng/irec/ihist/rng sections). `cmp -l
+        // smb_p0_fN.bin smb_p1_fN.bin` gives the exact diverging byte offset;
+        // battle_pools' known section layout decodes it to pool/slot/field.
+        // This is the value-based serialized copy, so offsets are comparable
+        // cross-process. Only the forward save (rb=0) to avoid re-sim noise.
+        if (frame <= 2 && g_trace_rb == 0) {
+            static int sdump[3] = {0,0,0};
+            if (sdump[frame] == 0) {
+                sdump[frame] = 1;
+                char pth[128];
+                snprintf(pth, sizeof(pth),
+                         "C:\\dev\\aocf\\th155\\smb_p%u_f%u.bin",
+                         (unsigned)g_local_idx, frame);
+                FILE* sf = fopen(pth, "wb");
+                if (sf) { fwrite(smb, 1, (size_t)(sp - smb), sf); fclose(sf); }
+            }
+        }
+        // STRUCTURAL CROSS-PEER CHECKSUM. The raw arena/pool hash `cs` is
+        // pointer-contaminated cross-peer: every C++ object body (Actor2D,
+        // AnimCtrl2D, the math/boost pools, physics) holds process-specific
+        // vtable / shared_ptr / cross-ref pointers, so identical logical state
+        // hashes differently between two processes (proven: ALL pools' bodies
+        // diverge cross-peer while the Squirrel state is identical). save_battle
+        // emits a CANONICAL (traversal-order instance IDs, key-sorted, per-peer
+        // fields skipped) text of the battle state — the only cross-peer-valid
+        // representation, and it matches byte-for-byte between peers. Use its
+        // hash as the gekko checksum for DUAL netplay. Solo keeps the raw `cs`
+        // (single-process, already proven at distance=10; no cross-peer compare).
+        // The raw snapshot still drives RESTORE — exact-byte restore keeps the
+        // local re-sim deterministic; the checksum only needs cross-peer validity.
+        uint32_t final_cs = cs;
+        if (!g_solo) {
+            static uint8_t* sqscratch = nullptr;
+            static const uint32_t SQSCRATCH = 1u << 20;
+            if (!sqscratch)
+                sqscratch = (uint8_t*)VirtualAlloc(nullptr, SQSCRATCH,
+                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (sqscratch) {
+                uint32_t sqn = call_squirrel_save(sqscratch, SQSCRATCH, frame);
+                final_cs = fletcher32(sqscratch, sqn);
+                if (frame <= 5 && g_trace_rb == 0)
+                    log_printf("[sqstruct] f=%u len=%u struct_cs=0x%08x "
+                               "(raw cs=0x%08x)\n", frame, sqn, final_cs, cs);
+                // Ring-keep the canonical TEXT per frame. The LAST save of a
+                // frame (post-rollback-corrected) is what gekko's checksum
+                // compare uses, and overwriting the slot reproduces exactly
+                // that. On DesyncDetected both peers dump the diverging
+                // frame's text to disk — a plain `diff` then NAMES the exact
+                // gameplay field that split (the whole point of a canonical
+                // structural format).
+                uint32_t ri = frame % SQTEXT_RING;
+                g_sqtext[ri].assign((const char*)sqscratch, sqn);
+                g_sqtext_frame[ri] = frame;
+                g_sqtext_cs[ri]    = final_cs;
+                g_sqtext_rb[ri]    = (uint8_t)(g_trace_rb ? 1 : 0);
+                { int bc = -1; read_battle_int(_SC("count"), &bc);
+                  g_sqtext_bcount[ri] = bc; }
+                g_sqtext_in[ri][0] = forced_inputs[0];
+                g_sqtext_in[ri][1] = forced_inputs[1];
+            }
+        }
         LARGE_INTEGER _c2; QueryPerformanceCounter(&_c2);
         g_perf_sblob += (uint64_t)(_c1.QuadPart - _c0.QuadPart);
         g_perf_cap   += (uint64_t)(_c2.QuadPart - _c1.QuadPart);
-        if (out_checksum) *out_checksum = cs;
+        if (out_checksum) *out_checksum = final_cs;
         return sizeof(SaveHeader);
     }
 
@@ -1671,6 +1888,31 @@ static void inject_forced_inputs_into_recorder() {
     auto* recorder = g_active_input_session->input_recorder.get();
     if (!recorder) return;
     size_t n = recorder->devices.size();
+    // One-shot device-order audit: forced_inputs[] is PLAYER-indexed; this
+    // loop assumes recorder->devices[] is too. If devices[] were ordered
+    // [local, remote] instead, the two peers would feed SWAPPED inputs —
+    // invisible while both players' inputs are equal, desyncing the moment
+    // they differ. dev[i].tf4_device == session->local_input names which
+    // index is the local player on THIS peer; comparing the two peers' logs
+    // proves player-indexed (host matches dev[0], client dev[1]) or
+    // local-first (both match dev[0]).
+    static bool order_dumped = false;
+    if (!order_dumped) {
+        order_dumped = true;
+        log_printf("[devorder] local_player_idx=%u local_input=%p ndev=%u\n",
+                   (unsigned)g_active_input_session->local_player_idx,
+                   (const void*)g_active_input_session->local_input,
+                   (unsigned)n);
+        for (size_t i = 0; i < n; ++i) {
+            auto* dd = recorder->devices[i].get();
+            log_printf("[devorder]   dev[%zu]=%p tf4_device=%p%s\n",
+                       i, (const void*)dd,
+                       dd ? (const void*)dd->tf4_device : nullptr,
+                       (dd && dd->tf4_device ==
+                            g_active_input_session->local_input)
+                           ? "  <== LOCAL" : "");
+        }
+    }
     for (size_t i = 0; i < n && i < 2; ++i) {
         auto* dev = recorder->devices[i].get();
         if (!dev) continue;
@@ -1743,6 +1985,7 @@ static uint32_t input_rec_save(uint8_t* out, uint32_t cap) {
 }
 
 static void input_rec_load(const uint8_t* blob, uint32_t len) {
+    ++g_irec_load_gen;   // legit cursor rewind — anomaly detector skips one
     const uint8_t* p = blob;
     const uint8_t* e = blob + len;
     auto get = [&](void* d, uint32_t n) -> bool {
@@ -1850,6 +2093,86 @@ void advance_one_frame() {
     if (forced_inputs_active) {
         inject_forced_inputs_into_recorder();
     }
+    // INPUT-CONSUME TRACE (dual, early frames): what the engine will read
+    // this advance — per recorder device: cursors + the value AT read_idx
+    // (post-inject, pre-sim). Comparing host/client [ic] lines at the same
+    // frame answers whether a corrected press reaches the sim at the same
+    // step on both peers, forward AND re-sim.
+    if (!g_solo && g_trace_frame <= 40 && g_active_input_session) {
+        auto* rec = g_active_input_session->input_recorder.get();
+        if (rec) {
+            for (size_t i = 0; i < rec->devices.size() && i < 2; ++i) {
+                auto* d = rec->devices[i].get();
+                if (!d) continue;
+                uint32_t ri = (uint32_t)d->input_read_idx;
+                uint16_t vv = (ri < d->input_vec.size()) ? d->input_vec[ri] : 0xFFFF;
+                log_printf("[ic] f=%d rb=%d dev%zu ri=%u wi=%u v@ri=0x%04x "
+                           "forced=0x%04x\n",
+                           g_trace_frame, g_trace_rb, i, ri,
+                           (uint32_t)d->input_write_idx, vv, forced_inputs[i]);
+            }
+        }
+    }
+    // CONSUME RING (dual, always on): per advance, what each device is
+    // about to feed the sim (post-inject read cursor + value). Dumped to
+    // icring_p{idx}.csv on desync — the ground truth of exactly which
+    // input bytes each peer's sim consumed at every (frame, rb) execution,
+    // including every re-sim. THE tool for stale-slot consumption bugs.
+    if (!g_solo && g_active_input_session) {
+        auto* rec = g_active_input_session->input_recorder.get();
+        if (rec && rec->devices.size() >= 2) {
+            auto* d0 = rec->devices[0].get();
+            auto* d1 = rec->devices[1].get();
+            if (d0 && d1) {
+                IcRec& R = g_icring[g_icring_n++ % ICRING];
+                R.f  = g_trace_frame;
+                R.rb = (uint8_t)(g_trace_rb ? 1 : 0);
+                R.ri0 = (uint32_t)d0->input_read_idx;
+                R.ri1 = (uint32_t)d1->input_read_idx;
+                R.v0 = (R.ri0 < d0->input_vec.size()) ? d0->input_vec[R.ri0] : 0xFFFF;
+                R.v1 = (R.ri1 < d1->input_vec.size()) ? d1->input_vec[R.ri1] : 0xFFFF;
+                R.f0 = forced_inputs[0];
+                R.f1 = forced_inputs[1];
+            }
+        }
+    }
+    // CURSOR-ANOMALY DETECTOR (dual, always on): between the END of one
+    // advance (engine consumed exactly one entry: ri_post = ri_pre + 1)
+    // and the START of the next, NOTHING may touch the recorder cursors
+    // — except input_rec_load (rollback restore), which announces itself
+    // via g_irec_load_gen. Any other movement = a vanilla netcode path
+    // (SyncInput local-append / async remote-append / render-side pump)
+    // racing gekko's exclusive ownership of the recorder — logged with
+    // the observed vs expected cursors. This is the asymmetric per-peer
+    // input-cadence bug class; the Dr0 watch on read_idx names the code.
+    if (!g_solo && g_active_input_session) {
+        auto* rec = g_active_input_session->input_recorder.get();
+        if (rec) {
+            static uint32_t exp_ri[2] = {0, 0};
+            static uint32_t exp_gen = 0;   // g_irec_load_gen at last sample
+            static bool     exp_valid[2] = {false, false};
+            for (size_t i = 0; i < rec->devices.size() && i < 2; ++i) {
+                auto* d = rec->devices[i].get();
+                if (!d) continue;
+                uint32_t ri = (uint32_t)d->input_read_idx;
+                if (exp_valid[i] && exp_gen == g_irec_load_gen &&
+                    ri != exp_ri[i]) {
+                    static int quota = 40;
+                    if (quota > 0) {
+                        --quota;
+                        log_printf("[icanom] f=%d rb=%d dev%zu ri=%u "
+                                   "EXPECTED %u (external cursor movement!)\n",
+                                   g_trace_frame, g_trace_rb, i, ri, exp_ri[i]);
+                    }
+                }
+                // After this advance the engine will have consumed exactly
+                // one entry from the post-inject position.
+                exp_ri[i] = ri + 1;
+                exp_valid[i] = true;
+            }
+            exp_gen = g_irec_load_gen;
+        }
+    }
     // Strict 1 gekko-Advance = 1 logical frame.
     //
     // We deliberately do NOT call update_logic() (0xE1A0) here. Its body
@@ -1950,12 +2273,24 @@ void advance_one_frame() {
     // display (read in window_render, outside advance) is unaffected.
     uint32_t saved_fps = sim_get_fps();
     sim_set_fps(60);
+    if (g_ig_probe && !g_solo && g_trace_frame <= 8)
+        log_printf("[igx] f=%d rb=%d PRE-run   x=%d y=%d b0=%d\n",
+                   g_trace_frame, g_trace_rb,
+                   g_ig_probe[1], g_ig_probe[2], g_ig_probe[3]);
     update_related(*MAIN_SCRIPTAPI_PTR);                    // RunOneFrame(g_main), once
+    if (g_ig_probe && !g_solo && g_trace_frame <= 8)
+        log_printf("[igx] f=%d rb=%d POST-run  x=%d y=%d b0=%d\n",
+                   g_trace_frame, g_trace_rb,
+                   g_ig_probe[1], g_ig_probe[2], g_ig_probe[3]);
     sim_set_fps(saved_fps);
     log_state_fingerprint(g_trace_frame, g_trace_rb, "post-run");
     if (rb_diag_enabled()) battle_pools::log_fingerprint("post-run");
     if (trace) log_printf("[gekko_bridge] advance: -> ScriptAPI::Update\n");
     Act_ScriptAPI_ptr->vftable->Update(Act_ScriptAPI_ptr);  // Act::ScriptAPI::Update
+    if (g_ig_probe && !g_solo && g_trace_frame <= 8)
+        log_printf("[igx] f=%d rb=%d POST-act  x=%d y=%d b0=%d\n",
+                   g_trace_frame, g_trace_rb,
+                   g_ig_probe[1], g_ig_probe[2], g_ig_probe[3]);
     // B1: rebuild trail ribbon meshes deterministically in the SIM (fwd AND re-sim),
     // BEFORE the save — the render-only build is forward-only and is the residual cpp
     // divergence + the texture-refcount crash. Must run while still marked resim so
@@ -2184,7 +2519,17 @@ bool init(uint16_t local_port, uint16_t remote_port,
 
     gekko_start(g_session, &config);
     gekko_net_adapter_set(g_session, gekko_default_adapter(local_port));
-    gekko_set_runahead(g_session, 8);
+    // RUNAHEAD 0 (was 8). Runahead is GekkoNet's negative-latency feature:
+    // it PREDICTS LOCAL inputs and rolls back on every local misprediction
+    // — with 8 it rolled back every single frame ([load] count == frame
+    // count), and our 1-add-per-tick cadence paired each peer's own input
+    // stream with session frames burst-dependently (the icring/addin logs
+    // showed the two peers consuming DIFFERENT values for the same player
+    // at the same frame, never converging). Classic fighting-game rollback
+    // = predict REMOTE only; local input is authoritative at add time
+    // (shifted by local delay). Revisit runahead as a feature only after
+    // dual is desync-free.
+    gekko_set_runahead(g_session, 0);
 
     g_local_idx = local_player_idx;
     char remote_addr[64];
@@ -2199,6 +2544,69 @@ bool init(uint16_t local_port, uint16_t remote_port,
             addr.data = remote_addr;
             addr.size = (uint32_t)strlen(remote_addr);
             gekko_add_actor(g_session, GekkoRemotePlayer, &addr);
+        }
+    }
+
+    // HEAP-CORRUPTION FIX (the deterministic f=53 0xC0000374 on both peers):
+    // TF4InputRecorderDevice lives in cpp_arena (raw page-captured), so its
+    // std::vector<uint16_t> input_vec HEADER rolls back with the arena — but
+    // the vector's BUFFER is game-CRT heap (never captured). inject grows the
+    // vec by 1/frame via OUR resize(); MSVC's 1.5x growth hits capacity
+    // exactly 504 = ri at f53, where the realloc (a) frees a GAME-CRT buffer
+    // with OUR CRT (Netcode.dll has its own static CRT — foreign-heap free),
+    // and (b) leaves every older snapshot's restored header pointing at the
+    // freed buffer for the next re-sim -> ntdll 0xC0000374 on both peers at
+    // f53, desync or not.
+    //
+    // Fix: swap in a big buffer allocated by the GAME's own malloc (0x306FBC
+    // chokepoint — unrouted, always the real game heap) and patch the vector
+    // header raw ({first,last,end} — MSVC x86 layout, same ABI our reads of
+    // .size()/.data() already rely on). NEVER call allocating methods of a
+    // game-owned container from our CRT. 65536 inputs = ~18 min of battle,
+    // 128KB/dev; the data pointer is then PINNED for the whole armed window,
+    // so header rollback is always consistent and inject's resize(ri+1)
+    // never reallocates. The old ~1KB game buffer is deliberately leaked
+    // (freeing it via the hooked game-free chokepoint is avoidable risk).
+    if (g_active_input_session) {
+        auto* rec = g_active_input_session->input_recorder.get();
+        if (rec) {
+            typedef void* (__cdecl* game_malloc_t)(size_t);
+            auto game_malloc = (game_malloc_t)(0x306FBC_R);
+            for (size_t i = 0; i < rec->devices.size(); ++i) {
+                auto* d = rec->devices[i].get();
+                if (!d || d->input_vec.capacity() >= 65536) continue;
+                uint32_t old_cap = (uint32_t)d->input_vec.capacity();
+                uint32_t n = (uint32_t)d->input_vec.size();
+                uint16_t* nb = (uint16_t*)game_malloc(65536 * sizeof(uint16_t));
+                if (!nb) {
+                    log_printf("[gekko_bridge] !! input_vec[%zu] game_malloc "
+                               "failed — realloc hazard remains\n", i);
+                    continue;
+                }
+                if (n) memcpy(nb, d->input_vec.data(), n * sizeof(uint16_t));
+                uint16_t** hdr = (uint16_t**)&d->input_vec; // {first,last,end}
+                hdr[0] = nb;
+                hdr[1] = nb + n;
+                hdr[2] = nb + 65536;
+                log_printf("[gekko_bridge] input_vec[%zu] rebased onto game-heap "
+                           "buffer %p (cap %u -> 65536, size %u)\n",
+                           i, (void*)nb, old_cap, n);
+            }
+            // Dr0 write-watch on the LOCAL player's recorder read_idx: the
+            // only sanctioned writers while armed are the game's consume
+            // (queue_pop_update_state 0x1698D0, ri++ @0x169903) and our
+            // input_rec_load rewind. Any OTHER EIP = the vanilla netcode
+            // touching the cursor between advances (the asymmetric input-
+            // cadence desync class flagged by [icanom]).
+            if (local_player_idx < (int)rec->devices.size()) {
+                auto* ld = rec->devices[local_player_idx].get();
+                if (ld) {
+                    actor2d_log::watch_arm((uint32_t)(uintptr_t)&ld->input_read_idx);
+                    log_printf("[gekko_bridge] Dr0 armed on local dev[%d] "
+                               "read_idx @%p\n", local_player_idx,
+                               (void*)&ld->input_read_idx);
+                }
+            }
         }
     }
 
@@ -2836,6 +3244,86 @@ bool tick() {
                                desync_counter + 1);
                 }
                 ++desync_counter;
+                // DUAL: dump the structural TEXT of the diverging frame (and
+                // two neighbors) — diffing the two peers' files names the
+                // exact gameplay field that split. Then FATAL (standing rule:
+                // desyncs are never tolerated), after the dump so every desync
+                // leaves usable evidence.
+                if (first && !g_solo) {
+                    int df = e->data.desynced.frame;
+                    int dumped = 0;
+                    for (int fr = df - (int)SQTEXT_RING + 1; fr <= df; ++fr) {
+                        if (fr < 0) continue;
+                        uint32_t ri = (uint32_t)fr % SQTEXT_RING;
+                        if (g_sqtext_frame[ri] != (uint32_t)fr || g_sqtext[ri].empty())
+                            continue;
+                        char pth[128];
+                        snprintf(pth, sizeof(pth),
+                                 "C:\\dev\\aocf\\th155\\sqtext_p%u_f%d.txt",
+                                 (unsigned)g_local_idx, fr);
+                        FILE* tf = fopen(pth, "wb");
+                        if (tf) {
+                            fwrite(g_sqtext[ri].data(), 1, g_sqtext[ri].size(), tf);
+                            fclose(tf);
+                            ++dumped;
+                        }
+                    }
+                    // Per-save metadata: frame, was-this-save-a-re-sim, engine
+                    // bcount, checksum, both players' inputs. Correlating a
+                    // field split with rb=1 rows names the rollback re-sim
+                    // that produced it.
+                    {
+                        char pth[128];
+                        snprintf(pth, sizeof(pth),
+                                 "C:\\dev\\aocf\\th155\\sqring_p%u.csv",
+                                 (unsigned)g_local_idx);
+                        FILE* cf = fopen(pth, "wb");
+                        if (cf) {
+                            fprintf(cf, "frame,rb,bcount,cs,in0,in1\n");
+                            for (int fr = df - (int)SQTEXT_RING + 1; fr <= df; ++fr) {
+                                if (fr < 0) continue;
+                                uint32_t ri = (uint32_t)fr % SQTEXT_RING;
+                                if (g_sqtext_frame[ri] != (uint32_t)fr) continue;
+                                fprintf(cf, "%d,%u,%d,0x%08x,0x%04x,0x%04x\n",
+                                        fr, g_sqtext_rb[ri], g_sqtext_bcount[ri],
+                                        g_sqtext_cs[ri], g_sqtext_in[ri][0],
+                                        g_sqtext_in[ri][1]);
+                            }
+                            fclose(cf);
+                        }
+                    }
+                    // Consume-ring: every advance's (frame, rb, cursor,
+                    // consumed value, forced inputs) — the exact input
+                    // bytes each execution fed the sim.
+                    {
+                        char pth[128];
+                        snprintf(pth, sizeof(pth),
+                                 "C:\\dev\\aocf\\th155\\icring_p%u.csv",
+                                 (unsigned)g_local_idx);
+                        FILE* cf = fopen(pth, "wb");
+                        if (cf) {
+                            fprintf(cf, "seq,frame,rb,ri0,v0,forced0,ri1,v1,forced1\n");
+                            uint32_t n = g_icring_n < ICRING ? g_icring_n : ICRING;
+                            uint32_t start = g_icring_n - n;
+                            for (uint32_t s = start; s < g_icring_n; ++s) {
+                                const IcRec& R = g_icring[s % ICRING];
+                                fprintf(cf, "%u,%d,%u,%u,0x%04x,0x%04x,%u,0x%04x,0x%04x\n",
+                                        s, R.f, R.rb, R.ri0, R.v0, R.f0,
+                                        R.ri1, R.v1, R.f1);
+                            }
+                            fclose(cf);
+                        }
+                    }
+                    log_printf("[gekko_bridge] desync dump: %d frames + ring csv\n",
+                               dumped);
+                    log_printf("[gekko_bridge] DESYNC FATAL (dual): frame=%d "
+                               "local=%08x remote=%08x — text dumped, exiting(5)\n",
+                               df, e->data.desynced.local_checksum,
+                               e->data.desynced.remote_checksum);
+                    log_flush();
+                    Sleep(500);
+                    ExitProcess(5);
+                }
                 // SQUIROLL_DESYNC_ABORT=1 -> stop dead on the FIRST desync, so a
                 // long run's log ends exactly at the diverging frame. Lets us push
                 // for 100% determinism: run long with random input seeds, and any
@@ -2887,6 +3375,19 @@ bool tick() {
             // only its own (the other arrives over the network), and the
             // per-player seeding keeps the streams identical cross-peer.
             uint16_t mine = fake_input_gen(g_local_idx);
+            // [addin] the OWNER's true input stream as handed to gekko.
+            // Cross-referencing against the PEER's icring (what its sim
+            // consumed for this player) shows whether gekko delivered the
+            // stream faithfully, at what frame offset, or dropped it
+            // (GekkoNet AddInput silently discards non-sequential adds).
+            if (!g_solo) {
+                static int addin_quota = 120;
+                if (addin_quota > 0) {
+                    --addin_quota;
+                    log_printf("[addin] tick_f=%d val=0x%04x\n",
+                               g_trace_frame, mine);
+                }
+            }
             gekko_add_local_input(g_session, g_local_idx, &mine);
             if (g_solo) {
                 uint16_t other = fake_input_gen(1);
@@ -2949,8 +3450,17 @@ bool tick() {
                         // frame, gekko's state buffer was clobbered.
                         uint32_t blobcs =
                             fletcher32((const uint8_t*)e->data.save.state, n);
-                        log_printf("[save] f=%d cs=0x%08x len=%u blobcs=0x%08x\n",
-                                   (int)e->data.save.frame, cs, n, blobcs);
+                        // Cross-peer localiser: battle `count` (engine frame)
+                        // tells us if both peers snapshot a gekko frame at the
+                        // SAME battle frame (rules the arm-timing drift in/out);
+                        // sq/bt/sb sub-checksums say WHICH component diverged.
+                        int bcount = -1; read_battle_int(_SC("count"), &bcount);
+                        uint32_t s_sq = 0, s_bt = 0, s_sb = 0;
+                        snapshot_ring::last_subchecksums(&s_sq, &s_bt, &s_sb);
+                        log_printf("[save] f=%d bcount=%d cs=0x%08x len=%u "
+                                   "blobcs=0x%08x sq=0x%08x bt=0x%08x sb=0x%08x\n",
+                                   (int)e->data.save.frame, bcount, cs, n, blobcs,
+                                   s_sq, s_bt, s_sb);
                     }
                 }
                 // Dump the Squirrel blob for two specific frames to

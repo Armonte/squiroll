@@ -564,13 +564,44 @@ bool get_hide_wip_enabled() {
     return GET_BOOL_CONFIG(MISC, HIDE_WIP);
 }
 
+// Parse a SQUIROLL_* boolean env var the same way get_gekko_enabled does:
+// leading 1/t/T/y/Y = true, 0/f/n = false. Returns -1 when the var is
+// unset (caller falls back to netcode.ini) so a launch can drive this
+// setting per-instance without editing the shared ini. env_cached/env_val
+// are the caller's per-getter static latches.
+static int read_env_bool(const char* name, char* env_buf, size_t buf_len,
+                         int& env_cached, bool& env_val) {
+    if (env_cached == 0) {
+        if (read_env_static(name, env_buf, buf_len)) {
+            char c = env_buf[0];
+            env_val = (c == '1' || c == 't' || c == 'T' || c == 'y' || c == 'Y');
+            env_cached = 1;
+        } else {
+            env_cached = 2;
+        }
+    }
+    return env_cached == 1 ? (env_val ? 1 : 0) : -1;
+}
+
 static char MISC_SKIP_INTRO_BUFFER[8]{ '\0' };
 bool get_skip_intro_enabled() {
+    static char env_buf[8];
+    static int env_cached = 0;
+    static bool env_val = false;
+    int e = read_env_bool("SQUIROLL_SKIP_INTRO", env_buf, sizeof(env_buf),
+                          env_cached, env_val);
+    if (e >= 0) return e != 0;
     return GET_BOOL_CONFIG(MISC, SKIP_INTRO);
 }
 
 static char MISC_SKIP_TO_BATTLE_BUFFER[8]{ '\0' };
 bool get_skip_to_battle_enabled() {
+    static char env_buf[8];
+    static int env_cached = 0;
+    static bool env_val = false;
+    int e = read_env_bool("SQUIROLL_SKIP_TO_BATTLE", env_buf, sizeof(env_buf),
+                          env_cached, env_val);
+    if (e >= 0) return e != 0;
     return GET_BOOL_CONFIG(MISC, SKIP_TO_BATTLE);
 }
 
