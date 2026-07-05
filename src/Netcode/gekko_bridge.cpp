@@ -126,6 +126,14 @@ static bool          g_watch_for_fight = false; // solo: armed by boot.nut, pre_
 // Soft disarms this match: 1 = round 1->2 transition, 2 = MATCH END (win
 // quote/result). Win-quote-only diagnostics gate on >= 2. Reset in shutdown().
 static int           g_disarm_count = 0;
+// DUAL round-end latch: the gekko frame whose ADVANCE observed the round-end
+// condition (battle.state left 8, or state 8 with time hitting 0). Both peers
+// evaluate this INSIDE the deterministic sim (identical state + inputs =>
+// identical latch frame), unlike the solo tick-time checks which are local
+// wall-clock and would race across peers (the f5018 time-up desync: dual had
+// NO round-end disarm and ran armed into the transition). -1 = not latched.
+// Cleared by load_state_from_buf when a rollback crosses it.
+static int32_t       g_roundend_latch = -1;
                                                  // creates the session at Round_Fight
 static uint32_t      g_evt_trace = 0;            // diagnostic: # of Save/Load/
                                                  // Advance events to trace with
@@ -909,6 +917,7 @@ static uint64_t g_perf_sblob = 0, g_perf_cap = 0;
 // frame-by-frame field walk + input correlation that pins WHERE two peers
 // split and whether a rollback re-sim was involved.
 static bool read_battle_int(const SQChar* field, int* out);  // defined below
+static bool read_battle_state(int* out);                     // defined below
 
 static constexpr uint32_t SQTEXT_RING = 64;
 static std::string g_sqtext[SQTEXT_RING];
@@ -1471,6 +1480,14 @@ void load_state_from_buf(const void* buf, uint32_t len) {
 
     acrt_getptd()->rand_state = hdr->rand_state;
     // TODO: restore frame counter if/where it lives
+
+    // Round-end latch invalidation: rolling back to (or before) the frame
+    // that latched the round end reopens the question — the re-sim with
+    // corrected inputs may move the KO/time-up frame. The latch re-fires
+    // during the re-simmed advance if the condition still holds, so the
+    // disarm frame is always a property of the FINAL (confirmed) timeline.
+    if (g_roundend_latch >= 0 && (int32_t)hdr->frame <= g_roundend_latch)
+        g_roundend_latch = -1;
 
     // Arena rollback: roll the big arenas back via snapshot_ring and restore
     // the small sections from that frame's blob. See save_state_to_buf.
@@ -2291,6 +2308,23 @@ void advance_one_frame() {
         log_printf("[igx] f=%d rb=%d POST-act  x=%d y=%d b0=%d\n",
                    g_trace_frame, g_trace_rb,
                    g_ig_probe[1], g_ig_probe[2], g_ig_probe[3]);
+    // DUAL round-end latch (see g_roundend_latch): evaluated INSIDE the
+    // deterministic sim so both peers latch the identical gekko frame.
+    // Conditions: the fight left state 8 (KO demo / transition started),
+    // or the timer ran out while still in state 8 (time-up frame itself).
+    // Keep the EARLIEST latched frame; rollback across it clears the latch
+    // (load_state_from_buf) so it always describes the final timeline.
+    if (!g_solo && g_session_started && g_roundend_latch < 0) {
+        int st = 0, bt = 0;
+        if (read_battle_state(&st) &&
+            (st != 8 ||
+             (read_battle_int(_SC("time"), &bt) && bt <= 0))) {
+            g_roundend_latch = g_trace_frame;
+            log_printf("[gekko_bridge] round-end LATCH f=%d rb=%d "
+                       "(state=%d time=%d)\n",
+                       g_trace_frame, g_trace_rb, st, bt);
+        }
+    }
     // B1: rebuild trail ribbon meshes deterministically in the SIM (fwd AND re-sim),
     // BEFORE the save — the render-only build is forward-only and is the residual cpp
     // divergence + the texture-refcount crash. Must run while still marked resim so
@@ -3079,6 +3113,7 @@ void shutdown() {
     g_watch_for_fight = false;
     g_match_setup_done = false;   // full teardown — next match re-runs one-time setup
     g_disarm_count = 0;
+    g_roundend_latch = -1;
     // Flush any actors held by defer-release so the engine can actually
     // reclaim their slots once we're done with the session.
     live_actors::set_defer_release(false);
@@ -3679,6 +3714,20 @@ bool tick() {
                        last_st, st, g_trace_frame);
             last_st = st;
         }
+    }
+    // DUAL round-end disarm: driven by the sim-latched frame (identical on
+    // both peers by construction), NOT by local wall-clock reads — each peer
+    // disarms right after ITS advance of the latched frame completed, so the
+    // gekko session covers exactly the same sim range on both sides. The
+    // round transition then runs on the vanilla/delay path (loop.nut's
+    // while(SyncInput()) gate resumes); pre_arm_poll re-arms at the next
+    // round's Round_Fight.
+    if (g_session_started && !g_solo && !no_disarm && g_roundend_latch >= 0) {
+        log_printf("[gekko_bridge] round-end latch f=%d reached -> dual "
+                   "disarm\n", g_roundend_latch);
+        g_roundend_latch = -1;
+        disarm_for_round_end();
+        return advanced;
     }
     if (g_session_started && g_solo && !no_disarm) {
         int st = 0;
