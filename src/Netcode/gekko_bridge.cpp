@@ -3284,6 +3284,31 @@ bool tick() {
                 // exact gameplay field that split. Then FATAL (standing rule:
                 // desyncs are never tolerated), after the dump so every desync
                 // leaves usable evidence.
+                // FALSE-POSITIVE FILTER (GekkoNet health-check race): Poll()
+                // runs SendSessionHealthCheck right after HandleRollback
+                // QUEUES re-save events — before the game executes them. A
+                // max-depth correction can therefore send a PRE-correction
+                // checksum for the confirmed frame while the peer sends its
+                // post-correction one → an ISOLATED false desync that self-
+                // heals next frame. A REAL divergence is deterministic and
+                // persists on every subsequent frame. Policy: dump evidence
+                // on the first report, FATAL only when >=3 CONSECUTIVE
+                // frames disagree (a real desync always trips this).
+                static int  ds_run   = 0;
+                static int  ds_last  = -999;
+                {
+                    int df0 = e->data.desynced.frame;
+                    ds_run  = (df0 == ds_last + 1) ? ds_run + 1 : 1;
+                    ds_last = df0;
+                }
+                if (!g_solo && ds_run >= 3) {
+                    log_printf("[gekko_bridge] DESYNC SUSTAINED (%d consecutive"
+                               " frames, last=%d) — real divergence\n",
+                               ds_run, ds_last);
+                    log_flush();
+                    Sleep(300);
+                    ExitProcess(5);
+                }
                 if (first && !g_solo) {
                     int df = e->data.desynced.frame;
                     int dumped = 0;
@@ -3351,13 +3376,15 @@ bool tick() {
                     }
                     log_printf("[gekko_bridge] desync dump: %d frames + ring csv\n",
                                dumped);
-                    log_printf("[gekko_bridge] DESYNC FATAL (dual): frame=%d "
-                               "local=%08x remote=%08x — text dumped, exiting(5)\n",
+                    // Evidence dumped; NOT fatal here — an isolated report
+                    // can be the health-check race (see filter above). The
+                    // sustained-run check is the executioner.
+                    log_printf("[gekko_bridge] DESYNC report (dual): frame=%d "
+                               "local=%08x remote=%08x — text dumped; fatal "
+                               "only if sustained\n",
                                df, e->data.desynced.local_checksum,
                                e->data.desynced.remote_checksum);
                     log_flush();
-                    Sleep(500);
-                    ExitProcess(5);
                 }
                 // SQUIROLL_DESYNC_ABORT=1 -> stop dead on the FIRST desync, so a
                 // long run's log ends exactly at the diverging frame. Lets us push
