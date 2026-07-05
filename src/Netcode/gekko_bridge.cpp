@@ -458,6 +458,12 @@ static const int32_t* g_ig_probe  = nullptr;
 // the watch names the WRITER (recorder-replay path vs a raw local-input
 // path that bypasses the injected cadence).
 static const int32_t* g_ig_probe2 = nullptr;
+// Remote-reader rebind state (see the REBIND block in advance()): the
+// fabricated {vtbl, recorder-queue} lambda and the InputGlobal whose +188
+// reader slot must be forced to it. Restore reverts the slot, so BOTH the
+// advance top AND the LoadEvent handler re-force it.
+static void**   g_reader_fab     = nullptr;
+static uint8_t* g_reader_fix_obj = nullptr;
 // Squirrel 3.0.6 SQInstance: ..., _class @0x1C, _userpointer @0x20, _hook,
 // _memsize, _values @0x2C — matches the SqInstance mirror above.
 static inline void* sq_inst_userptr(const SqInstance* inst) {
@@ -2127,84 +2133,62 @@ void advance_one_frame() {
     if (forced_inputs_active) {
         inject_forced_inputs_into_recorder();
     }
-    // INPUT-CONSUME TRACE (dual, early frames): what the engine will read
-    // this advance — per recorder device: cursors + the value AT read_idx
-    // (post-inject, pre-sim). Comparing host/client [ic] lines at the same
-    // frame answers whether a corrected press reaches the sim at the same
-    // step on both peers, forward AND re-sim.
-    if (!g_solo && g_trace_frame <= 40 && g_active_input_session) {
-        auto* rec = g_active_input_session->input_recorder.get();
-        if (rec) {
-            for (size_t i = 0; i < rec->devices.size() && i < 2; ++i) {
-                auto* d = rec->devices[i].get();
-                if (!d) continue;
-                uint32_t ri = (uint32_t)d->input_read_idx;
-                uint16_t vv = (ri < d->input_vec.size()) ? d->input_vec[ri] : 0xFFFF;
-                log_printf("[ic] f=%d rb=%d dev%zu ri=%u wi=%u v@ri=0x%04x "
-                           "forced=0x%04x\n",
-                           g_trace_frame, g_trace_rb, i, ri,
-                           (uint32_t)d->input_write_idx, vv, forced_inputs[i]);
-            }
-        }
-    }
-    // CONSUME RING (dual, always on): per advance, what each device is
-    // about to feed the sim (post-inject read cursor + value). Dumped to
-    // icring_p{idx}.csv on desync — the ground truth of exactly which
-    // input bytes each peer's sim consumed at every (frame, rb) execution,
-    // including every re-sim. THE tool for stale-slot consumption bugs.
-    if (!g_solo && g_active_input_session) {
+    // REMOTE-READER REBIND (the residual desync class): the REMOTE player's
+    // visible InputGlobal reads through a network-gated reader (obj at
+    // InputGlobal+188; vfunc+8) whose availability bookkeeping rolls back,
+    // so it NO-OPS during re-sims and the remote counters freeze. The LOCAL
+    // player's reader is a plain {vtbl, queue*} lambda over its recorder
+    // device (queue_pop replays perfectly). Identify each probe's reader by
+    // its CAPTURED QUEUE (no team/local mapping guesses): the one whose
+    // reader[1] is a recorder device keeps it; the other (network-gated)
+    // gets a fabricated {same vtbl, other recorder device} lambda, re-forced
+    // every advance (restore reverts the pointer slot; idempotent).
+    if (!g_solo && g_session_started && g_ig_probe && g_ig_probe2 &&
+        g_active_input_session) {
         auto* rec = g_active_input_session->input_recorder.get();
         if (rec && rec->devices.size() >= 2) {
-            auto* d0 = rec->devices[0].get();
-            auto* d1 = rec->devices[1].get();
-            if (d0 && d1) {
-                IcRec& R = g_icring[g_icring_n++ % ICRING];
-                R.f  = g_trace_frame;
-                R.rb = (uint8_t)(g_trace_rb ? 1 : 0);
-                R.ri0 = (uint32_t)d0->input_read_idx;
-                R.ri1 = (uint32_t)d1->input_read_idx;
-                R.v0 = (R.ri0 < d0->input_vec.size()) ? d0->input_vec[R.ri0] : 0xFFFF;
-                R.v1 = (R.ri1 < d1->input_vec.size()) ? d1->input_vec[R.ri1] : 0xFFFF;
-                R.f0 = forced_inputs[0];
-                R.f1 = forced_inputs[1];
-            }
-        }
-    }
-    // CURSOR-ANOMALY DETECTOR (dual, always on): between the END of one
-    // advance (engine consumed exactly one entry: ri_post = ri_pre + 1)
-    // and the START of the next, NOTHING may touch the recorder cursors
-    // — except input_rec_load (rollback restore), which announces itself
-    // via g_irec_load_gen. Any other movement = a vanilla netcode path
-    // (SyncInput local-append / async remote-append / render-side pump)
-    // racing gekko's exclusive ownership of the recorder — logged with
-    // the observed vs expected cursors. This is the asymmetric per-peer
-    // input-cadence bug class; the Dr0 watch on read_idx names the code.
-    if (!g_solo && g_active_input_session) {
-        auto* rec = g_active_input_session->input_recorder.get();
-        if (rec) {
-            static uint32_t exp_ri[2] = {0, 0};
-            static uint32_t exp_gen = 0;   // g_irec_load_gen at last sample
-            static bool     exp_valid[2] = {false, false};
-            for (size_t i = 0; i < rec->devices.size() && i < 2; ++i) {
-                auto* d = rec->devices[i].get();
-                if (!d) continue;
-                uint32_t ri = (uint32_t)d->input_read_idx;
-                if (exp_valid[i] && exp_gen == g_irec_load_gen &&
-                    ri != exp_ri[i]) {
-                    static int quota = 40;
-                    if (quota > 0) {
-                        --quota;
-                        log_printf("[icanom] f=%d rb=%d dev%zu ri=%u "
-                                   "EXPECTED %u (external cursor movement!)\n",
-                                   g_trace_frame, g_trace_rb, i, ri, exp_ri[i]);
-                    }
+            void* dev0 = rec->devices[0].get();
+            void* dev1 = rec->devices[1].get();
+            // (g_reader_fab/g_reader_fix_obj are file-scope so the
+            // LoadEvent handler can re-force immediately after restore.)
+            void**&  fab      = g_reader_fab;
+            uint8_t*& fix_obj = g_reader_fix_obj;
+            static bool     resolved = false;
+            if (!resolved) {
+                uint8_t* a = (uint8_t*)(uintptr_t)g_ig_probe;
+                uint8_t* b = (uint8_t*)(uintptr_t)g_ig_probe2;
+                void** ra = *(void***)(a + 188);
+                void** rb = *(void***)(b + 188);
+                void* qa = ra ? ra[1] : nullptr;
+                void* qb = rb ? rb[1] : nullptr;
+                uint8_t* anchor_obj = nullptr; void** anchor_reader = nullptr;
+                void* anchor_dev = nullptr;
+                if (qa == dev0 || qa == dev1) {
+                    anchor_obj = a; anchor_reader = ra; anchor_dev = qa;
+                    fix_obj = b;
+                } else if (qb == dev0 || qb == dev1) {
+                    anchor_obj = b; anchor_reader = rb; anchor_dev = qb;
+                    fix_obj = a;
                 }
-                // After this advance the engine will have consumed exactly
-                // one entry from the post-inject position.
-                exp_ri[i] = ri + 1;
-                exp_valid[i] = true;
+                if (anchor_obj && fix_obj) {
+                    void* other_dev = (anchor_dev == dev0) ? dev1 : dev0;
+                    typedef void* (__cdecl* gm_t)(size_t);
+                    fab = (void**)((gm_t)(0x306FBC_R))(2 * sizeof(void*));
+                    if (fab) {
+                        fab[0] = anchor_reader[0];   // lambda vtable
+                        fab[1] = other_dev;          // captured queue
+                        log_printf("[gekko_bridge] reader rebind: anchor=%p"
+                                   " (dev %p) fix=%p -> fab{%p,%p} was %p\n",
+                                   (void*)anchor_obj, anchor_dev,
+                                   (void*)fix_obj, fab[0], fab[1],
+                                   *(void**)(fix_obj + 188));
+                    }
+                    resolved = true;
+                } else {
+                    // neither reader recorder-backed yet — retry next advance
+                }
             }
-            exp_gen = g_irec_load_gen;
+            if (fab && fix_obj) *(void**)(fix_obj + 188) = (void*)fab;
         }
     }
     // Strict 1 gekko-Advance = 1 logical frame.
@@ -3652,6 +3636,12 @@ bool tick() {
                                    e->data.load.state_len, blobcs);
                     }
                 }
+                // Re-force the rebound reader IMMEDIATELY after restore —
+                // the arena restore reverts InputGlobal+188 to the network-
+                // gated reader, and any input pump firing between this load
+                // and the next advance-top force would run the wrong reader.
+                if (g_reader_fab && g_reader_fix_obj)
+                    *(void**)(g_reader_fix_obj + 188) = (void*)g_reader_fab;
                 // [igx] post-restore counter value — pairs with PRE/POST-run
                 // probes on the subsequent rb=1 advances.
                 if (!g_solo && g_ig_probe)
