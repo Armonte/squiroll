@@ -466,6 +466,11 @@ static void**   g_reader_fab     = nullptr;
 static uint8_t* g_reader_fix_obj = nullptr;
 static void**   g_reader_fab2     = nullptr;  // anchor's replacement
 static uint8_t* g_reader_fix_obj2 = nullptr;  // anchor object
+// +0xE4 secondary decoder objects (objmap found them adjacent to the +0xBC
+// readers; the only other non-null pointer slot). Converted in place to
+// tapped recorder lambdas and re-forced per advance + post-load.
+static void**   g_rdr_e4[2]     = {nullptr, nullptr};
+static void*    g_rdr_e4_dev[2] = {nullptr, nullptr};
 
 // POP TAP — surgical per-pop attribution. Our fabricated readers get a
 // COPY of the lambda vtable with the invoke slot (+8, index 2) replaced by
@@ -2025,25 +2030,12 @@ static void inject_forced_inputs_into_recorder() {
         }
         dev->input_vec[ri] = forced_inputs[i];
         dev->input_write_idx = ri + 1;
-        // RE-SIM RAW-STATE SYNC (the f391-class split): a second, un-tapped
-        // reader decodes the visible InputGlobal from the RAW
-        // TF4InputDeviceState (not the queue). Forward, the vanilla playback
-        // keeps that state current; during a re-sim burst NOTHING updates it,
-        // so it re-applies the load-frame's input every re-simmed frame,
-        // overwriting the queue-pop's correct decode (tap-bracketed: pop
-        // applied 0x0028, POST-run showed the state re-ticked with the
-        // restored 0x0006). Write the forced input into the raw state on
-        // re-sim advances only (forward stays vanilla-fed). Bit → state
-        // mapping mirrors queue_pop: bit0 x--, bit1 x++, bit2 y--, bit3 y++,
-        // bit(4+i) -> buttons[i]; poll-side reads sign/nonzero.
-        if (g_trace_rb && dev->tf4_device) {
-            TF4InputDeviceState* ds = &dev->tf4_device->state;
-            uint16_t in = forced_inputs[i];
-            ds->x = (in & 1) ? -1 : ((in & 2) ? 1 : 0);
-            ds->y = (in & 4) ? -1 : ((in & 8) ? 1 : 0);
-            for (int b = 0; b < 12; ++b)
-                ds->buttons[b] = (uint32_t)((in >> (4 + b)) & 1);
-        }
+        // (RE-SIM RAW-STATE SYNC experiment REMOVED: tf4_device->state IS
+        // the visible InputGlobal's counter block — the recorder's
+        // tf4_device is the same object the script reads. Writing absolute
+        // ±1 into it clobbered live hold counters every rb advance;
+        // velwatch caught our own write EIP. The counters are fully
+        // restored by bp + irec; only the game's decoder may tick them.)
     }
 }
 
@@ -2285,9 +2277,91 @@ void advance_one_frame() {
                             anchor_reader[0] = (void*)g_tap_vt;
                             anchor_reader[1] = anchor_dev;
                         }
-                        log_printf("[gekko_bridge] original readers converted "
-                                   "in place: fix-old=%p anchor-old=%p\n",
-                                   (void*)orig_fix, (void*)anchor_reader);
+                        // +0xCC = InputMulti::Update's MERGE HANDLER
+                        // (this[51]; called every frame with state=this+4
+                        // AFTER updating the raw child list) — the second
+                        // un-tapped decoder that overwrote the recorder
+                        // decode with raw kbd/pad-derived state during
+                        // re-sims. Convert it in place too; with wi=ri+1
+                        // the second pop hits the empty-guard = no-op.
+                        void** mh_fix = *(void***)(fix_obj + 204);
+                        if (mh_fix) {
+                            mh_fix[0] = (void*)g_tap_vt;
+                            mh_fix[1] = other_dev;
+                        }
+                        void** mh_anchor = *(void***)(anchor_obj + 204);
+                        if (mh_anchor) {
+                            mh_anchor[0] = (void*)g_tap_vt;
+                            mh_anchor[1] = anchor_dev;
+                        }
+                        log_printf("[gekko_bridge] originals converted: "
+                                   "rdr fix=%p anchor=%p; MERGE fix=%p "
+                                   "anchor=%p\n",
+                                   (void*)orig_fix, (void*)anchor_reader,
+                                   (void*)mh_fix, (void*)mh_anchor);
+                    }
+                    // +0xE4 SECONDARY DECODER conversion (guarded): the
+                    // only other populated pointer slot on the visible
+                    // objects. If it is reader-shaped ([0] = in-image
+                    // vtable), convert to a tapped recorder lambda over the
+                    // object's own device and re-force alongside the others.
+                    {
+                        uint8_t* objs[2] = { anchor_obj, fix_obj };
+                        void*    devs[2] = { anchor_dev, other_dev };
+                        for (int oi = 0; oi < 2; ++oi) {
+                            void** e4 = *(void***)(objs[oi] + 0xE4);
+                            if (e4) {
+                                uint32_t vt0 = (uint32_t)(uintptr_t)e4[0];
+                                if (vt0 >= 0x00400000 && vt0 < 0x01000000) {
+                                    // NOT converted: this is a NO-ARG
+                                    // std::function (pump registration whose
+                                    // invoke calls obj->Update() through the
+                                    // +0xBC reader we already own). Forcing
+                                    // the 2-arg reader vtable onto it broke
+                                    // its invoke signature -> instant f2
+                                    // desyncs. Leave it; it is not a decoder.
+                                    log_printf("[gekko_bridge] +E4 %d @%p "
+                                               "vt=%08X q=%p (no-arg pump fn,"
+                                               " left alone)\n",
+                                               oi, (void*)e4, vt0,
+                                               (void*)e4[1]);
+                                } else {
+                                    log_printf("[gekko_bridge] +E4 obj %d @%p "
+                                               "vt=%08X NOT reader-shaped — "
+                                               "left alone\n",
+                                               oi, (void*)e4, vt0);
+                                }
+                            }
+                        }
+                    }
+                    // [objmap] full pointer-region dump of both visible
+                    // objects (+0xB0..+0xE8): every reader/handler/child
+                    // slot candidate, with [0]/[1] derefs — so ALL decode
+                    // paths can be identified and owned in one pass.
+                    for (int oi = 0; oi < 2; ++oi) {
+                        uint8_t* ob = oi ? fix_obj : anchor_obj;
+                        char ln[420]; int n0 = 0;
+                        n0 += wsprintfA(ln + n0, "[objmap] %s=%p:",
+                                        oi ? "fix" : "anchor", (void*)ob);
+                        for (int off = 0xB0; off <= 0xE8; off += 4) {
+                            uint32_t vv = *(uint32_t*)(ob + off);
+                            n0 += wsprintfA(ln + n0, " +%X=%08X", off, vv);
+                            if (n0 > 340) break;
+                        }
+                        log_printf("%s\n", ln);
+                        // deref candidates: +BC (reader), +CC (handler),
+                        // +D8 (list head)
+                        for (int off2 = 0xBC; off2 <= 0xD8; off2 += 4) {
+                            uint32_t p = *(uint32_t*)(ob + off2);
+                            if (p > 0x10000 && p < 0x80000000) {
+                                uint32_t d0 = *(uint32_t*)(uintptr_t)p;
+                                uint32_t d1 = *(uint32_t*)(uintptr_t)(p + 4);
+                                uint32_t d2 = *(uint32_t*)(uintptr_t)(p + 8);
+                                log_printf("[objmap]   +%X -> %08X: [0]=%08X "
+                                           "[1]=%08X [2]=%08X\n",
+                                           off2, p, d0, d1, d2);
+                            }
+                        }
                     }
                     log_printf("[gekko_bridge] reader rebind BOTH: anchor=%p"
                                " (dev %p) -> fab2{%p,%p}; fix=%p -> "
@@ -2307,6 +2381,11 @@ void advance_one_frame() {
             if (fab && fix_obj) *(void**)(fix_obj + 188) = (void*)fab;
             if (g_reader_fab2 && g_reader_fix_obj2)
                 *(void**)(g_reader_fix_obj2 + 188) = (void*)g_reader_fab2;
+            for (int oi = 0; oi < 2; ++oi)
+                if (g_rdr_e4[oi]) {
+                    g_rdr_e4[oi][0] = (void*)g_tap_vt;
+                    g_rdr_e4[oi][1] = g_rdr_e4_dev[oi];
+                }
         }
     }
     // INPUT-CONSUME TRACE (dual, early frames): what the engine will read
@@ -2853,6 +2932,15 @@ bool init(uint16_t local_port, uint16_t remote_port,
             // the in-burst zeroer.)
         }
     }
+
+    // [addrmap] one-shot: our functions' addresses so velwatch EIPs in the
+    // 0x5xxxxxxx range can be attributed to a specific squiroll routine.
+    log_printf("[addrmap] pop_tap=%p inject=%p irec_save=%p irec_load=%p "
+               "bp_save=%p bp_load=%p eng_save=%p eng_load=%p\n",
+               (void*)&pop_tap, (void*)&inject_forced_inputs_into_recorder,
+               (void*)&input_rec_save, (void*)&input_rec_load,
+               (void*)&battle_pools::save, (void*)&battle_pools::load,
+               (void*)&engine_snap::save, (void*)&engine_snap::load);
 
     g_active = true;
     // Deferred release is OFF for the arena-rollback path. It no-ops
@@ -3843,6 +3931,11 @@ bool tick() {
                     *(void**)(g_reader_fix_obj + 188) = (void*)g_reader_fab;
                 if (g_reader_fab2 && g_reader_fix_obj2)
                     *(void**)(g_reader_fix_obj2 + 188) = (void*)g_reader_fab2;
+                for (int oi2 = 0; oi2 < 2; ++oi2)
+                    if (g_rdr_e4[oi2]) {
+                        g_rdr_e4[oi2][0] = (void*)g_tap_vt;
+                        g_rdr_e4[oi2][1] = g_rdr_e4_dev[oi2];
+                    }
                 // [igx] post-restore counter value — pairs with PRE/POST-run
                 // probes on the subsequent rb=1 advances.
                 if (!g_solo && g_ig_probe)
