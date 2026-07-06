@@ -35,6 +35,20 @@
                          // PlayerTeamData + actor classes; process-local,
                          // not part of the gekko snapshot. Skipping it
                          // keeps the depth-6 walk out of plugin internals.
+    // [M4] `count` on INSTANCES (draw/effect Actor2D-derived objects) is a
+    // per-object FORWARD-ONLY animation counter, not sim state — load_into
+    // restores it fine, but it advances non-deterministically across a headless
+    // re-sim (engine-frame drift), so it's cosmetic render state that must be
+    // excluded from the structural checksum. This ONLY affects the INSTANCE walk
+    // (line ~182) — the sim-critical root ::battle.count rides the TABLE walk
+    // (line ~111), which does NOT honor _skip_keys, so it's still checksummed.
+    count       = true,
+    // `__setTable` / `_staticTable` are the actor class's _set-dispatch + static
+    // property tables (mostly setter functions). Not sim state, and they carry a
+    // DUPLICATE cosmetic `count` the instance skip above can't reach (they're
+    // TABLES, walked by the table branch which ignores _skip_keys). Skip whole.
+    __setTable   = true,
+    _staticTable = true,
 };
 
 // Singleton sentinel that the deserializer returns for `?;` (skip)
@@ -52,6 +66,7 @@
 // Per-save state: list of [instance, assigned_id], cleared at save start.
 ::__gekko_state._seen     <- null;
 ::__gekko_state._next_id  <- 1;
+::__gekko_state._cnt_log  <- 30;   // [M4-cntdiag] quota for the actor-count restore log
 
 // Per-load state: saved-id -> live-instance (filled during apply).
 ::__gekko_state._live_by_id <- null;
@@ -117,7 +132,24 @@
         foreach (k, _ in v) keys.append(k);
         keys.sort();
         local s = "t" + v.len() + ":{";
-        foreach (k in keys) s += ::__gekko_state.ser(k) + ::__gekko_state.ser(v[k]);
+        foreach (k in keys) {
+            // [M4] In NESTED tables (depth > 0 — inside an actor's property /
+            // snapshot / _set-dispatch tables) honor _skip_keys: the same
+            // cosmetic/forward-only fields (count, device_id, ...) recur there and
+            // load_into skips them on read anyway. Depth 0 is the ROOT ::battle
+            // table, whose count/state/etc. ARE sim state and are never skipped.
+            // [M4] Honor _skip_keys in tables too — the cosmetic/forward-only
+            // fields (count, ...) recur inside actor property/snapshot/clone
+            // tables (reached via all-table paths, so instance-depth tracking
+            // doesn't see them). The root ::battle.count is deterministic (never
+            // diverges) and the engine restores it via engine_snap .data, so
+            // dropping its structural copy is safe. load_into skips these on read.
+            if (k in ::__gekko_state._skip_keys) {
+                s += ::__gekko_state.ser(k) + "?;";
+                continue;
+            }
+            s += ::__gekko_state.ser(k) + ::__gekko_state.ser(v[k]);
+        }
         return s + "}";
     }
     if (t == "weakref") {

@@ -386,7 +386,15 @@ static bool raw_is_skip_key(const SqString* s) {
     const char* k = s->val;
     return (n == 9 && memcmp(k, "device_id", 9) == 0)
         || (n == 5 && memcmp(k, "input", 5) == 0)
-        || (n == 9 && memcmp(k, "last_snap", 9) == 0);
+        || (n == 9 && memcmp(k, "last_snap", 9) == 0)
+        // [M4] cosmetic / forward-only render state: `count` is a per-object
+        // animation counter that drifts with engine-frame re-execution (not sim
+        // state; the sim-critical root ::battle.count rides engine_snap .data).
+        // __setTable/_staticTable are the actor class's _set-dispatch + static
+        // property tables (setter functions + duplicate cosmetic values).
+        || (n == 5  && memcmp(k, "count", 5) == 0)
+        || (n == 10 && memcmp(k, "__setTable", 10) == 0)
+        || (n == 12 && memcmp(k, "_staticTable", 12) == 0);
 }
 
 static void raw_emit_string(std::string& out, const SqString* s) {
@@ -441,6 +449,10 @@ static void raw_ser_table(RawSer& c, const SqTable* t) {
         if (kv.kind == 0)      { c.out += 'i'; raw_ser_append_int(c.out, kv.ki); c.out += ';'; }
         else if (kv.kind == 1) { raw_emit_string(c.out, kv.ks); }
         else                   { c.out += "n;"; }
+        // [M4] Honor skip-keys in TABLES too (not just instances) — the cosmetic
+        // fields recur inside actor property/snapshot/clone tables. Emit `?;` so
+        // load_into leaves the live slot alone (deser returns the skip sentinel).
+        if (kv.kind == 1 && raw_is_skip_key(kv.ks)) { c.out += "?;"; continue; }
         raw_ser(c, *kv.val);
     }
     c.out += '}';
@@ -1007,7 +1019,33 @@ static bool g_sq_save_enabled = true;
 // touches lives in one of those, so the restore is lossless and the
 // re-sim is bit-deterministic. OFF: the build falls back to the text
 // walker for restore (non-crashing, but lossy — only used for bring-up).
-static bool g_arena_rollback = true;
+//
+// [M4] The OFF path is the STRUCTURAL rollback (serialize only sim state via
+// save_battle/load_into + battle_pools + engine_snap + per-actor records; NO raw
+// arena memcpy). It's the root fix — it never rewinds render state, so plugins
+// (and th155's own render) stay forward-only. It's currently "lossy" (load_into
+// is in-place-only: no create/destroy, and sim state outside ::battle isn't
+// covered). M4 = complete it until the cross-peer checksum agrees, then delete
+// the raw path (M5). SQUIROLL_ARENA_ROLLBACK=0 runs it for development/measure.
+static bool init_arena_rollback() {
+    const char* e = getenv("SQUIROLL_ARENA_ROLLBACK");
+    return !(e && e[0] == '0');   // default ON (raw memcpy); =0 -> structural (M4 dev)
+}
+static bool g_arena_rollback = init_arena_rollback();
+
+// [M4] GekkoNet state-buffer size. Raw mode restores from snapshot_ring's own
+// ring (this buffer only holds the Trailer-2 checksum + frame ref), so 1MB is
+// ample. Structural mode restores FROM this buffer — it carries the text blob
+// (~175KB) + the full C++ sim sections (pools ~640KB, .data ~293KB, bullet,
+// input, rng), which overflows 1MB. Give structural mode room; keep raw at 1MB
+// so the default build's GekkoNet memory (state_size x ring) doesn't balloon.
+static uint32_t gekko_state_size() {
+    // Structural bumped to 16MB: bullet_arena's blob is ~7.6MB (physics heap) and
+    // rides Trailer 2 for now (Phase C: move it to a selective snapshot_ring
+    // dirty-page path so it isn't blob-copied every frame). Raw stays 1MB
+    // (snapshot_ring owns the real state there).
+    return (g_arena_rollback ? 1u : 16u) * 1024u * 1024u;
+}
 
 // input-recorder snapshot section (defined after inject_forced_inputs).
 static uint32_t input_rec_save(uint8_t* out, uint32_t cap);
@@ -1489,6 +1527,17 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
     *sq_len_field = sq_n;
     p += sq_n;
 
+    // [M4-diag] Dump the ::battle text blob (the structural-mode checksum source)
+    // for the first few frames, forward (rb=0) AND re-sim (rb>0), so a structural
+    // divergence can be byte-diffed offline: fwd f2 vs resim f2 shows the exact
+    // ::battle field load_into failed to restore. SQUIROLL_ARENA_ROLLBACK=0 only.
+    if (!g_arena_rollback && sq_n > 0 && frame <= 15) {
+        char _fn[64];
+        snprintf(_fn, sizeof _fn, "aocf_txt_f%u_rb%d.txt", frame, g_trace_rb);
+        FILE* _f = fopen(_fn, "wb");
+        if (_f) { fwrite(text_blob, 1, sq_n, _f); fclose(_f); }
+    }
+
     // Trailer 2: arena rollback snapshot — the real restorable state.
     // Three length-prefixed sections: sq_arena (Squirrel VM heap),
     // battle_pools (battle object pools) and engine_snap (the scheduler's
@@ -1500,7 +1549,13 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
     // desync checksum can skip it (see below). Empty span when rollback is off.
     uint8_t* cpp_sect_start = p;
     uint8_t* cpp_sect_end   = p;
-    if (g_arena_rollback) {
+    // [M4] Trailer 2 (the C++ sim sections) is written in BOTH modes now. In raw
+    // mode it's the whole restorable state; in structural mode (g_arena_rollback
+    // off) the C++ SIM sections (pools/engine/bullet + cpp/input) still ride here
+    // — only sq_arena is skipped, because sq is restored STRUCTURALLY from the
+    // text blob (Trailer 1). This lets structural mode restore the full C++
+    // engine state on proven serializers while isolating the sq load_into path.
+    {
         auto put_section = [&](const char* name, auto save_fn) -> bool {
             uint32_t off = (uint32_t)(p - static_cast<uint8_t*>(buf));
             if (off + 4 > cap) {
@@ -1531,7 +1586,9 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         // forward-vs-re-sim. We still SAVE + restore it (snapshot_ring) for visual
         // correctness, but EXCLUDE its bytes from the desync checksum below. Track
         // its span so the checksum can skip it.
-        bool ok = put_section("sq_arena",  &sq_arena::save);
+        // [M4] structural mode restores sq from the text blob, so skip its raw
+        // section (keeps Trailer 2 = the C++ sim sections only in that mode).
+        bool ok = g_arena_rollback ? put_section("sq_arena", &sq_arena::save) : true;
         uint8_t* bp_sect_start = p;
         ok = ok && put_section("pools",     &battle_pools::save);
         uint8_t* bp_sect_end = p;
@@ -1545,10 +1602,24 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         ok = ok && put_section("boostpools", &battle_pools::boostpool_save)
                && put_section("engine",    &engine_snap::save);
         cpp_sect_start = p;
-        ok = ok && put_section("cpp_arena", &cpp_arena::save);
+        // [M4] cpp_arena is the RENDER-object heap (>7MB used) — it can't be
+        // blob-snapshotted, and rewinding it is exactly what we're eliminating.
+        // Raw mode still captures it (dirty-page, for visual correctness); in
+        // structural mode SKIP it entirely — render stays forward-only, and its
+        // sim SATELLITES (AnimController std::vectors) get a structural serializer
+        // in Phase C. Restoring render here is both impossible (size) and wrong.
+        if (g_arena_rollback)
+            ok = ok && put_section("cpp_arena", &cpp_arena::save);
         cpp_sect_end = p;
         ok = ok && put_section("bullet",    &bullet_arena::save)
                 && put_section("input",     &input_rec_save);
+        // [M4] RNG rides a separate "restore-but-not-checksum" section that the
+        // raw path handles via snapshot_ring, NOT via Trailer 2. Append it to
+        // Trailer 2 ONLY in structural mode (where restore reads it below). The
+        // OFF checksum is the text blob, so this can't pollute the raw-path
+        // Trailer-2 checksum, and the raw path never reads it (order preserved).
+        if (!g_arena_rollback)
+            ok = ok && put_section("rng", &engine_snap::rng_save);
         if (!ok) {
             log_printf("[gekko_bridge] !! arena save overflow frame=%u — "
                        "bump GekkoConfig::state_size\n", frame);
@@ -1849,8 +1920,41 @@ void load_state_from_buf(const void* buf, uint32_t len) {
         return;
     }
 
-    // Text-walker restore path — lossy fallback, used only when arena
-    // rollback is off (bring-up / diagnostics).
+    // [M4] STRUCTURAL restore path (g_arena_rollback off). The C++ SIM state
+    // rides Trailer 2 as raw sections (sq_arena OMITTED — sq is restored
+    // structurally from the text blob below), in the SAME order the save side
+    // wrote them in structural mode: pools, boostpools, engine, cpp, bullet,
+    // input, rng. Restore them on the proven serializers first (so the re-sim
+    // runs from the correct C++ engine state), THEN apply the Squirrel ::battle
+    // tree structurally. (cpp_arena is restored raw here for now — Phase C will
+    // replace it with structural satellite serializers so render isn't rewound.)
+    {
+        const uint8_t* ap   = text_blob + text_len;
+        const uint8_t* aend = static_cast<const uint8_t*>(buf) + len;
+        auto get_section = [&](const char* name, auto load_fn) -> bool {
+            if (ap + 4 > aend) {
+                log_printf("[gekko_bridge] load(struct): %s truncated\n", name);
+                return false;
+            }
+            uint32_t slen = *(const uint32_t*)ap; ap += 4;
+            if (ap + slen > aend) {
+                log_printf("[gekko_bridge] load(struct): %s overrun (len=%u)\n",
+                           name, slen);
+                return false;
+            }
+            load_fn(ap, slen); ap += slen; return true;
+        };
+        // Order matches the structural-mode save (sq + cpp omitted): pools,
+        // boostpools, engine, bullet, input, rng.
+        if (get_section("pools",      &battle_pools::load) &&
+            get_section("boostpools", &battle_pools::boostpool_load) &&
+            get_section("engine",     &engine_snap::load) &&
+            get_section("bullet",     &bullet_arena::load) &&
+            get_section("input",      &input_rec_load))
+            get_section("rng",        &engine_snap::rng_load);
+    }
+
+    // Squirrel ::battle tree — structural restore (call_squirrel_load / load_into).
     if (text_len > 0 &&
         (size_t)(text_blob - static_cast<const uint8_t*>(buf)) + text_len <= len) {
         call_squirrel_load(text_blob, text_len, hdr->frame);
@@ -3020,7 +3124,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
     // the real state (dirty-page ring for the arenas, its own small-section
     // ring). 1 MB is generous headroom for the header / the legacy bring-up
     // path; it must match the cap passed to save_state_to_buf below.
-    config.state_size = 1 * 1024 * 1024;
+    config.state_size = gekko_state_size();
     config.max_spectators = 0;
     config.input_prediction_window = 10;
     config.num_players = 2;
@@ -3184,7 +3288,7 @@ bool init_solo() {
     GekkoConfig config = {};
     config.desync_detection = true;
     config.input_size = sizeof(uint16_t);
-    config.state_size = 1 * 1024 * 1024;   // see init() — snapshot_ring owns the state
+    config.state_size = gekko_state_size();   // see init() — snapshot_ring owns the state
     config.max_spectators = 0;
     config.num_players = 2;
     // Roll back check_distance frames every frame: the stress session
@@ -4091,7 +4195,7 @@ bool tick() {
                 LARGE_INTEGER _ts0; QueryPerformanceCounter(&_ts0);
                 uint32_t n = save_state_to_buf(
                     e->data.save.state,
-                    /*cap=*/ 1 * 1024 * 1024,   // must match GekkoConfig::state_size
+                    /*cap=*/ gekko_state_size(),   // must match GekkoConfig::state_size
                     &cs,
                     (uint32_t)e->data.save.frame
                 );
