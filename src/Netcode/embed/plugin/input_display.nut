@@ -165,12 +165,18 @@ class modifier extends modifier {
     }
 
     function Update() {
-        if (::network.IsPlaying()) {
-            list[::network.is_parent_vs.tointeger()].Update();
-        }else {
-            list[0].Update();
-            list[1].Update();
-        }
+        // Defensive: at round-end / match transitions on the rollback
+        // (auto_connect / real-flow) path a list entry can momentarily be
+        // absent — an uncaught throw here halts the game on the Squirrel
+        // exception break. Display-only; skip a frame rather than die.
+        try {
+            if (::network.IsPlaying()) {
+                list[::network.is_parent_vs.tointeger()].Update();
+            }else {
+                list[0].Update();
+                list[1].Update();
+            }
+        } catch (_e) {}
     }
 
     function Release() {
