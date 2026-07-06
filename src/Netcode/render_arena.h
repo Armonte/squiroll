@@ -35,6 +35,12 @@ namespace render_arena {
 void  init();
 bool  ready();
 
+// Install the th155 UI-allocation hooks (Manbow::String glyph vector +
+// Act::BitmapFontResource clone) that bracket those allocations in the scope so
+// UI text render memory is never snapshotted. Call once after init(), with the
+// th155 image loaded. See render_arena.cpp / task #30.
+void  install_ui_hooks();
+
 // Allocator. alloc returns 8-aligned memory; free/realloc accept only pointers
 // this arena handed out (guard with owns()). owns() is a fast range check.
 void* alloc(size_t n);

@@ -47,14 +47,10 @@ class modifier extends modifier {
 		// Render on the UI slot at a high layer (60000, same as the network
 		// name/text overlays) so we draw ON TOP of the game HUD — the old
 		// status/layer-1 put us behind it (game HUD icons sit at status ~3000).
-		// [#28] INERT (crash-free) pending the full rollback-safe HUD. Two halves
-		// remain, both deeper than the render_arena scope reaches: (1) glyph churn
-		// — th155's UI glyph/vertex data is NOT allocated via cpp_arena's
-		// operator-new (the render_arena scope diverts 0 bytes around the whole
-		// front-render pass), so it lives in a th155 UI/tf4 allocator still to be
-		// identified + routed; (2) the ConnectRenderSlot connection into th155's
-		// rolled-back signal list needs the squiroll-owned slot. Re-enable via
-		// ::rollback.hud once both land.
+		// [#30] INERT (crash-free) while the rollback-safe HUD lands. render_arena
+		// now routes the String glyph vector (0x67270) + the D3D11VertexBuffer
+		// render-pool slabs (0x37C30/0x356A0) off the snapshot; a remaining
+		// pre-existing-slab case + the squiroll-owned slot are in progress.
 		for (local i = 0; i < 0; ++i) {}
 	}
 

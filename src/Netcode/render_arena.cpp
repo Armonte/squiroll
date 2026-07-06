@@ -9,10 +9,12 @@
 
 #include "render_arena.h"
 
+#include <safetyhook.hpp>
 #include <windows.h>
 #include <string.h>
 
 #include "log.h"
+#include "util.h"          // _R literal + thiscall
 
 namespace render_arena {
 
@@ -122,7 +124,6 @@ void* alloc(size_t n) {
     EnterCriticalSection(&g_cs);
     void* r = alloc_locked(n);
     LeaveCriticalSection(&g_cs);
-    static int d = 24; if (d > 0) { --d; log_printf("[render_arena] alloc n=%zu -> %p (live=%zu)\n", n, r, g_live); }
     return r;
 }
 
@@ -159,14 +160,78 @@ void* realloc(void* p, size_t n) {
     return np;
 }
 
-void enter() {
-    ++g_scope_depth;
-    static int d = 8; if (d > 0) { --d; log_printf("[render_arena] enter depth=%d live=%zu\n", g_scope_depth, g_live); }
-}
+void enter() { ++g_scope_depth; }
 void leave() { if (g_scope_depth > 0) --g_scope_depth; }
 bool in_scope() { return g_scope_depth > 0; }
 
 size_t bytes_live()     { return g_live; }
 size_t bytes_capacity() { return CAP; }
+
+// ---------------------------------------------------------------------------
+// UI glyph / BitmapFontResource allocation pinning (task #30, RE by agent).
+//
+// th155's UI text (Manbow::String / UI.Core.Text) builds its glyph-vertex
+// buffer and its Act::BitmapFontResource through operator new during the
+// Squirrel .Set()/.ConnectRenderSlot() phase (allocate-on-growth-then-cached,
+// so steady-state frames allocate nothing — which is why bracketing the render
+// PASS diverted zero bytes). While a match is armed those allocations land in
+// the snapshotted arenas; a rollback then rewinds them out from under the async
+// D3D driver -> nvwgf2um exec-at-heap. A Manbow::String connected to a render
+// slot has TWO forward-only render allocations the driver's draw path touches:
+//   (1) its glyph-vertex CPU vector (String+276), grown via
+//       String__glyph_vertex_vector_reserve (0x67270) -> operator new; and
+//   (2) the TF4::D3D11VertexBuffer control block (String+288) the render closure
+//       builds, carved from the g_pool_D3D11VertexBuffer_freelist render pool
+//       (0x49B310), whose slabs grow from a snapshotted tf4 mspace via
+//       TF4::MeshVertex::PoolAlloc (0x356A0) — NOT operator new. (2) is the
+//       object the driver dereferences; its rewound refcount-vtable/type ptr is
+//       the crash (confirmed: the 0x67270/operator-new hooks alone don't stop it).
+// (1) rides the operator-new scope; (2) needs the render pool's slab carved from
+// render_arena. Both render pools (0x49B310 + sibling 0x49B2D0) are 100%
+// render-forward-only (engine_snap already excludes their heads). All addresses
+// are raw RVAs (IDB base 0).
+static SafetyHookInline g_h_glyph_reserve{};
+static SafetyHookInline g_h_beginstream{};
+static SafetyHookInline g_h_poolalloc{};
+
+// Set (render thread) while growing a render vertex-buffer pool, so the shared
+// mspace leaf carves that one slab from render_arena instead.
+static thread_local bool g_route_vbpool = false;
+
+// String glyph-vertex CPU buffer (operator new) -> render_arena.
+static void* thiscall glyph_reserve_hook(int self, unsigned int new_capacity) {
+    Scope s;
+    return g_h_glyph_reserve.unsafe_thiscall<void*>(self, new_capacity);
+}
+// Manbow::NetworkNode::BeginStreaming (0x37C30) grows a pool by one slab. For a
+// render vertex-buffer pool, flag the internal mspace alloc for redirection.
+static void* thiscall begin_streaming_hook(int self) {
+    bool prev = g_route_vbpool;
+    uint32_t p = (uint32_t)self;
+    if (p == (uint32_t)(0x49B310_R) || p == (uint32_t)(0x49B2D0_R))
+        g_route_vbpool = true;
+    void* r = g_h_beginstream.unsafe_thiscall<void*>(self);
+    g_route_vbpool = prev;
+    return r;
+}
+// TF4::MeshVertex::PoolAlloc (0x356A0, fastcall) — shared tf4 mspace leaf. While
+// growing a render pool, carve the slab from render_arena (never snapshotted).
+static void* fastcall poolalloc_hook(unsigned int* pool, unsigned int size) {
+    if (g_route_vbpool) {
+        void* p = alloc(size);
+        if (p) return p;   // OOM -> fall through to the real mspace
+    }
+    return g_h_poolalloc.unsafe_fastcall<void*>(pool, size);
+}
+
+void install_ui_hooks() {
+    if (!g_base) return;   // region must be reserved first (init())
+    g_h_glyph_reserve = safetyhook::create_inline((void*)(0x67270_R), (void*)glyph_reserve_hook);
+    g_h_beginstream   = safetyhook::create_inline((void*)(0x37C30_R), (void*)begin_streaming_hook);
+    g_h_poolalloc     = safetyhook::create_inline((void*)(0x356A0_R), (void*)poolalloc_hook);
+    log_printf("[render_arena] UI render hooks installed: glyph=%d beginstream=%d "
+               "poolalloc=%d\n", (int)(bool)g_h_glyph_reserve,
+               (int)(bool)g_h_beginstream, (int)(bool)g_h_poolalloc);
+}
 
 } // namespace render_arena

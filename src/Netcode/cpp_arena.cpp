@@ -1139,7 +1139,8 @@ static void __stdcall det_getlocaltime(unsigned short* st) {
 void install() {
     if (g_installed) return;
 
-    render_arena::init();   // NON-snapshotted region for plugin UI (see render_arena.h)
+    render_arena::init();          // NON-snapshotted region for plugin UI (see render_arena.h)
+    render_arena::install_ui_hooks();  // route th155 UI glyph/BFR allocs off the snapshot
 
     {   // SQUIROLL_FLATTEN_JOBS=1 -> run cJobThread jobs inline (deterministic order)
         char fb[8] = {0};
