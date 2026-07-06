@@ -69,6 +69,11 @@ void shutdown();
 bool is_active();
 bool menu_mash_active();          // session exists; UDP poll runs in background
 bool is_session_started(); // GekkoSessionStarted fired; tick() owns the frame
+// True when a DUAL (2-peer) gekko session owns input replay via the recorder
+// queue + reader rebind. input_global_sync's capture-replay MUST stand down
+// then: on a mispredicted rolling peer it would restore the forward-captured
+// (predicted, wrong) InputGlobal state over the corrected re-sim decode.
+bool dual_input_owned();
 
 // Per-frame entry. Returns true if the visible frame was advanced.
 // Pre-SessionStarted: drains network/session events only — engine runs

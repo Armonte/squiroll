@@ -11,6 +11,7 @@
 #include "util.h"          // thiscall
 #include "crash_handler.h" // watchpoint_arm — hunt the InputGlobal+4 writer
 #include "log.h"
+#include "gekko_bridge.h"  // dual_input_owned — stand down during dual netplay
 
 // gekko_bridge.cpp publishes these (sq_trace pattern).
 namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; extern int g_trace_depth; }
@@ -145,6 +146,15 @@ static unsigned thiscall hook(int* this_ptr, int stack_arg) {
     int f  = gekko_bridge::g_trace_frame;
     int rb = gekko_bridge::g_trace_rb;
 
+    // DUAL netplay: the recorder queue + reader rebind already make the input
+    // decode deterministic across re-sims (from the CORRECTED input). This
+    // capture-replay would instead restore the forward-captured PREDICTED
+    // (mispredicted) InputGlobal over the correct re-sim decode -> the
+    // one-counter sustained desync. Stand down entirely.
+    if (gekko_bridge::dual_input_owned()) {
+        return g_h.unsafe_thiscall<unsigned>(this_ptr, stack_arg);
+    }
+
     if (f < 0 || !this_ptr) {
         return g_h.unsafe_thiscall<unsigned>(this_ptr, stack_arg);
     }
@@ -200,6 +210,9 @@ static int thiscall hook_multi(int* this_ptr) {
     int r = g_h_multi.unsafe_thiscall<int>(this_ptr);   // poll + write this+4..36
     int f  = gekko_bridge::g_trace_frame;
     int rb = gekko_bridge::g_trace_rb;
+    // DUAL netplay: stand down (see hook() above — same clobber mechanism).
+    if (gekko_bridge::dual_input_owned())
+        return r;
     if (f >= 0 && this_ptr) {
         uint8_t* state = (uint8_t*)(uintptr_t)((uint32_t)(uintptr_t)this_ptr + 4);
         if (rb == 0) {

@@ -177,10 +177,37 @@ static LONG CALLBACK vw_veh(EXCEPTION_POINTERS* ep) {
     if ((vw_rb || (now != 0 && gekko_bridge::g_trace_frame <= 30)) &&
         g_vw_hits < 2000) {
         ++g_vw_hits;
-        log_printf("[velwatch] %08X <- val=%08X rva=%08X f=%d rb=%d d=%d\n",
+        // On a ZERO write (the re-sim resetter), walk the stack for return
+        // addresses so the CALLER of the bare memcpy is named. In-image
+        // (<0x400000 rva) callers = game code; Netcode.dll callers show as
+        // module-relative via the addrmap.
+        char sk[256]; int sn = 0;
+        if (now == 0) {
+            uint32_t* sp = (uint32_t*)(uintptr_t)c->Esp;
+            for (int k = 0; k < 32 && sn < 200; ++k) {
+                uint32_t v = sp[k];
+                // in-image code (game) or Netcode.dll code (0x53xxxxxx-ish)
+                bool inimg = (v >= 0x401000 && v < 0x800000);
+                bool ndll  = (v >= 0x50000000 && v < 0x60000000);
+                if (inimg)
+                    sn += wsprintfA(sk + sn, " g:%X", v - (uint32_t)base_address);
+                else if (ndll) {
+                    static uintptr_t nbase = 0;
+                    if (!nbase) {
+                        HMODULE hm = GetModuleHandleW(L"Netcode.dll");
+                        nbase = (uintptr_t)hm;
+                    }
+                    if (nbase && v >= nbase)
+                        sn += wsprintfA(sk + sn, " N+%X", v - (uint32_t)nbase);
+                    else
+                        sn += wsprintfA(sk + sn, " n:%X", v);
+                }
+            }
+        }
+        log_printf("[velwatch] %08X <- val=%08X rva=%08X f=%d rb=%d d=%d%s\n",
                    g_vw_addr, now, (uint32_t)(c->Eip - base_address),
                    gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
-                   gekko_bridge::g_trace_depth);
+                   gekko_bridge::g_trace_depth, now == 0 ? sk : "");
     }
     return EXCEPTION_CONTINUE_EXECUTION;
 }

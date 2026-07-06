@@ -493,10 +493,12 @@ static unsigned int __fastcall pop_tap(void* self, void* /*edx*/,
     int*      st  = state_ptr_ptr ? *state_ptr_ptr : nullptr;
     unsigned int r = ((pop_fn_t)(uintptr_t)g_tap_orig)(self, state_ptr_ptr);
     uint32_t  ri2 = *(uint32_t*)(q + 4);
-    if (g_trace_rb || g_trace_frame <= 8) {   // re-sims + early window
-        static int quota = 600;
-        if (quota > 0) {
-            --quota;
+    // rb frames: ALWAYS log (the 600-line lifetime quota ran out before
+    // late splits — the one blind spot). Forward: early window only.
+    if (g_trace_rb || g_trace_frame <= 8) {
+        static int fwd_quota = 40;
+        bool ok = g_trace_rb ? true : (fwd_quota-- > 0);
+        if (ok) {
             log_printf("[pop] f=%d rb=%d q=%p ri=%u wi=%u v=0x%04x st=%p "
                        "consumed=%d y'=%d\n",
                        g_trace_frame, g_trace_rb, (void*)q, ri, wi, v,
@@ -1215,17 +1217,29 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
             LARGE_INTEGER b; QueryPerformanceCounter(&b);
             return (uint64_t)(b.QuadPart - a.QuadPart);
         };
+        // [secbr] section bracket: P1's y counter after each serializer —
+        // names the section whose code path ZEROES the live InputGlobal
+        // during re-sim saves (velwatch: pop writes 1, then 4x memcpy'd
+        // zeros before the next advance, EIP = CRT memcpy).
+        #define SECBR(tag) do { if (g_ig_probe2 && g_trace_rb) \
+            log_printf("[secbr] f=%u rb=%d " tag " p1y=%d\n", \
+                       frame, g_trace_rb, g_ig_probe2[2]); } while (0)
+        SECBR("pre-bp   ");
         ps_bp += timed(&battle_pools::save);
+        SECBR("post-bp  ");
         // DESYNC BYTE-DIFF STASH (the ACTIVE save path — the put_section chain
         // below is the non-snapshot_ring fallback): first section == bp, bytes
         // at smb+4 with the u32 length at smb. Kept per frame for both
         // timelines; desync-abort writes the diverging frame's pair to disk.
         if (ok) bp_stash(frame, g_trace_rb, smb + 4, *(uint32_t*)smb);
         ps_mp  += timed(&battle_pools::boostpool_save);   // Sqrat math boost::pools
+        SECBR("post-mp  ");
         uint8_t* eng_sect_start = sp;                       // [len][bytes] for eng
         ps_eng += timed(&engine_snap::save);
+        SECBR("post-eng ");
         if (ok) eng_stash(frame, g_trace_rb, eng_sect_start + 4, *(uint32_t*)eng_sect_start);
         ps_ir  += timed(&input_rec_save);
+        SECBR("post-irec");
         ps_ih  += timed(&input_hist::save);
         if (++ps_n >= 240) {
             LARGE_INTEGER fr; QueryPerformanceFrequency(&fr); uint64_t hz = fr.QuadPart;
@@ -1274,8 +1288,10 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
             log_printf("[sblob] f=%u%s\n", frame, comps);
         }
         LARGE_INTEGER _c1; QueryPerformanceCounter(&_c1);
+        SECBR("pre-cap  ");
         uint32_t cs = snapshot_ring::capture(frame, smb,
                                              (uint32_t)(sp - smb), rng_tail);
+        SECBR("post-cap ");
         // CROSS-PEER sblob dump (frames 0-2, first save each): the WHOLE
         // checksummed small blob (bp/mp/eng/irec/ihist/rng sections). `cmp -l
         // smb_p0_fN.bin smb_p1_fN.bin` gives the exact diverging byte offset;
@@ -2941,6 +2957,9 @@ bool init(uint16_t local_port, uint16_t remote_port,
                (void*)&input_rec_save, (void*)&input_rec_load,
                (void*)&battle_pools::save, (void*)&battle_pools::load,
                (void*)&engine_snap::save, (void*)&engine_snap::load);
+    log_printf("[addrmap2] save_state=%p load_state=%p nbase=%p\n",
+               (void*)&save_state_to_buf, (void*)&load_state_from_buf,
+               (void*)GetModuleHandleW(L"Netcode.dll"));
 
     g_active = true;
     // Deferred release is OFF for the arena-rollback path. It no-ops
@@ -3280,6 +3299,28 @@ static int thiscall condrange_hook(void** self, uint32_t* info, int counters) {
 // silence => input_talk isn't pumped at the win quote.
 static SafetyHookInline g_h_isu{};
 static int thiscall inputsingle_update_hook(int self) {
+    // [isucnt] rb-window call counter for the two VISIBLE player devices:
+    // if Update runs MORE THAN ONCE for the same object in one re-sim
+    // frame, the second call's consume shape is the residual one-counter
+    // desync (first call pops the injected value; a second call would...
+    // be empty-guarded for the pop but may still run other side effects).
+    if (g_trace_rb && !g_solo &&
+        ((uint32_t)self == (uint32_t)(uintptr_t)g_ig_probe ||
+         (uint32_t)self == (uint32_t)(uintptr_t)g_ig_probe2)) {
+        static int      last_f[2]  = {-1, -1};
+        static int      cnt[2]     = {0, 0};
+        int idx = ((uint32_t)self == (uint32_t)(uintptr_t)g_ig_probe) ? 0 : 1;
+        if (last_f[idx] != g_trace_frame) { last_f[idx] = g_trace_frame; cnt[idx] = 0; }
+        ++cnt[idx];
+        if (cnt[idx] > 1) {
+            static int q = 200;
+            if (q > 0) { --q;
+                log_printf("[isucnt] f=%d rb=%d obj=%d Update call #%d "
+                           "IN ONE FRAME\n",
+                           g_trace_frame, g_trace_rb, idx, cnt[idx]);
+            }
+        }
+    }
     int r = g_h_isu.unsafe_thiscall<int>(self);
     if (menu_mash_active()) {
         int dev = *(int*)(uintptr_t)(self + 232);
@@ -3376,6 +3417,14 @@ static void install_menu_mash_hook() {
     g_h_condrange = safetyhook::create_inline((void*)(0x6A720_R), (void*)condrange_hook);
     g_h_isu = safetyhook::create_inline((void*)(0x168510_R), (void*)inputsingle_update_hook);
     g_h_imu = safetyhook::create_inline((void*)(0x6F360_R), (void*)inputmulti_update_hook);
+    log_printf("[addrmap3] nbase=%p isu_hook=N+%X imu_hook=N+%X advance=N+%X\n",
+               (void*)GetModuleHandleW(L"Netcode.dll"),
+               (uint32_t)((uintptr_t)&inputsingle_update_hook
+                          - (uintptr_t)GetModuleHandleW(L"Netcode.dll")),
+               (uint32_t)((uintptr_t)&inputmulti_update_hook
+                          - (uintptr_t)GetModuleHandleW(L"Netcode.dll")),
+               (uint32_t)((uintptr_t)&advance_one_frame
+                          - (uintptr_t)GetModuleHandleW(L"Netcode.dll")));
     log_printf("[gekko_bridge] menu-mash keyboard hook @0x3B850 %s, IsKeyDown @0x697F0 %s, "
                "hold-counter @0x6A720 %s\n",
                g_h_kbd_poll.enabled() ? "OK" : "FAIL",
@@ -3421,6 +3470,7 @@ void shutdown() {
 
 bool is_active()         { return g_active; }
 bool is_session_started(){ return g_session_started; }
+bool dual_input_owned()  { return g_active && !g_solo; }
 
 // Round-end disarm. The interactive fight is exactly battle.state == 8
 // (the engine's own damage code gates on `state != 8`); the round-start
