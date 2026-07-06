@@ -405,6 +405,16 @@ static void thiscall runone_hook(int self) {
     // NOT from its own advance — so excluding 0x49B01C is correct and safe.
     bool sim_api = ((uint32_t)self == *(uint32_t*)(0x49B01C_R));
     bool gl_api  = ((uint32_t)self == *(uint32_t*)(0x49AFBC_R));
+    // [#28] g_render_front_scriptapi (0x49B02C) = th155's FRONT-render dispatch
+    // (Manbow__RenderFrontPass_lookup @0x56710, fired from window_render). It is
+    // RENDER-ONLY / forward-frame-only (skipped in re-sims), so everything it
+    // allocates — every UI glyph/vertex buffer for th155's HUD AND any plugin
+    // UI.Core.Text — is forward-only render output that must NOT be snapshotted:
+    // the rollback rewinding it out from under the driver's async processing is
+    // the nvwgf2um exec-at-heap crash. Route the whole front-render pass into the
+    // non-snapshotted render_arena. (The plugin-connection half is handled by the
+    // squiroll-owned slot; this fixes the glyph-churn half for ALL UI.)
+    bool front_api = ((uint32_t)self == *(uint32_t*)(0x49B02C_R));
     DWORD tid = GetCurrentThreadId();
     if (gl_api) g_gameloop_tid = tid;
     else if (!sim_api) g_bg_tid = tid;   // background ScriptAPI thread
@@ -425,7 +435,9 @@ static void thiscall runone_hook(int self) {
         g_rbcs_owner_tid = tid;
         g_rbcs_owner_label = gl_api ? "gameloop-runone" : "bg-runone";
     }
+    if (front_api) render_arena::enter();   // front-render allocs -> non-snapshotted
     g_h_runone.unsafe_thiscall<int>(self);
+    if (front_api) render_arena::leave();
     if (gl_api) snapshot_ring::gl_capture();
     if (take_lock) {
         g_rbcs_owner_tid = 0; g_rbcs_owner_label = "";

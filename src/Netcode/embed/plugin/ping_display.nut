@@ -47,16 +47,14 @@ class modifier extends modifier {
 		// Render on the UI slot at a high layer (60000, same as the network
 		// name/text overlays) so we draw ON TOP of the game HUD — the old
 		// status/layer-1 put us behind it (game HUD icons sit at status ~3000).
-		// [#28] INERT (crash-free) pending the squiroll-owned render slot.
-		// PROVEN this session: any plugin UI.Core.Text + ConnectRenderSlot into
-		// th155's game render slot crashes under rollback — its connection lives
-		// in th155's rolled-back, sim-rebuilt signal list but the plugin's
-		// connection is forward-only (never re-inserted by the re-sim), so the
-		// dispatch walks a stale list -> NULL call; and per-frame Text.Set glyph
-		// churn collides with the re-sim -> nvwgf2um driver crash. The fix is a
-		// squiroll-owned render slot (list in render_arena, fired from squiroll's
-		// own pass, outside th155's dispatch) that plugins connect to instead.
-		// Re-enable via that slot once it exists (segs loop -> ::rollback.hud).
+		// [#28] INERT (crash-free) pending the full rollback-safe HUD. Two halves
+		// remain, both deeper than the render_arena scope reaches: (1) glyph churn
+		// — th155's UI glyph/vertex data is NOT allocated via cpp_arena's
+		// operator-new (the render_arena scope diverts 0 bytes around the whole
+		// front-render pass), so it lives in a th155 UI/tf4 allocator still to be
+		// identified + routed; (2) the ConnectRenderSlot connection into th155's
+		// rolled-back signal list needs the squiroll-owned slot. Re-enable via
+		// ::rollback.hud once both land.
 		for (local i = 0; i < 0; ++i) {}
 	}
 
@@ -80,12 +78,7 @@ class modifier extends modifier {
 	}
 
 	function Update() {
-		// [#28 GAP TEST] STATIC HUD: Update is a NO-OP. Objects were created +
-		// set once in the constructor and are never mutated per frame. Flip
-		// this back on (remove the return) to compare against the churning HUD.
-		return;
 		if (segs.len() == 0) return;
-		::__render_unsnap_enter();
 		try {
 			local s = ("__gekko_netstats" in ::getroottable())
 				? ::__gekko_netstats() : null;
@@ -148,7 +141,6 @@ class modifier extends modifier {
 				x += widths[i] + gap;
 			}
 		} catch (_e) {}
-		::__render_unsnap_leave();
 	}
 
 	function Enabled(param) {
