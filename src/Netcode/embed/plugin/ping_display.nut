@@ -30,6 +30,8 @@ class modifier extends modifier {
 		ahead  = [0.76, 0.58, 0.98]  // Patchouli lavender
 		rb     = [1.00, 0.50, 0.66]  // Reimu pink — the star stat
 		frame  = [0.90, 0.92, 0.97]  // soft white
+		fps_good = [0.45, 0.94, 0.58]  // render fps at/near 60
+		fps_bad  = [1.00, 0.60, 0.30]  // render fps dropping
 		ok     = [0.45, 0.94, 0.58]  // sync green
 		bad    = [0.98, 0.26, 0.32]  // desync red
 	};
@@ -82,6 +84,10 @@ class modifier extends modifier {
 				local pcol = (pv > cfg.bad_threshold) ? COL.ping_bad
 					: (pv > cfg.good_threshold) ? COL.ping_ok : COL.ping_good;
 
+				// sim/render fps: sim is the pinned deterministic 60, render
+				// is the real presented rate (dips under load).
+				local fpscol = (s.rfps >= 58) ? COL.fps_good : COL.fps_bad;
+				parts.append([s.simfps + "/" + s.rfps + "fps", fpscol]);
 				parts.append(["dly" + s.delay, COL.delay]);
 				parts.append([pv + "ms", pcol]);
 				parts.append(["j" + f1(s.jitter), COL.jitter]);

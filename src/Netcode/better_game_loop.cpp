@@ -84,6 +84,7 @@ uint32_t current_fps = 60;   // what GetFPS() returns — pinned to 60 for deter
 uint32_t measured_fps = 0;   // real measured rate, for display/diagnostics only
 uint32_t sim_get_fps() { return current_fps; }
 void     sim_set_fps(uint32_t v) { current_fps = v; }
+uint32_t render_fps()  { return measured_fps; }
 
 // Monotonic real-frame counter, bumped once per better_game_loop iteration
 // (i.e. once per real displayed frame, in EVERY branch incl. the vanilla

@@ -10,6 +10,9 @@ void init_better_game_loop();
 // the same dt as the original forward pass. See better_game_loop.cpp.
 uint32_t sim_get_fps();
 void     sim_set_fps(uint32_t v);
+// The REAL measured render/present rate (frames actually presented last
+// second) — distinct from the pinned 60 the sim always runs at. For the HUD.
+uint32_t render_fps();
 // Monotonic per-real-frame counter (see better_game_loop.cpp).
 uint32_t sim_real_frame();
 

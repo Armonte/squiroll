@@ -806,6 +806,13 @@ static SQInteger gekko_netstats(HSQUIRRELVM vm) {
     sq_setinteger(vm, _SC("desync"),   (SQInteger)g_desync_total);
     sq_setinteger(vm, _SC("delay"),    (SQInteger)g_local_delay);
     sq_setinteger(vm, _SC("runahead"), (SQInteger)g_runahead);
+    // sim fps is ALWAYS the pinned deterministic 60 (GetFPS is frozen to 60
+    // for rollback determinism); render fps is the real presented rate, which
+    // drops under heavy rollback bursts / the ~8.7ms save. Showing both makes
+    // the "not hitting 60" visible + correct: sim stays 60, render is the
+    // number that dips.
+    sq_setinteger(vm, _SC("simfps"),   (SQInteger)60);
+    sq_setinteger(vm, _SC("rfps"),     (SQInteger)render_fps());
     return 1;  // table left on top
 }
 
