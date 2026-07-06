@@ -466,6 +466,40 @@ static void**   g_reader_fab     = nullptr;
 static uint8_t* g_reader_fix_obj = nullptr;
 static void**   g_reader_fab2     = nullptr;  // anchor's replacement
 static uint8_t* g_reader_fix_obj2 = nullptr;  // anchor object
+
+// POP TAP — surgical per-pop attribution. Our fabricated readers get a
+// COPY of the lambda vtable with the invoke slot (+8, index 2) replaced by
+// pop_tap, which records (queue, ri, wi, vec[ri], state target) BEFORE
+// tail-calling the real queue_pop and (consumed delta, y-after) — the
+// exact value the decode consumed and where it landed, per pop, forward
+// AND re-sim. Decides the "first re-advance applies the pre-inject value"
+// mystery: v=corrected at pop time => the decode/target is suspect;
+// v=stale => something rewrote the slot after inject.
+static void*    g_tap_vt[4]  = {nullptr, nullptr, nullptr, nullptr};
+static uint32_t g_tap_orig   = 0;
+typedef unsigned int (__thiscall* pop_fn_t)(void* self, int** state_ptr_ptr);
+static unsigned int __fastcall pop_tap(void* self, void* /*edx*/,
+                                       int** state_ptr_ptr) {
+    uint8_t*  q   = (uint8_t*)((void**)self)[1];
+    uint32_t  wi  = *(uint32_t*)q;
+    uint32_t  ri  = *(uint32_t*)(q + 4);
+    uint16_t* vec = *(uint16_t**)(q + 0x10);
+    uint16_t  v   = (vec && ri < wi) ? vec[ri] : 0xFFFF;
+    int*      st  = state_ptr_ptr ? *state_ptr_ptr : nullptr;
+    unsigned int r = ((pop_fn_t)(uintptr_t)g_tap_orig)(self, state_ptr_ptr);
+    uint32_t  ri2 = *(uint32_t*)(q + 4);
+    if (g_trace_rb || g_trace_frame <= 8) {   // re-sims + early window
+        static int quota = 600;
+        if (quota > 0) {
+            --quota;
+            log_printf("[pop] f=%d rb=%d q=%p ri=%u wi=%u v=0x%04x st=%p "
+                       "consumed=%d y'=%d\n",
+                       g_trace_frame, g_trace_rb, (void*)q, ri, wi, v,
+                       (void*)st, (int)(ri2 - ri), st ? st[1] : -999);
+        }
+    }
+    return r;
+}
 // Squirrel 3.0.6 SQInstance: ..., _class @0x1C, _userpointer @0x20, _hook,
 // _memsize, _values @0x2C — matches the SqInstance mirror above.
 static inline void* sq_inst_userptr(const SqInstance* inst) {
@@ -1276,6 +1310,15 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                 sqscratch = (uint8_t*)VirtualAlloc(nullptr, SQSCRATCH,
                                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (sqscratch) {
+                // [igxs] save-time sample (rb-saves only): the InputGlobal
+                // counters AS THE TEXT WALK WILL SEE THEM. Bracketed against
+                // POST-run/POST-act, this pins the window where a counter
+                // reset lands between the pop and the save.
+                if (g_ig_probe && g_trace_rb)
+                    log_printf("[igxs] f=%u rb=%d SAVE-time p0(x=%d y=%d "
+                               "b1=%d b2=%d b3=%d)\n",
+                               frame, g_trace_rb, g_ig_probe[1], g_ig_probe[2],
+                               g_ig_probe[3], g_ig_probe[4], g_ig_probe[5]);
                 uint32_t sqn = call_squirrel_save(sqscratch, SQSCRATCH, frame);
                 final_cs = fletcher32(sqscratch, sqn);
                 if (frame <= 5 && g_trace_rb == 0)
@@ -1982,6 +2025,25 @@ static void inject_forced_inputs_into_recorder() {
         }
         dev->input_vec[ri] = forced_inputs[i];
         dev->input_write_idx = ri + 1;
+        // RE-SIM RAW-STATE SYNC (the f391-class split): a second, un-tapped
+        // reader decodes the visible InputGlobal from the RAW
+        // TF4InputDeviceState (not the queue). Forward, the vanilla playback
+        // keeps that state current; during a re-sim burst NOTHING updates it,
+        // so it re-applies the load-frame's input every re-simmed frame,
+        // overwriting the queue-pop's correct decode (tap-bracketed: pop
+        // applied 0x0028, POST-run showed the state re-ticked with the
+        // restored 0x0006). Write the forced input into the raw state on
+        // re-sim advances only (forward stays vanilla-fed). Bit → state
+        // mapping mirrors queue_pop: bit0 x--, bit1 x++, bit2 y--, bit3 y++,
+        // bit(4+i) -> buttons[i]; poll-side reads sign/nonzero.
+        if (g_trace_rb && dev->tf4_device) {
+            TF4InputDeviceState* ds = &dev->tf4_device->state;
+            uint16_t in = forced_inputs[i];
+            ds->x = (in & 1) ? -1 : ((in & 2) ? 1 : 0);
+            ds->y = (in & 4) ? -1 : ((in & 8) ? 1 : 0);
+            for (int b = 0; b < 12; ++b)
+                ds->buttons[b] = (uint32_t)((in >> (4 + b)) & 1);
+        }
     }
 }
 
@@ -2175,9 +2237,19 @@ void advance_one_frame() {
                 if (anchor_obj && fix_obj) {
                     void* other_dev = (anchor_dev == dev0) ? dev1 : dev0;
                     typedef void* (__cdecl* gm_t)(size_t);
+                    // Build the tapped vtable copy once: original
+                    // entries 0..3, invoke slot (index 2) -> pop_tap.
+                    if (!g_tap_vt[2] && anchor_reader[0]) {
+                        void** ovt = (void**)anchor_reader[0];
+                        for (int vi = 0; vi < 4; ++vi) g_tap_vt[vi] = ovt[vi];
+                        g_tap_orig  = (uint32_t)(uintptr_t)ovt[2];
+                        g_tap_vt[2] = (void*)&pop_tap;
+                        log_printf("[gekko_bridge] pop tap: orig invoke=%p\n",
+                                   (void*)(uintptr_t)g_tap_orig);
+                    }
                     fab = (void**)((gm_t)(0x306FBC_R))(2 * sizeof(void*));
                     if (fab) {
-                        fab[0] = anchor_reader[0];   // lambda vtable
+                        fab[0] = (void*)g_tap_vt;    // TAPPED vtable
                         fab[1] = other_dev;          // captured queue
                     }
                     // REBIND BOTH: the anchor's ORIGINAL lambda object lives
@@ -2190,8 +2262,32 @@ void advance_one_frame() {
                     g_reader_fab2     = (void**)((gm_t)(0x306FBC_R))(2 * sizeof(void*));
                     g_reader_fix_obj2 = anchor_obj;
                     if (g_reader_fab2) {
-                        g_reader_fab2[0] = anchor_reader[0];
+                        g_reader_fab2[0] = (void*)g_tap_vt;   // TAPPED
                         g_reader_fab2[1] = anchor_dev;
+                    }
+                    // IN-PLACE CONVERSION of the ORIGINAL reader objects:
+                    // the game invokes the old readers through a SECOND path
+                    // (the visible device is a multi with several children),
+                    // and the network-gated one kept overwriting the
+                    // InputGlobal with its own stale stream AFTER our fab's
+                    // correct pop (f2926: restored X=15 + one predicted
+                    // 0x0002 pop = X=16 in the re-save). Rewrite the old
+                    // objects' {vtbl, queue} to tapped recorder lambdas —
+                    // every consumer then reads the recorder; wi=ri+1 makes
+                    // any second pop hit the empty-guard (no double-apply).
+                    {
+                        void** orig_fix = *(void***)(fix_obj + 188);
+                        if (orig_fix) {
+                            orig_fix[0] = (void*)g_tap_vt;
+                            orig_fix[1] = other_dev;
+                        }
+                        if (anchor_reader) {
+                            anchor_reader[0] = (void*)g_tap_vt;
+                            anchor_reader[1] = anchor_dev;
+                        }
+                        log_printf("[gekko_bridge] original readers converted "
+                                   "in place: fix-old=%p anchor-old=%p\n",
+                                   (void*)orig_fix, (void*)anchor_reader);
                     }
                     log_printf("[gekko_bridge] reader rebind BOTH: anchor=%p"
                                " (dev %p) -> fab2{%p,%p}; fix=%p -> "
@@ -2399,17 +2495,19 @@ void advance_one_frame() {
     // the corrected input's pop ticks the counter during the re-advance.
     bool igx_on = g_ig_probe && !g_solo && (g_trace_frame <= 8 || g_trace_rb);
     if (igx_on)
-        log_printf("[igx] f=%d rb=%d PRE-run   p0(x=%d y=%d b1=%d) p1(x=%d y=%d b1=%d)\n",
+        log_printf("[igx] f=%d rb=%d PRE-run   p0(x=%d y=%d b1=%d b2=%d b3=%d) p1(x=%d y=%d b1=%d)\n",
                    g_trace_frame, g_trace_rb,
                    g_ig_probe[1], g_ig_probe[2], g_ig_probe[3],
+                   g_ig_probe[4], g_ig_probe[5],
                    g_ig_probe2 ? g_ig_probe2[1] : -1,
                    g_ig_probe2 ? g_ig_probe2[2] : -1,
                    g_ig_probe2 ? g_ig_probe2[3] : -1);
     update_related(*MAIN_SCRIPTAPI_PTR);                    // RunOneFrame(g_main), once
     if (igx_on)
-        log_printf("[igx] f=%d rb=%d POST-run  p0(x=%d y=%d b1=%d) p1(x=%d y=%d b1=%d)\n",
+        log_printf("[igx] f=%d rb=%d POST-run  p0(x=%d y=%d b1=%d b2=%d b3=%d) p1(x=%d y=%d b1=%d)\n",
                    g_trace_frame, g_trace_rb,
                    g_ig_probe[1], g_ig_probe[2], g_ig_probe[3],
+                   g_ig_probe[4], g_ig_probe[5],
                    g_ig_probe2 ? g_ig_probe2[1] : -1,
                    g_ig_probe2 ? g_ig_probe2[2] : -1,
                    g_ig_probe2 ? g_ig_probe2[3] : -1);
@@ -2419,9 +2517,10 @@ void advance_one_frame() {
     if (trace) log_printf("[gekko_bridge] advance: -> ScriptAPI::Update\n");
     Act_ScriptAPI_ptr->vftable->Update(Act_ScriptAPI_ptr);  // Act::ScriptAPI::Update
     if (igx_on)
-        log_printf("[igx] f=%d rb=%d POST-act  p0(x=%d y=%d b1=%d) p1(x=%d y=%d b1=%d)\n",
+        log_printf("[igx] f=%d rb=%d POST-act  p0(x=%d y=%d b1=%d b2=%d b3=%d) p1(x=%d y=%d b1=%d)\n",
                    g_trace_frame, g_trace_rb,
                    g_ig_probe[1], g_ig_probe[2], g_ig_probe[3],
+                   g_ig_probe[4], g_ig_probe[5],
                    g_ig_probe2 ? g_ig_probe2[1] : -1,
                    g_ig_probe2 ? g_ig_probe2[2] : -1,
                    g_ig_probe2 ? g_ig_probe2[3] : -1);
@@ -2749,15 +2848,9 @@ bool init(uint16_t local_port, uint16_t remote_port,
             // input_rec_load rewind. Any OTHER EIP = the vanilla netcode
             // touching the cursor between advances (the asymmetric input-
             // cadence desync class flagged by [icanom]).
-            if (local_player_idx < (int)rec->devices.size()) {
-                auto* ld = rec->devices[local_player_idx].get();
-                if (ld) {
-                    actor2d_log::watch_arm((uint32_t)(uintptr_t)&ld->input_read_idx);
-                    log_printf("[gekko_bridge] Dr0 armed on local dev[%d] "
-                               "read_idx @%p\n", local_player_idx,
-                               (void*)&ld->input_read_idx);
-                }
-            }
+            // (read_idx Dr0 arm retired — the single watch slot now goes
+            // to P1's InputGlobal y, armed at kind==2 registration, to name
+            // the in-burst zeroer.)
         }
     }
 
@@ -3418,15 +3511,18 @@ bool tick() {
                     ds_run  = (df0 == ds_last + 1) ? ds_run + 1 : 1;
                     ds_last = df0;
                 }
-                if (!g_solo && ds_run >= 3) {
+                bool sustained = (!g_solo && ds_run >= 3);
+                if (sustained) {
                     log_printf("[gekko_bridge] DESYNC SUSTAINED (%d consecutive"
                                " frames, last=%d) — real divergence\n",
                                ds_run, ds_last);
-                    log_flush();
-                    Sleep(300);
-                    ExitProcess(5);
+                    // fall through into the dump block below, then exit.
                 }
-                if (first && !g_solo) {
+                // Dump on the FIRST report (transient evidence) AND on the
+                // SUSTAINED verdict (the dump that actually matters: first-
+                // report dumps can capture mid-correction transients that
+                // later self-heal).
+                if ((first || sustained) && !g_solo) {
                     int df = e->data.desynced.frame;
                     int dumped = 0;
                     for (int fr = df - (int)SQTEXT_RING + 1; fr <= df; ++fr) {
@@ -3502,6 +3598,7 @@ bool tick() {
                                df, e->data.desynced.local_checksum,
                                e->data.desynced.remote_checksum);
                     log_flush();
+                    if (sustained) { Sleep(300); ExitProcess(5); }
                 }
                 // SQUIROLL_DESYNC_ABORT=1 -> stop dead on the FIRST desync, so a
                 // long run's log ends exactly at the diverging frame. Lets us push
@@ -3749,9 +3846,10 @@ bool tick() {
                 // [igx] post-restore counter value — pairs with PRE/POST-run
                 // probes on the subsequent rb=1 advances.
                 if (!g_solo && g_ig_probe)
-                    log_printf("[igx] LOAD f=%d p0(x=%d y=%d b1=%d) p1(x=%d y=%d b1=%d)\n",
+                    log_printf("[igx] LOAD f=%d p0(x=%d y=%d b1=%d b2=%d b3=%d) p1(x=%d y=%d b1=%d)\n",
                                (int)e->data.load.frame, g_ig_probe[1],
                                g_ig_probe[2], g_ig_probe[3],
+                               g_ig_probe[4], g_ig_probe[5],
                                g_ig_probe2 ? g_ig_probe2[1] : -1,
                                g_ig_probe2 ? g_ig_probe2[2] : -1,
                                g_ig_probe2 ? g_ig_probe2[3] : -1);
