@@ -37,9 +37,12 @@ class modifier extends modifier {
 	constructor() {
 		segs = [];
 		// Up to 8 segments: delay, ping, jitter, ahead, rb, frame, status, (ra)
+		// Render on the UI slot at a high layer (60000, same as the network
+		// name/text overlays) so we draw ON TOP of the game HUD — the old
+		// status/layer-1 put us behind it (game HUD icons sit at status ~3000).
 		for (local i = 0; i < 9; ++i) {
 			local t = ::UI.Core.Text("");
-			t.ConnectRenderSlot(::graphics.slot.status, 1);
+			t.ConnectRenderSlot(::graphics.slot.ui, 60000);
 			t.sx = 0.62;
 			t.sy = 0.62;
 			segs.push(t);
