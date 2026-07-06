@@ -8,16 +8,32 @@ config = {
 
 // ============================================================================
 // Netcode HUD — live proof the GekkoNet rollback is running. Each stat is its
-// own coloured Text segment (one colour per stat, Touhou-ish palette, no ugly
-// blue), laid out centred along the bottom. Reads ::__gekko_netstats() (native,
-// gekko_bridge): { active, ping, avg, jitter, sent, recv, ahead, rb, fwd,
-// frame, desync, delay, runahead }. Everything is in one try/catch so a HUD
-// read can never halt the sim at a round-end transition.
+// own coloured segment (one colour per stat, Touhou-ish palette, no ugly blue),
+// laid out centred along the bottom.
+//
+// [#30] RENDER PATH: this now draws through the NATIVE, rollback-safe
+// immediate-mode HUD (::hud.*, backed by squiroll's own D3D in overlay.cpp) —
+// NOT th155's UI.Core.Text / DrawCommandSlot machinery. That machinery lives in
+// the rolled-back arenas, so a HUD built on it HUNG deterministically right
+// after the first rollback (verified rb 0->1). The native HUD keeps nothing in
+// any snapshot, so it is rollback-safe by construction: every Update we
+// ::hud.clear() then re-emit the whole HUD forward-only (immediate mode).
+//
+// Reads ::__gekko_netstats() (native, gekko_bridge): { active, ping, avg,
+// jitter, sent, recv, ahead, rb, fwd, frame, desync, delay, runahead, simfps,
+// rfps }. Everything is in one try/catch so a HUD read can never halt the sim
+// at a round-end transition. Stays async=true; since it no longer creates any
+// render objects, the M3 render_arena bracket in battle.nut still applies but is
+// harmless. The queue is cleared on battle teardown by battle.Release().
 // ============================================================================
 class modifier extends modifier {
 	async = true;
-	segs = null;          // array of Text objects, one per stat
 	diag_done = false;
+
+	// Render scale for the native 8x8 font: SCALE px per font-pixel, so each
+	// monospace cell is 8*SCALE px. Single source of truth — passed to
+	// ::hud.text AND used for the layout math, so they can never desync.
+	SCALE = 2.0;
 
 	// Touhou palette (RGB 0..1). Deliberately NO flat ugly blue.
 	COL = {
@@ -36,24 +52,6 @@ class modifier extends modifier {
 		bad    = [0.98, 0.26, 0.32]  // desync red
 	};
 
-	constructor() {
-		segs = [];
-		// [#28 FIX] Create the render objects inside the render_arena
-		// "unsnapshotted" scope so their native TF4 UI / glyph allocations land
-		// in a region the rollback NEVER rewinds. Without this, these dual-only
-		// render objects (solo never loads this plugin) sat in the rolled-back
-		// arenas -> re-sim collision -> the nvwgf2um/d3d11 crash.
-		// Up to 8 segments: delay, ping, jitter, ahead, rb, frame, status, (ra)
-		// Render on the UI slot at a high layer (60000, same as the network
-		// name/text overlays) so we draw ON TOP of the game HUD — the old
-		// status/layer-1 put us behind it (game HUD icons sit at status ~3000).
-		// [#30] INERT (crash-free) while the rollback-safe HUD lands. render_arena
-		// now routes the String glyph vector (0x67270) + the D3D11VertexBuffer
-		// render-pool slabs (0x37C30/0x356A0) off the snapshot; a remaining
-		// pre-existing-slab case + the squiroll-owned slot are in progress.
-		for (local i = 0; i < 0; ++i) {}
-	}
-
 	// One-decimal float -> string, no ::format (which threw on some builds).
 	function f1(v) {
 		local neg = v < 0.0;
@@ -63,19 +61,11 @@ class modifier extends modifier {
 		return neg ? ("-" + s) : s;
 	}
 
-	// Stamp segment i with text + colour; returns its scaled width.
-	function put(i, str, col) {
-		local t = segs[i];
-		t.Set(str);
-		t.red   = col[0];
-		t.green = col[1];
-		t.blue  = col[2];
-		return t.width * t.sx;
-	}
-
 	function Update() {
-		if (segs.len() == 0) return;
 		try {
+			// Immediate mode: clear + re-emit the whole HUD every frame.
+			::hud.clear();
+
 			local s = ("__gekko_netstats" in ::getroottable())
 				? ::__gekko_netstats() : null;
 
@@ -116,24 +106,23 @@ class modifier extends modifier {
 				parts.append(["ping " + d, COL.frame]);
 			}
 
-			// Layout: measure, centre, place left-to-right with a gap.
-			local gap = 14.0;
+			// Layout: monospace cell = 8*SCALE px. Measure, centre, place L->R.
+			local cell = 8.0 * SCALE;   // char advance / cell height
+			local gap = cell;           // one cell between segments
 			local widths = [];
 			local total = 0.0;
 			for (local i = 0; i < parts.len(); ++i) {
-				local w = put(i, parts[i][0], parts[i][1]);
+				local w = parts[i][0].len() * cell;
 				widths.append(w);
 				total += w + (i > 0 ? gap : 0);
 			}
-			// Hide any leftover segments from a longer previous frame.
-			for (local i = parts.len(); i < segs.len(); ++i) segs[i].Set("");
 
 			local x = 640.0 - (total / 2.0);
-			local y = 714.0;
+			local y = 720.0 - cell - 6.0;   // sit near the bottom edge
 			for (local i = 0; i < parts.len(); ++i) {
-				local t = segs[i];
-				t.x = x;
-				t.y = y - (t.height * t.sy);
+				local col = parts[i][1];
+				// a=1.0, scale=SCALE passed explicitly (no default-coupling).
+				::hud.text(x, y, parts[i][0], col[0], col[1], col[2], 1.0, SCALE);
 				x += widths[i] + gap;
 			}
 		} catch (_e) {}

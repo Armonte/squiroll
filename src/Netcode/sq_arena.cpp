@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "sq_arena.h"
+#include "render_arena.h"  // M3: plugin Squirrel objects route to the non-snapshotted domain
 #include "patch_utils.h"   // _R address literal
 #include "util.h"
 #include "log.h"
@@ -156,6 +157,14 @@ static inline bool from_vm(void* ret) {
 // no caller check needed.
 
 static void* cdecl hook_malloc(size_t size) {
+    // M3: while a plugin's execution is bracketed (render_arena plugin scope),
+    // its Squirrel objects go to the NON-snapshotted render_arena so a rollback
+    // never rewinds them (keeping them consistent with their forward-only native
+    // render side). Falls through if the region is exhausted.
+    if (render_arena::in_sq_scope()) {
+        void* p = render_arena::alloc(size);
+        if (p) return p;
+    }
     if (from_vm(__builtin_return_address(0))) {
         void* p = arena_alloc(size);
         if (p) return p;  // else arena exhausted — fall through to real heap
@@ -164,11 +173,28 @@ static void* cdecl hook_malloc(size_t size) {
 }
 
 static void* cdecl hook_realloc(void* block, int oldsize, size_t size) {
+    // M3: a block render_arena handed out stays there (route by owner, exact).
+    if (render_arena::owns(block)) {
+        if (size == 0) { render_arena::free(block); return nullptr; }
+        void* p = render_arena::realloc(block, size);
+        if (p) return p;
+        // render_arena OOM growing an owned block: can't hand it to the real
+        // realloc, so copy out to the real heap (sized so this never hits).
+        p = g_h_malloc.unsafe_ccall<void*>(size);
+        if (p && oldsize > 0)
+            memcpy(p, block, (size_t)oldsize < size ? (size_t)oldsize : size);
+        render_arena::free(block);
+        return p;
+    }
     if (in_arena(block)) {
         if (size == 0) { arena_free(block); return nullptr; }
         void* p = arena_realloc(block, size);
         if (p) return p;
         return g_h_realloc.unsafe_ccall<void*>(block, oldsize, size);
+    }
+    if (!block && render_arena::in_sq_scope()) {          // M3: fresh alloc in plugin scope
+        void* p = render_arena::alloc(size);
+        if (p) return p;
     }
     if (!block && from_vm(__builtin_return_address(0))) {
         void* p = arena_alloc(size);
@@ -178,6 +204,7 @@ static void* cdecl hook_realloc(void* block, int oldsize, size_t size) {
 }
 
 static void cdecl hook_free(void* block) {
+    if (render_arena::owns(block)) { render_arena::free(block); return; }   // M3
     if (in_arena(block)) { arena_free(block); return; }
     g_h_free.unsafe_ccall<void>(block);
 }

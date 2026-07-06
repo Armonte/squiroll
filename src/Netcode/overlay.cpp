@@ -23,6 +23,8 @@
 #include "bt.h"
 #include "sqrat.h"
 #include "d3d_probe.h"    // [#28] region-A D3D resource probe
+#include "render_slot.h"  // [#30] squiroll-owned plugin HUD draw slot
+#include "hud_font8x8.h"  // [#30 native HUD] embedded 8x8 bitmap font (CC0)
 
 static constexpr uint8_t hitbox_vert_cso[] = {
 #include "shaders/hitbox_vert.cso.h"
@@ -31,7 +33,13 @@ static constexpr uint8_t hitbox_frag_cso[] = {
 #include "shaders/hitbox_frag.cso.h"
 };
 
-#define MAX_HITBOXES 1024
+// Quad budget for the shared vertex/index/structured buffers (verts = *4,
+// indices = *6, structured elems = *1). Bumped 1024 -> 4096 for the native HUD:
+// text expands to many small rects (each lit font-pixel is one quad), so a full
+// stats line can be ~1000+ quads on top of the debug hitboxes. All buffer
+// allocations below scale off this, and both the hitbox and HUD emit paths cap
+// gracefully at MAX_HITBOXES (no overflow).
+#define MAX_HITBOXES 4096
 
 #define d3d11_dev ((ID3D11Device**)0x4DAE9C_R)
 #define d3d11_imm ((ID3D11DeviceContext**)0x4DAE98_R)
@@ -719,6 +727,130 @@ static void draw_objs(const std::vector<DrawObj>& vec, uint32_t col) {
     });
 }
 
+// ===========================================================================
+// Native immediate-mode HUD (task #30 fix). See overlay.h for the rationale.
+//
+// A plugin queues text/rect commands via ::hud.* (native hud_text/hud_rect);
+// overlay_draw expands the queue into the SAME hitbox quad pipeline (continuing
+// hitbox_write_idx, sharing the one Map + DrawIndexed). Rollback-safe because
+// the queue is a NATIVE std::vector on the DLL heap (exactly like the
+// overlay_collision/hurt/hit vectors above — the render_arena hooks only reroute
+// th155's OWN allocators, never the mingw CRT), the font is a static const
+// array, and nothing here ever touches th155's String/DrawCommandSlot render
+// path. Single render/sim thread (better_game_loop), so no locking is needed —
+// hud_* (sim/Update) and overlay_draw (render) never overlap, same as the
+// hitbox vectors.
+// ===========================================================================
+enum HudCmdType : uint8_t { HUD_TEXT, HUD_RECT };
+struct HudCmd {
+    uint8_t  type;
+    float    x, y, w, h;
+    float    scale;
+    uint32_t rgba;      // 0xAARRGGBB
+    char     text[128]; // HUD_TEXT only; NUL-terminated, truncated to fit
+};
+static std::vector<HudCmd> hud_cmds;
+
+void hud_clear() {
+    hud_cmds.clear();   // keeps capacity — no per-frame realloc churn
+}
+
+void hud_text(float x, float y, const char* str, uint32_t rgba, float scale) {
+    if (!str) return;
+    if (scale <= 0.0f) scale = 1.0f;
+    HudCmd cmd;
+    cmd.type = HUD_TEXT;
+    cmd.x = x; cmd.y = y; cmd.w = 0.0f; cmd.h = 0.0f;
+    cmd.scale = scale;
+    cmd.rgba = rgba;
+    size_t i = 0;
+    for (; str[i] && i < sizeof(cmd.text) - 1; ++i) cmd.text[i] = str[i];
+    cmd.text[i] = '\0';
+    hud_cmds.push_back(cmd);
+}
+
+void hud_rect(float x, float y, float w, float h, uint32_t rgba) {
+    HudCmd cmd;
+    cmd.type = HUD_RECT;
+    cmd.x = x; cmd.y = y; cmd.w = w; cmd.h = h;
+    cmd.scale = 0.0f;
+    cmd.rgba = rgba;
+    cmd.text[0] = '\0';
+    hud_cmds.push_back(cmd);
+}
+
+// Screen (1280x720, top-left origin) -> clip space [-1,1]. Inverse of the
+// clip_to_screen() used by the hitbox path.
+static forceinline float hud_scr_to_clip_x(float sx) { return sx * (2.0f / 1280.0f) - 1.0f; }
+static forceinline float hud_scr_to_clip_y(float sy) { return 1.0f - sy * (2.0f / 720.0f); }
+
+// Emit one FILLED, fully-solid rect into the hitbox buffers at slot `index`.
+// Uses the rect (flags=0) shader path with thresholds forced to 0 so the frag
+// shader's is_border is ALWAYS true -> it samples alphas[1] (== border_alpha).
+// We pre-divide the packed alpha by border_alpha so the on-screen alpha equals
+// the caller's alpha regardless of the hitbox border_alpha config (default 1.0).
+static void hud_emit_rect(size_t index, float x, float y, float w, float h,
+                          uint32_t rgba, float border_alpha) {
+    float x0 = hud_scr_to_clip_x(x);
+    float x1 = hud_scr_to_clip_x(x + w);
+    float y0 = hud_scr_to_clip_y(y);
+    float y1 = hud_scr_to_clip_y(y + h);
+    HitboxVertex* vtx = &hitbox_vertices[index * 4];
+    vtx[0].pos[0] = x0; vtx[0].pos[1] = y0;   // top-left
+    vtx[1].pos[0] = x1; vtx[1].pos[1] = y0;   // top-right
+    vtx[2].pos[0] = x1; vtx[2].pos[1] = y1;   // bottom-right
+    vtx[3].pos[0] = x0; vtx[3].pos[1] = y1;   // bottom-left
+
+    uint32_t a = (rgba >> 24) & 0xFF;
+    if (border_alpha > 1.0f / 255.0f) {
+        float ca = (float)a / border_alpha;
+        a = ca >= 255.0f ? 255u : (uint32_t)(ca + 0.5f);
+    }
+    hitbox_gpu_data[index].col = (rgba & 0x00FFFFFFu) | (a << 24);
+    hitbox_gpu_data[index].flags = 0;              // rect path (no circle)
+    hitbox_gpu_data[index].thresholds[0] = 0.0f;   // abs(uv) >= 0 -> always "border"
+    hitbox_gpu_data[index].thresholds[1] = 0.0f;
+}
+
+// Expand the queued HUD commands into hitbox quads, continuing hitbox_write_idx
+// and capping at MAX_HITBOXES (graceful stop, never overflow). Called from
+// overlay_draw AFTER the hitbox draw_objs, sharing the one Map + DrawIndexed.
+static void hud_render_queue(float border_alpha) {
+    size_t index = hitbox_write_idx;
+    for (const HudCmd& cmd : hud_cmds) {
+        if (index >= MAX_HITBOXES) break;
+        if (cmd.type == HUD_RECT) {
+            hud_emit_rect(index, cmd.x, cmd.y, cmd.w, cmd.h, cmd.rgba, border_alpha);
+            ++index;
+            continue;
+        }
+        // HUD_TEXT: monospace 8x8 font, one lit font-pixel = one scale*scale rect.
+        float pen_x = cmd.x;
+        for (const char* p = cmd.text; *p; ++p) {
+            unsigned char ch = (unsigned char)*p;
+            if (ch >= 0x20 && ch < 0x80) {
+                const unsigned char* glyph = HUD_FONT8X8[ch];
+                for (int row = 0; row < 8; ++row) {
+                    unsigned char bits = glyph[row];
+                    if (!bits) continue;
+                    for (int col = 0; col < 8; ++col) {
+                        if (!(bits & (1u << col))) continue;   // bit0 = leftmost
+                        if (index >= MAX_HITBOXES) { hitbox_write_idx = index; return; }
+                        hud_emit_rect(index,
+                                      pen_x + (float)col * cmd.scale,
+                                      cmd.y  + (float)row * cmd.scale,
+                                      cmd.scale, cmd.scale,
+                                      cmd.rgba, border_alpha);
+                        ++index;
+                    }
+                }
+            }
+            pen_x += 8.0f * cmd.scale;   // advance one monospace cell
+        }
+    }
+    hitbox_write_idx = index;
+}
+
 void overlay_clear() {
     overlay_collision.clear();
     overlay_hurt.clear();
@@ -732,13 +864,26 @@ void overlay_draw() {
                    GetCurrentThreadId()); } }
     d3d_probe_arm();   // [#28] one-shot D3D vtable probe (SQUIROLL_D3D_PROBE=1)
 
+    // [#30] Emit the squiroll-owned plugin HUD slot FORWARD-ONLY on the render
+    // thread. Must run BEFORE the hitbox early-returns below so the HUD draws
+    // even when the debug hitbox overlay is off. No-op until render_slot::init()
+    // (driven from the sim thread) has created the slot; empty when no plugin
+    // Text is connected. This is the "connection half" that lets a plugin draw
+    // under rollback without th155 ever walking a half-rewound connection list.
+    render_slot::emit();
+
     if (!overlay_supported)
         return;
 
     bool has_collision = !overlay_collision.empty();
     bool has_hurt = !overlay_hurt.empty();
     bool has_hit = !overlay_hit.empty();
-    if (!has_collision && !has_hurt && !has_hurt)
+    bool has_hitboxes = has_collision || has_hurt || has_hit;
+    bool has_hud = !hud_cmds.empty();
+    // [#30] Also render when the native HUD queue is non-empty (the plugin HUD
+    // draws even with the debug hitbox overlay off). (This also fixes the old
+    // early-return that tested has_hurt twice instead of has_hit.)
+    if (!has_hitboxes && !has_hud)
         return;
 
     hitbox_border_width = get_hitbox_border_width() * 2.0f;
@@ -793,6 +938,12 @@ void overlay_draw() {
         }
     });
     draw_objs(overlay_hit, hit_col);
+
+    // [#30] Expand the native HUD queue into the SAME quad buffers, continuing
+    // hitbox_write_idx. Pass the border alpha (alphas[1]) so hud_emit_rect can
+    // compensate for the shader's alpha modulation and render fully solid.
+    if (has_hud)
+        hud_render_queue(new_cb.alphas[1]);
 
     imm->Unmap(hitbox_vb, 0);
     imm->Unmap(hitbox_sb, 0);

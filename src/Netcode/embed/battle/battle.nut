@@ -176,16 +176,56 @@ function _SetupInputs(param) {
 	::replay.SetDevice(devices,offset);
 }
 
+// [M3] Wrap a plugin instance in a bracketing PROXY table. Squirrel class
+// instances don't allow reassigning a method slot, so the engine's lifecycle
+// calls go through this table: each runs inside the render_arena plugin scope
+// (so the plugin's render objects -- glyph/VB -- AND its Squirrel churn land
+// off-snapshot, never rewound by a rollback) then delegates to the real
+// instance. `r` is a PER-CALL parameter (avoids the classic loop-capture trap),
+// and `r.Method()` is a normal method call so `this == r` inside (a plain
+// bindenv on the extracted method did NOT bind member access correctly).
+// Squirrel has no `finally`, so leave() on BOTH the normal and throw paths keeps
+// the nestable scope balanced even if a plugin throws.
+function _BracketModifier(r) {
+	local p = {};
+	p.Update    <- function() { ::__render_unsnap_enter(); try { r.Update(); }    catch(e){ ::__render_unsnap_leave(); throw e; } ::__render_unsnap_leave(); };
+	p.Begin     <- function() { ::__render_unsnap_enter(); try { r.Begin(); }     catch(e){ ::__render_unsnap_leave(); throw e; } ::__render_unsnap_leave(); };
+	p.PreFrame  <- function() { ::__render_unsnap_enter(); local ok=true; try { ok = r.PreFrame(); } catch(e){ ::__render_unsnap_leave(); throw e; } ::__render_unsnap_leave(); return ok; };
+	p.PostFrame <- function() { ::__render_unsnap_enter(); try { r.PostFrame(); } catch(e){ ::__render_unsnap_leave(); throw e; } ::__render_unsnap_leave(); };
+	p.Release   <- function() { ::__render_unsnap_enter(); try { r.Release(); }   catch(e){ ::__render_unsnap_leave(); throw e; } ::__render_unsnap_leave(); };
+	return p;
+}
+
 function _SetupModifiers(param) {
 	foreach(name,modifier in modifiers) {
 		::print(::format("[mod] trying %s\n",name));
 		if (!modifier.enabled.call(this,param)) { ::print(::format("[mod] %s disabled\n",name)); continue; }
 		::print(::format("[mod] %s constructing\n",name));
-		modifier.task = modifier.base_class();
-		if (!modifier.task) { ::print(::format("[mod] %s null task\n",name)); continue; }
-		::print(::format("Activating %s...\n",name));
-		if (modifier.async)::loop.AddTask(modifier.task);
-		else AddTask(modifier.task);
+		if (modifier.async) {
+			// [M3] ASYNC plugins (e.g. ping_display) dispatch from loop.task_async
+			// -- forward-only, NOT re-run by a rollback re-sim -- so their entire
+			// lifecycle can safely live off-snapshot: bracket the constructor AND
+			// every engine call (via the proxy) in the render_arena plugin scope,
+			// so their render objects (glyph/VB) + Squirrel churn are never rewound
+			// (fixes the #28 dual-only crash without breaking determinism).
+			::__render_unsnap_enter();
+			local real = modifier.base_class();
+			::__render_unsnap_leave();
+			if (!real) { ::print(::format("[mod] %s null task\n",name)); continue; }
+			modifier.task = _BracketModifier(real);
+			::print(::format("Activating %s...\n",name));
+			::loop.AddTask(modifier.task);
+		} else {
+			// SYNC plugins run INSIDE the re-simmed sim path (UpdateMain). Bracketing
+			// them would route deterministic sim-path allocations off-snapshot and
+			// break rollback (endless re-sim / stall). Dispatch them unchanged; a
+			// finer sync-plugin API (bracket only their render-object creation) is
+			// future work -- see docs/STRUCTURAL_ROLLBACK_PLAN.md §12.
+			modifier.task = modifier.base_class();
+			if (!modifier.task) { ::print(::format("[mod] %s null task\n",name)); continue; }
+			::print(::format("Activating %s...\n",name));
+			AddTask(modifier.task);
+		}
 	}
 }
 
@@ -245,6 +285,7 @@ function Release() {
 	_ClearModifiers();
 	_ClearBattle();
 	::overlay.clear();
+	::hud.clear();   // [#30] drop the native HUD queue so it doesn't linger post-match
 }
 
 function Begin(){

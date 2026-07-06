@@ -57,6 +57,26 @@ bool  in_scope();
 
 struct Scope { Scope() { enter(); } ~Scope() { leave(); } };
 
+// --- Squirrel plugin sub-domain scope (M3) -----------------------------------
+// A SEPARATE depth from enter()/leave(). While in_sq_scope() > 0 on the sim
+// thread, sq_arena's VM-allocator hooks route Squirrel allocations here too (not
+// just cpp_arena's native allocs). Kept distinct on purpose: front-render uses
+// enter()/leave() for NATIVE routing and must NOT have its Squirrel allocations
+// rerouted — only the plugin bracket sets the Squirrel scope. Plugin execution
+// (async modifier ctor + Update) is bracketed with plugin_scope_enter/leave,
+// which bump BOTH scopes so a plugin's native (String/glyph/VB) AND Squirrel
+// (the Text wrapper + its churn) allocations all land in render_arena and stay
+// mutually consistent (a rewound wrapper pointing at a forward-only String would
+// dangle — so both must be forward-only, not just the native side).
+void  sq_enter();
+void  sq_leave();
+bool  in_sq_scope();
+
+// Combined plugin bracket = enter()+sq_enter() / sq_leave()+leave(). Balanced.
+void  plugin_scope_enter();
+void  plugin_scope_leave();
+struct PluginScope { PluginScope() { plugin_scope_enter(); } ~PluginScope() { plugin_scope_leave(); } };
+
 // Diagnostics
 size_t bytes_live();
 size_t bytes_capacity();

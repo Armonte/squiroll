@@ -164,6 +164,18 @@ void enter() { ++g_scope_depth; }
 void leave() { if (g_scope_depth > 0) --g_scope_depth; }
 bool in_scope() { return g_scope_depth > 0; }
 
+// Squirrel plugin sub-domain scope (M3). Separate depth so front-render's
+// enter()/leave() (native routing) does NOT reroute its Squirrel allocations.
+static thread_local int g_sq_depth = 0;
+void sq_enter() { ++g_sq_depth; }
+void sq_leave() { if (g_sq_depth > 0) --g_sq_depth; }
+bool in_sq_scope() { return g_sq_depth > 0; }
+
+// Plugin bracket: route BOTH native (cpp_arena via in_scope) and Squirrel
+// (sq_arena via in_sq_scope) sim-thread allocations into render_arena.
+void plugin_scope_enter() { ++g_scope_depth; ++g_sq_depth; }
+void plugin_scope_leave() { if (g_sq_depth > 0) --g_sq_depth; if (g_scope_depth > 0) --g_scope_depth; }
+
 size_t bytes_live()     { return g_live; }
 size_t bytes_capacity() { return CAP; }
 

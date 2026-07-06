@@ -30,6 +30,7 @@ namespace fs = std::filesystem;
 #include "sq_debug.h"
 #include "gekko_bridge.h"
 #include "render_arena.h"
+#include "render_slot.h"
 #include "discord.h"
 #include "overlay.h"
 #include "frame_data_display.h"
@@ -307,6 +308,79 @@ SQInteger ignore_lobby_punch_ping(HSQUIRRELVM v) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// [#30 native HUD] ::hud.* bindings -> the rollback-safe immediate-mode HUD in
+// overlay.cpp. Colour convention = packed 0xAARRGGBB (the overlay's convention);
+// the float forms take r,g,b,a in [0,1] and pack to that. Coords are 1280x720
+// game-HUD space, origin top-left. See overlay.h.
+static inline uint32_t hud_pack_rgba(float r, float g, float b, float a) {
+    auto q = [](float f) -> uint32_t {
+        int i = (int)(f * 255.0f + 0.5f);
+        return (uint32_t)(i < 0 ? 0 : (i > 255 ? 255 : i));
+    };
+    return (q(a) << 24) | (q(r) << 16) | (q(g) << 8) | q(b);
+}
+
+// ::hud.text(x, y, str, <packed_int | r, g, b [, a]> [, scale])
+//   arg5 integer  -> packed 0xAARRGGBB, optional scale at arg6.
+//   arg5 float    -> r,g,b floats (args 5,6,7), optional a (arg8), scale (arg9).
+// scale defaults to 2.0 (16x16 monospace glyphs).
+static SQInteger hud_text_sq(HSQUIRRELVM v) {
+    SQInteger top = sq_gettop(v);
+    SQFloat x, y;
+    const SQChar* str;
+    if (top < 4 ||
+        SQ_FAILED(sq_getfloat(v, 2, &x)) ||
+        SQ_FAILED(sq_getfloat(v, 3, &y)) ||
+        SQ_FAILED(sq_getstring(v, 4, &str))
+    ) {
+        return sq_throwerror(v, _SC("Expected: <x> <y> <str> <packed_int | r g b [a]> [scale]"));
+    }
+    uint32_t rgba;
+    float scale = 2.0f;
+    if (top >= 5 && sq_gettype(v, 5) == OT_INTEGER) {
+        SQInteger packed = 0;
+        sq_getinteger(v, 5, &packed);
+        rgba = (uint32_t)packed;
+        if (top >= 6) { SQFloat s; if (SQ_SUCCEEDED(sq_getfloat(v, 6, &s))) scale = (float)s; }
+    } else {
+        SQFloat r = 1.0f, g = 1.0f, b = 1.0f, a = 1.0f;
+        if (top < 7 ||
+            SQ_FAILED(sq_getfloat(v, 5, &r)) ||
+            SQ_FAILED(sq_getfloat(v, 6, &g)) ||
+            SQ_FAILED(sq_getfloat(v, 7, &b))
+        ) {
+            return sq_throwerror(v, _SC("Expected: <x> <y> <str> <r> <g> <b> [a] [scale]"));
+        }
+        if (top >= 8) sq_getfloat(v, 8, &a);
+        if (top >= 9) { SQFloat s; if (SQ_SUCCEEDED(sq_getfloat(v, 9, &s))) scale = (float)s; }
+        rgba = hud_pack_rgba((float)r, (float)g, (float)b, (float)a);
+    }
+    hud_text((float)x, (float)y, str, rgba, scale);
+    return 0;
+}
+
+// ::hud.rect(x, y, w, h, r, g, b [, a])  — r,g,b,a floats in [0,1]; a default 1.
+static SQInteger hud_rect_sq(HSQUIRRELVM v) {
+    SQInteger top = sq_gettop(v);
+    SQFloat x, y, w, h, r, g, b, a = 1.0f;
+    if (top < 8 ||
+        SQ_FAILED(sq_getfloat(v, 2, &x)) ||
+        SQ_FAILED(sq_getfloat(v, 3, &y)) ||
+        SQ_FAILED(sq_getfloat(v, 4, &w)) ||
+        SQ_FAILED(sq_getfloat(v, 5, &h)) ||
+        SQ_FAILED(sq_getfloat(v, 6, &r)) ||
+        SQ_FAILED(sq_getfloat(v, 7, &g)) ||
+        SQ_FAILED(sq_getfloat(v, 8, &b))
+    ) {
+        return sq_throwerror(v, _SC("Expected: <x> <y> <w> <h> <r> <g> <b> [a]"));
+    }
+    if (top >= 9) sq_getfloat(v, 9, &a);
+    hud_rect((float)x, (float)y, (float)w, (float)h,
+             hud_pack_rgba((float)r, (float)g, (float)b, (float)a));
+    return 0;
+}
+
 // template<typename T>
 // SQInteger ReceiveArray(HSQUIRRELVM v) {
 //     if (sq_gettop(v) != 2 ||
@@ -425,16 +499,20 @@ extern "C" {
             sq_setfunc(v, _SC("print"), sq_print);
             sq_setfunc(v, _SC("fprint"), sq_fprint);
 
-            // Rollback-safe UI: enter/leave the render_arena "unsnapshotted"
-            // scope. Allocations made between enter and leave land in a region
-            // the rollback NEVER rewinds, so a plugin's render objects can't be
-            // corrupted by a re-sim. squiroll's UI layer brackets render-object
-            // creation/mutation with these; ::rollback.unsnapshotted(fn) wraps
-            // them for hand-rolled render state. See render_arena.h.
+            // Rollback-safe plugins (M3): enter/leave the render_arena
+            // "unsnapshotted" scope. Allocations made between enter and leave land
+            // in a region the rollback NEVER rewinds, so a plugin's objects can't
+            // be corrupted by a re-sim. This uses plugin_scope (BOTH the native
+            // AND the Squirrel routing), so a plugin's native render side (String
+            // /glyph/VB via cpp_arena) AND its Squirrel side (the Text wrapper +
+            // its per-frame churn via sq_arena) all go off-snapshot and stay
+            // mutually consistent. squiroll brackets plugin ctor + Update with
+            // these (battle.nut _SetupModifiers); ::rollback.unsnapshotted(fn)
+            // wraps them for hand-rolled render state. See render_arena.h.
             sq_setfunc(v, _SC("__render_unsnap_enter"), [](HSQUIRRELVM) -> SQInteger {
-                render_arena::enter(); return 0; });
+                render_arena::plugin_scope_enter(); return 0; });
             sq_setfunc(v, _SC("__render_unsnap_leave"), [](HSQUIRRELVM) -> SQInteger {
-                render_arena::leave(); return 0; });
+                render_arena::plugin_scope_leave(); return 0; });
 
             // [nuttrace] -- .nut-side divergence tracer. ::__gekko_trace(tag, val)
             // logs the value (float bits, or int) tagged with the authoritative
@@ -1098,6 +1176,31 @@ extern "C" {
             });
             overlay_init();
 
+            // [#30 native HUD] Immediate-mode, rollback-safe plugin HUD. Renders
+            // through squiroll's OWN D3D (overlay.cpp), never th155's
+            // String/DrawCommandSlot render path -> nothing for a rollback to
+            // rewind. The plugin calls ::hud.clear() at the top of its Update and
+            // re-emits every frame (forward-only immediate mode).
+            //   ::hud.clear()
+            //   ::hud.text(x, y, str, r, g, b [, a] [, scale])  (or packed int)
+            //   ::hud.rect(x, y, w, h, r, g, b [, a])
+            // Colours: floats [0,1] (packed native as 0xAARRGGBB). Coords:
+            // 1280x720 game-HUD space, origin top-left.
+            sq_createtable(v, _SC("hud"), [](HSQUIRRELVM v) {
+                sq_setfunc(v, _SC("clear"), [](HSQUIRRELVM v) -> SQInteger {
+                    hud_clear();
+                    return 0;
+                });
+                sq_setfunc(v, _SC("text"), hud_text_sq);
+                sq_setfunc(v, _SC("rect"), hud_rect_sq);
+            });
+
+            // [#30] Create the squiroll-owned plugin HUD DrawCommandSlot. Sim
+            // thread, VM up, pre-arm -> the slot + its signal land in
+            // render_arena. Idempotent + self-guarded; also retried from
+            // update_frame() in case ::graphics.slot isn't up yet here.
+            render_slot::init();
+
             //this changes the item array in the config menu :)
             //yes i know it's beautiful you don't have to tell me
             // sq_edit(v, _SC("menu"), [](HSQUIRRELVM v) {
@@ -1124,6 +1227,10 @@ extern "C" {
     }
 
     dll_export int stdcall update_frame() {
+        // [#30] Ensure the plugin HUD slot exists (sim thread). No-ops after the
+        // first success; retries each frame until ::graphics.slot is up.
+        render_slot::init();
+
         /*
         sq_pushroottable(v);
 

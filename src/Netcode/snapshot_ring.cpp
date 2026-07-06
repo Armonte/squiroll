@@ -190,14 +190,28 @@ void arm() {
     // intermittent ~f=12 abort). Its sim-relevant pool BLOCKS stay covered by
     // the targeted boostpool capture. SQUIROLL_TF4B=1 re-enables for experiments.
     // Region A ('system', 128MB) is ~1 dirty page/frame in battle — capture it.
-    const bool tf4_on  = tf4_arena::ready();
-    const bool tf4b_on = tf4_on && getenv("SQUIROLL_TF4B");
+    //
+    // [M2 / structural-rollback] Phase-0 RE (docs/SIM_STATE_MANIFEST.md) proved
+    // region A is the TF4 asset/RENDER heap (meshes/textures/anim-sets/audio +
+    // per-frame re-skinned vertex geometry) — NOT sim state. The sim objects live
+    // in region B, already captured structurally by battle_pools. Region A's
+    // contents are either load-once-immutable (asset ptrs the sim holds stay
+    // valid without rewinding, since they never move/free inside state==8) or
+    // per-frame render output re-derived from actor transform+anim (both of which
+    // ARE rolled back). So it should DROP from the savestate — a ~8MB/frame perf
+    // win and one whole class-X arena removed by construction. SQUIROLL_NO_TF4A=1
+    // performs the drop; kept behind a flag until the distance=10 solo + dual
+    // cross-peer soaks confirm no A-resident sim read-back state (the oracle:
+    // any would diverge the sim -> desync counter). Flip the default once proven.
+    const bool tf4_on   = tf4_arena::ready();
+    const bool tf4a_on  = tf4_on && !getenv("SQUIROLL_NO_TF4A");
+    const bool tf4b_on  = tf4_on && getenv("SQUIROLL_TF4B");
     struct Src { uint8_t* base; uint32_t size; };
     Src src[NARENA] = {
         { sq_arena::base(),     sq_arena::capacity()     },
         { bullet_arena::base(), bullet_arena::capacity() },
         { cpp_arena::base(),    cpp_arena::capacity()    },
-        { tf4_on  ? tf4_arena::base(0) : nullptr, tf4_on  ? tf4_arena::size(0) : 0 },
+        { tf4a_on ? tf4_arena::base(0) : nullptr, tf4a_on ? tf4_arena::size(0) : 0 },
         { tf4b_on ? tf4_arena::base(1) : nullptr, tf4b_on ? tf4_arena::size(1) : 0 },
     };
 
