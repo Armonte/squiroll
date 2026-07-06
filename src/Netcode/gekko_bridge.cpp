@@ -160,6 +160,20 @@ static volatile int      g_wd_last_adv_frame = -1;   // last AdvanceEvent frame
 static volatile int      g_wd_last_adv_rb    = 0;    // was it a rollback re-sim?
 static volatile uint32_t g_wd_adv_fwd_n = 0;         // forward advances (total)
 static volatile uint32_t g_wd_adv_rb_n  = 0;         // rollback advances (total)
+static volatile uint32_t g_desync_total = 0;         // confirmed desyncs (HUD)
+static int               g_local_delay  = 2;         // gekko local input delay (HUD)
+static int               g_runahead     = 0;         // gekko runahead (HUD)
+
+// Read an integer env var with a default (small helper for the net knobs).
+static int env_int(const char* name, int def) {
+    char b[16] = {0};
+    DWORD n = GetEnvironmentVariableA(name, b, sizeof(b));
+    if (n == 0 || n >= sizeof(b)) return def;
+    int v = 0; bool neg = false; const char* p = b;
+    if (*p == '-') { neg = true; ++p; }
+    for (; *p >= '0' && *p <= '9'; ++p) v = v * 10 + (*p - '0');
+    return neg ? -v : v;
+}
 int g_trace_rb    = 0;
 // Rollback DEPTH = how many frames the current re-sim advance is past its load
 // target (g_trace_frame - last GekkoLoad frame). 0 on the forward. Lets the
@@ -485,7 +499,14 @@ static uint32_t g_tap_orig   = 0;
 typedef unsigned int (__thiscall* pop_fn_t)(void* self, int** state_ptr_ptr);
 static unsigned int __fastcall pop_tap(void* self, void* /*edx*/,
                                        int** state_ptr_ptr) {
+    // Session not armed (round-end demo / match end / between rounds): the
+    // recorder device this reader captured is torn down, so its queue and
+    // the original queue_pop's chase would dereference freed memory (the
+    // FASTFAIL at rva=169F89 fault=1 during the state-64 KO demo). The demo
+    // ignores input; skip the pop entirely. On re-arm pop_tap resumes.
+    if (!g_session_started) return 0;
     uint8_t*  q   = (uint8_t*)((void**)self)[1];
+    if (!q) return 0;
     uint32_t  wi  = *(uint32_t*)q;
     uint32_t  ri  = *(uint32_t*)(q + 4);
     uint16_t* vec = *(uint16_t**)(q + 0x10);
@@ -755,6 +776,39 @@ static SQInteger gekko_vec3_register(HSQUIRRELVM vm) {
     return 1;
 }
 
+// ::__gekko_netstats() -> table for the ping_display HUD (live proof the
+// rollback is running): { active, ping, avg, jitter, sent, recv, ahead,
+// rb, fwd, frame, desync }. Real GekkoNet stats (no packet-loss field
+// exists upstream); rb/fwd are the total rollback-re-sim / forward advance
+// counts, frame is the current gekko frame, desync the confirmed count.
+static SQInteger gekko_netstats(HSQUIRRELVM vm) {
+    float ping = 0, avg = 0, jit = 0, sent = 0, recv = 0, ahead = 0;
+    bool active = (g_session != nullptr) && !g_solo;
+    if (active) {
+        GekkoNetworkStats ns = {};
+        uint8_t remote = (uint8_t)(1 - g_local_idx);
+        gekko_network_stats(g_session, remote, &ns);
+        ping = (float)ns.last_ping; avg = ns.avg_ping; jit = ns.jitter;
+        sent = ns.kb_sent; recv = ns.kb_received;
+        ahead = gekko_frames_ahead(g_session);
+    }
+    sq_newtable(vm);
+    sq_setbool(vm, _SC("active"), active ? SQTrue : SQFalse);
+    sq_setfloat(vm, _SC("ping"),   ping);
+    sq_setfloat(vm, _SC("avg"),    avg);
+    sq_setfloat(vm, _SC("jitter"), jit);
+    sq_setfloat(vm, _SC("sent"),   sent);
+    sq_setfloat(vm, _SC("recv"),   recv);
+    sq_setfloat(vm, _SC("ahead"),  ahead);
+    sq_setinteger(vm, _SC("rb"),       (SQInteger)g_wd_adv_rb_n);
+    sq_setinteger(vm, _SC("fwd"),      (SQInteger)g_wd_adv_fwd_n);
+    sq_setinteger(vm, _SC("frame"),    (SQInteger)g_trace_frame);
+    sq_setinteger(vm, _SC("desync"),   (SQInteger)g_desync_total);
+    sq_setinteger(vm, _SC("delay"),    (SQInteger)g_local_delay);
+    sq_setinteger(vm, _SC("runahead"), (SQInteger)g_runahead);
+    return 1;  // table left on top
+}
+
 // Register ::__gekko_cpp_ser on the root table. Idempotent; called from
 // init()/init_solo() once the Squirrel VM is up.
 static void register_cpp_ser() {
@@ -765,6 +819,7 @@ static void register_cpp_ser() {
     sq_pushroottable(v);
     sq_setfunc(v, _SC("__gekko_cpp_ser"), &gekko_cpp_ser);
     sq_setfunc(v, _SC("__gekko_vec3_register"), &gekko_vec3_register);
+    sq_setfunc(v, _SC("__gekko_netstats"), &gekko_netstats);
     sq_settop(v, top);
     log_printf("[gekko_bridge] registered __gekko_cpp_ser (native walker)\n");
 }
@@ -2621,18 +2676,25 @@ void advance_one_frame() {
                    g_ig_probe2 ? g_ig_probe2[3] : -1);
     // DUAL round-end latch (see g_roundend_latch): evaluated INSIDE the
     // deterministic sim so both peers latch the identical gekko frame.
-    // Conditions: the fight left state 8 (KO demo / transition started),
-    // or the timer ran out while still in state 8 (time-up frame itself).
-    // Keep the EARLIEST latched frame; rollback across it clears the latch
-    // (load_state_from_buf) so it always describes the final timeline.
+    // PRE-BURST BARRIER (mirrors the solo path): the round-end effect
+    // mass-destroy starts BEFORE battle.state leaves 8 — KO hitstop and the
+    // timer-end cinematic run under state 8 — and rolling back across that
+    // destroy latches corpse refs into member-internal lists (the 0xEAC9 /
+    // [haspend] use=-2 crash class). So disarm on the EARLIEST of:
+    //   - state != 8 (a KO/transition already started), OR
+    //   - state == 8 && time <= 20 (the countdown pre-burst window; time is
+    //     sim-deterministic so both peers hit 20 on the identical frame).
+    // Latching at time<=0 (the old condition) was several churn-frames too
+    // late — the burst ran while still armed and fastfailed on both peers.
+    // Rollback across the latch clears it (load_state_from_buf).
     if (!g_solo && g_session_started && g_roundend_latch < 0) {
         int st = 0, bt = 0;
         if (read_battle_state(&st) &&
             (st != 8 ||
-             (read_battle_int(_SC("time"), &bt) && bt <= 0))) {
+             (read_battle_int(_SC("time"), &bt) && bt <= 20))) {
             g_roundend_latch = g_trace_frame;
             log_printf("[gekko_bridge] round-end LATCH f=%d rb=%d "
-                       "(state=%d time=%d)\n",
+                       "(state=%d time=%d) [pre-burst barrier]\n",
                        g_trace_frame, g_trace_rb, st, bt);
         }
     }
@@ -2864,17 +2926,22 @@ bool init(uint16_t local_port, uint16_t remote_port,
 
     gekko_start(g_session, &config);
     gekko_net_adapter_set(g_session, gekko_default_adapter(local_port));
-    // RUNAHEAD 0 (was 8). Runahead is GekkoNet's negative-latency feature:
-    // it PREDICTS LOCAL inputs and rolls back on every local misprediction
-    // — with 8 it rolled back every single frame ([load] count == frame
-    // count), and our 1-add-per-tick cadence paired each peer's own input
-    // stream with session frames burst-dependently (the icring/addin logs
-    // showed the two peers consuming DIFFERENT values for the same player
-    // at the same frame, never converging). Classic fighting-game rollback
-    // = predict REMOTE only; local input is authoritative at add time
-    // (shifted by local delay). Revisit runahead as a feature only after
-    // dual is desync-free.
-    gekko_set_runahead(g_session, 0);
+    // RUNAHEAD: predicts LOCAL inputs and rolls back on every local
+    // misprediction — a rollback most frames. It was the desync engine while
+    // the input-decode bug lived (runahead=8 rolled back every frame and
+    // exposed it); now that determinism is fixed it's safe AND it's the
+    // easiest way to DEMONSTRATE rollback on localhost (rb climbs fast, the
+    // HUD lights up). Default 0 (clean fighting-game rollback: predict remote
+    // only); set SQUIROLL_RUNAHEAD=N to force the stress demo.
+    g_runahead = env_int("SQUIROLL_RUNAHEAD", 0);
+    if (g_runahead < 0) g_runahead = 0;
+    if (g_runahead > 15) g_runahead = 15;
+    gekko_set_runahead(g_session, (uint8_t)g_runahead);
+    g_local_delay = env_int("SQUIROLL_LOCAL_DELAY", 2);
+    if (g_local_delay < 0) g_local_delay = 0;
+    if (g_local_delay > 9) g_local_delay = 9;
+    log_printf("[gekko_bridge] net knobs: runahead=%d local_delay=%d\n",
+               g_runahead, g_local_delay);
 
     g_local_idx = local_player_idx;
     char remote_addr[64];
@@ -2883,7 +2950,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
     for (int i = 0; i < 2; ++i) {
         if (i == local_player_idx) {
             gekko_add_actor(g_session, GekkoLocalPlayer, nullptr);
-            gekko_set_local_delay(g_session, i, 2);
+            gekko_set_local_delay(g_session, i, (uint8_t)g_local_delay);
         } else {
             GekkoNetAddress addr = {};
             addr.data = remote_addr;
@@ -3617,6 +3684,7 @@ bool tick() {
                 // checksums disagree. Throttle to one line per 300 to
                 // keep the log readable while still showing the issue.
                 static uint32_t desync_counter = 0;
+                g_desync_total = desync_counter + 1;   // HUD mirror
                 bool first = (desync_counter == 0);
                 if (first || (desync_counter % 300) == 0) {
                     log_printf("[gekko_bridge] !! DESYNC frame=%d local=0x%08x remote=0x%08x peer_handle=%d (desyncs_so_far=%u)\n",
