@@ -2909,6 +2909,92 @@ void render_one_frame() {
 static void apply_test_round_frames();  // defined below; used by init/init_solo
 static void install_menu_mash_hook();   // defined below; installs the kbd-poll hook
 
+// ============================================================================
+// ARTIFICIAL LATENCY / JITTER / LOSS — a repeatable network-condition harness
+// that wraps GekkoNet's default UDP adapter, so real rollbacks can be forced
+// and the rollback-path crashes (Squirrel GC #27, render) reproduced on
+// demand without an external tool. Env:
+//   SQUIROLL_NET_DELAY_MS  one-way added latency (each direction), default 0
+//   SQUIROLL_NET_JITTER_MS uniform +/- jitter on the delay, default 0
+//   SQUIROLL_NET_LOSS_PCT  packet drop chance 0..100, default 0
+// The delay is applied on RECEIVE (buffer incoming, release after delay+/-jit);
+// loss drops on receive. Uses a PRIVATE rng (never the game's rand — that would
+// perturb the sim); packet timing is NOT sim state, so non-determinism here is
+// exactly what rollback is supposed to absorb.
+// ============================================================================
+namespace {
+static GekkoNetAdapter* g_real_adapter = nullptr;
+static int      g_net_delay = 0, g_net_jitter = 0, g_net_loss = 0;
+static uint32_t g_lag_rng = 0x1234abcdu;
+static inline uint32_t lag_rand() {
+    g_lag_rng ^= g_lag_rng << 13; g_lag_rng ^= g_lag_rng >> 17;
+    g_lag_rng ^= g_lag_rng << 5;  return g_lag_rng;
+}
+struct HeldPkt { uint32_t release_ms; GekkoNetResult* res; };
+static std::vector<HeldPkt>       g_held;
+static std::vector<GekkoNetResult*> g_lag_out;
+
+static void lag_send(GekkoNetAddress* addr, const char* data, int length) {
+    // Loss on the outbound path.
+    if (g_net_loss > 0 && (int)(lag_rand() % 100) < g_net_loss) return;
+    g_real_adapter->send_data(addr, data, length);
+}
+static GekkoNetResult* lag_copy(const GekkoNetResult* r) {
+    GekkoNetResult* c = (GekkoNetResult*)std::malloc(sizeof(*c));
+    c->addr.size = r->addr.size;
+    c->addr.data = std::malloc(r->addr.size ? r->addr.size : 1);
+    if (r->addr.size) std::memcpy(c->addr.data, r->addr.data, r->addr.size);
+    c->data_len = r->data_len;
+    c->data = std::malloc(r->data_len ? r->data_len : 1);
+    if (r->data_len) std::memcpy(c->data, r->data, r->data_len);
+    return c;
+}
+static GekkoNetResult** lag_receive(int* length) {
+    uint32_t now = GetTickCount();
+    // Pull everything the real socket has; stamp each with a release time.
+    int n = 0;
+    GekkoNetResult** real = g_real_adapter->receive_data(&n);
+    for (int i = 0; i < n; ++i) {
+        if (g_net_loss > 0 && (int)(lag_rand() % 100) < g_net_loss) continue;
+        int jit = g_net_jitter > 0
+            ? ((int)(lag_rand() % (2u * g_net_jitter + 1)) - g_net_jitter) : 0;
+        int d = g_net_delay + jit; if (d < 0) d = 0;
+        g_held.push_back({ now + (uint32_t)d, lag_copy(real[i]) });
+    }
+    // Release everything whose time has come (sorted-ish; just scan).
+    g_lag_out.clear();
+    for (size_t i = 0; i < g_held.size(); ) {
+        if ((int32_t)(now - g_held[i].release_ms) >= 0) {
+            g_lag_out.push_back(g_held[i].res);
+            g_held[i] = g_held.back(); g_held.pop_back();
+        } else ++i;
+    }
+    *length = (int)g_lag_out.size();
+    return g_lag_out.data();
+}
+static void lag_free(void* p) { std::free(p); }
+static GekkoNetAdapter g_lag_adapter{ lag_send, lag_receive, lag_free };
+
+// Install the lag wrapper if any knob is set; else return the real adapter.
+static GekkoNetAdapter* make_net_adapter(uint16_t local_port) {
+    g_real_adapter = gekko_default_adapter(local_port);
+    g_net_delay  = env_int("SQUIROLL_NET_DELAY_MS", 0);
+    g_net_jitter = env_int("SQUIROLL_NET_JITTER_MS", 0);
+    g_net_loss   = env_int("SQUIROLL_NET_LOSS_PCT", 0);
+    if (g_net_delay < 0) g_net_delay = 0;
+    if (g_net_jitter < 0) g_net_jitter = 0;
+    if (g_net_loss < 0) g_net_loss = 0; if (g_net_loss > 90) g_net_loss = 90;
+    g_lag_rng ^= (GetTickCount() | 1u);
+    g_held.clear();
+    if (g_net_delay || g_net_jitter || g_net_loss) {
+        log_printf("[netlag] ARTIFICIAL: delay=%dms jitter=%dms loss=%d%%\n",
+                   g_net_delay, g_net_jitter, g_net_loss);
+        return &g_lag_adapter;
+    }
+    return g_real_adapter;
+}
+} // namespace
+
 bool init(uint16_t local_port, uint16_t remote_port,
           uint8_t local_player_idx, const char* remote_ip)
 {
@@ -2932,7 +3018,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
     config.num_players = 2;
 
     gekko_start(g_session, &config);
-    gekko_net_adapter_set(g_session, gekko_default_adapter(local_port));
+    gekko_net_adapter_set(g_session, make_net_adapter(local_port));
     // RUNAHEAD: predicts LOCAL inputs and rolls back on every local
     // misprediction — a rollback most frames. It was the desync engine while
     // the input-decode bug lived (runahead=8 rolled back every frame and
@@ -3371,6 +3457,31 @@ static int thiscall condrange_hook(void** self, uint32_t* info, int counters) {
 // class and proved nothing. Log dev==-1 (keyboard) entries during mash:
 // b0 pulsing 0/1 => the input chain works and the block is script-side;
 // silence => input_talk isn't pumped at the win quote.
+// GC-SUPPRESSION (task #27): the game triggers the Squirrel GC natively during
+// battle. sq_collectgarbage / sq_resurrectunreachable walk SQSharedState's GC
+// object chain — whose HEAD lives outside sq_arena, while the objects' _next
+// links live INSIDE it. A rollback restores the objects (and their links) but
+// not the external head, so MarkObject (0x18BBE0) follows a stale link and
+// faults (0xC0000005, seen only under real rollback depth). Ref-counting frees
+// the common case; the cycle-collector is not needed mid-battle. Suppress it
+// while the session is armed; it runs normally once disarmed.
+static SafetyHookInline g_h_gc{}, g_h_resurrect{};
+static uint32_t g_gc_suppressed = 0;
+static int sq_collectgarbage_hook(int vm) {
+    if (g_session_started) {
+        ++g_gc_suppressed;
+        static int q = 6;
+        if (q > 0) { --q; log_printf("[gc] collectgarbage suppressed while "
+                                     "armed (#%u)\n", g_gc_suppressed); }
+        return 0;
+    }
+    return g_h_gc.unsafe_call<int>(vm);
+}
+static int sq_resurrectunreachable_hook(int vm) {
+    if (g_session_started) { ++g_gc_suppressed; return 0; }
+    return g_h_resurrect.unsafe_call<int>(vm);
+}
+
 static SafetyHookInline g_h_isu{};
 static int thiscall inputsingle_update_hook(int self) {
     // [isucnt] rb-window call counter for the two VISIBLE player devices:
@@ -3491,6 +3602,12 @@ static void install_menu_mash_hook() {
     g_h_condrange = safetyhook::create_inline((void*)(0x6A720_R), (void*)condrange_hook);
     g_h_isu = safetyhook::create_inline((void*)(0x168510_R), (void*)inputsingle_update_hook);
     g_h_imu = safetyhook::create_inline((void*)(0x6F360_R), (void*)inputmulti_update_hook);
+    g_h_gc = safetyhook::create_inline((void*)(0x182040_R), (void*)sq_collectgarbage_hook);
+    g_h_resurrect = safetyhook::create_inline((void*)(0x184E60_R), (void*)sq_resurrectunreachable_hook);
+    log_printf("[gc] GC-suppression hooks: collectgarbage @0x182040 %s, "
+               "resurrectunreachable @0x184E60 %s\n",
+               g_h_gc.enabled() ? "OK" : "FAIL",
+               g_h_resurrect.enabled() ? "OK" : "FAIL");
     log_printf("[addrmap3] nbase=%p isu_hook=N+%X imu_hook=N+%X advance=N+%X\n",
                (void*)GetModuleHandleW(L"Netcode.dll"),
                (uint32_t)((uintptr_t)&inputsingle_update_hook
