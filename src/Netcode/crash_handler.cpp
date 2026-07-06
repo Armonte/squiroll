@@ -398,6 +398,45 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
         if (next <= ebp) break;  // frames must climb the stack
         ebp = next;
     }
+    // EXEC-AT-HEAP diagnosis (task #28 render crash): when EIP is in no module
+    // (executing heap because a vtable/fptr was corrupted), the ebp chain is
+    // all-driver and useless. Scan the CRASHED stack (gc->Esp) for th155
+    // return addresses to recover the game render call site, AND probe the
+    // registers/stack for the object whose vtable points into heap (the freed
+    // render/effect object). Also dump the bytes at EIP (the fake "code" = the
+    // object's overwritten first dword) so we can see what clobbered it.
+    {
+        bool in_image = (c->Eip >= ::base_address + 0x1000 &&
+                         c->Eip <  ::base_address + 0x300000);
+        if (!in_image) {
+            crash_logf("  --- exec-at-heap: th155 render call site scan ---\r\n");
+            const uint32_t* sp = (const uint32_t*)(uintptr_t)c->Esp;
+            for (int k = 0, shown = 0; k < 256 && shown < 16; ++k) {
+                if (IsBadReadPtr((void*)&sp[k], 4)) break;
+                uint32_t v = sp[k];
+                uint32_t rva = v - (uint32_t)::base_address;
+                if (rva >= 0x1000 && rva < 0x300000) {
+                    describe_addr(v, loc);
+                    crash_logf("    esp[+0x%03X] rva=%08X  %s\r\n",
+                               k * 4, rva, loc);
+                    ++shown;
+                }
+            }
+            // The corrupted object: EIP is its clobbered vtable[0] target;
+            // dump 16 bytes at EIP (the object's first bytes) + the regs that
+            // likely hold the object pointer.
+            if (!IsBadReadPtr((void*)(uintptr_t)c->Eip, 16)) {
+                const uint8_t* p = (const uint8_t*)(uintptr_t)c->Eip;
+                crash_logf("  obj-bytes @EIP: %02X %02X %02X %02X %02X %02X %02X "
+                           "%02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+                           p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
+                           p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
+            }
+            crash_logf("  regs: eax=%08X ecx=%08X edx=%08X esi=%08X edi=%08X "
+                       "ebx=%08X\r\n", c->Eax, c->Ecx, c->Edx, c->Esi,
+                       c->Edi, c->Ebx);
+        }
+    }
     crash_logf("==== END CRASH ====\r\n");
 
     // Drain the async log queue AFTER the crash dump is safely on disk: if
