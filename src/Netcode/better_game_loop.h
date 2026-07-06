@@ -16,4 +16,8 @@ uint32_t render_fps();
 // Monotonic per-real-frame counter (see better_game_loop.cpp).
 uint32_t sim_real_frame();
 
+// End the frame loop cleanly (e.g. on remote peer disconnect). v1 closes the
+// window; shipping should unwind to the menu instead (task #29).
+void request_shutdown();
+
 #endif

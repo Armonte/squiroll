@@ -17,6 +17,7 @@
 #include "snapshot_ring.h" // snapshot_ring::gl_capture (game-loop render-dispatch pin)
 #include "sync_pin.h"      // forget freed locks (never re-apply stale lock bytes)
 #include "bullet_arena.h"  // bullet_arena::base/capacity
+#include "render_arena.h"  // NON-snapshotted region for plugin UI (unsnapshotted scope)
 
 namespace actor2d_log { void watch_arm(uint32_t addr); }  // Dr0 write-watch (VEH logs writer rva)
 
@@ -833,6 +834,14 @@ static bool is_render_caller(uint32_t abs_caller) {
 // excluded set (audio) also passes through: its objects are non-deterministic
 // and must stay out of the snapshot. On overflow likewise fall through.
 static void* cdecl hook_op_new(size_t size) {
+    // Unsnapshotted scope (render_arena): squiroll's UI layer brackets plugin
+    // render-object creation/mutation with this scope so those allocations land
+    // in a region the rollback NEVER rewinds. Highest priority + thread-local,
+    // so only the thread inside the scope is affected. See render_arena.h.
+    if (render_arena::in_scope()) {
+        void* p = render_arena::alloc(size);
+        if (p) return p;   // OOM -> fall through to the normal path
+    }
     if (g_armed && g_meta) {
         uint32_t caller = (uint32_t)(uintptr_t)_ReturnAddress();
         g_opnew_caller = caller;
@@ -922,6 +931,10 @@ static void* cdecl hook_op_new(size_t size) {
 // freed from the forward pass; the bounded leak is the transient buffers a
 // growing std::vector sheds — they stop once capacity settles).
 static void cdecl hook_free(void* block) {
+    // render_arena pointers (plugin UI, unsnapshotted) route to its own free —
+    // range-checked, so it's exact and cheap. Never rolled back, so freeing
+    // from a re-sim is a non-issue (the UI layer only allocates forward anyway).
+    if (render_arena::owns(block)) { render_arena::free(block); return; }
     if (in_arena(block)) {
         // Non-sim, non-worker threads (the audio thread) freeing an arena
         // block — necessarily a pre-gate baseline object — would push it
@@ -1113,6 +1126,8 @@ static void __stdcall det_getlocaltime(unsigned short* st) {
 
 void install() {
     if (g_installed) return;
+
+    render_arena::init();   // NON-snapshotted region for plugin UI (see render_arena.h)
 
     {   // SQUIROLL_FLATTEN_JOBS=1 -> run cJobThread jobs inline (deterministic order)
         char fb[8] = {0};

@@ -29,6 +29,7 @@ namespace fs = std::filesystem;
 #include "lobby.h"
 #include "sq_debug.h"
 #include "gekko_bridge.h"
+#include "render_arena.h"
 #include "discord.h"
 #include "overlay.h"
 #include "frame_data_display.h"
@@ -423,6 +424,17 @@ extern "C" {
 
             sq_setfunc(v, _SC("print"), sq_print);
             sq_setfunc(v, _SC("fprint"), sq_fprint);
+
+            // Rollback-safe UI: enter/leave the render_arena "unsnapshotted"
+            // scope. Allocations made between enter and leave land in a region
+            // the rollback NEVER rewinds, so a plugin's render objects can't be
+            // corrupted by a re-sim. squiroll's UI layer brackets render-object
+            // creation/mutation with these; ::rollback.unsnapshotted(fn) wraps
+            // them for hand-rolled render state. See render_arena.h.
+            sq_setfunc(v, _SC("__render_unsnap_enter"), [](HSQUIRRELVM) -> SQInteger {
+                render_arena::enter(); return 0; });
+            sq_setfunc(v, _SC("__render_unsnap_leave"), [](HSQUIRRELVM) -> SQInteger {
+                render_arena::leave(); return 0; });
 
             // [nuttrace] -- .nut-side divergence tracer. ::__gekko_trace(tag, val)
             // logs the value (float bits, or int) tagged with the authoritative

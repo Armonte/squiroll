@@ -13,6 +13,7 @@
 #include "config.h"
 #include "gekko_bridge.h"
 #include "cpp_arena.h"
+#include "render_arena.h"
 
 // Superluminal markers for debugging frametime spikes
 #define PROFILING 0
@@ -75,6 +76,14 @@ static void cdecl set_window_mode_custom(int, int, bool fullscreen, bool vsync) 
 
 static bool fullscreen_queued = false;
 static bool exit_requested = false;
+
+// Ends the frame loop cleanly (loop exits -> WM_DESTROY). Called when the
+// remote peer drops (GekkoPlayerDisconnected): GekkoNet otherwise synthesizes
+// the dead peer's inputs and the survivor plays on solo forever, hanging the
+// window (and holding Netcode.dll open across a redeploy). v1 = close; a
+// shipping build should instead unwind to the main menu with a "peer left"
+// notice — see task #29.
+void request_shutdown() { exit_requested = true; }
 // GetFPS() (th155 0xEA21, patched below to read this) feeds a script-computed
 // sim dt = 1/GetFPS(). It updates once/sec from the real frame count, so it
 // drifts across a rollback burst -> a frame's forward pass and its re-sim read

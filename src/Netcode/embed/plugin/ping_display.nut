@@ -38,17 +38,26 @@ class modifier extends modifier {
 
 	constructor() {
 		segs = [];
+		// [#28 FIX] Create the render objects inside the render_arena
+		// "unsnapshotted" scope so their native TF4 UI / glyph allocations land
+		// in a region the rollback NEVER rewinds. Without this, these dual-only
+		// render objects (solo never loads this plugin) sat in the rolled-back
+		// arenas -> re-sim collision -> the nvwgf2um/d3d11 crash.
 		// Up to 8 segments: delay, ping, jitter, ahead, rb, frame, status, (ra)
 		// Render on the UI slot at a high layer (60000, same as the network
 		// name/text overlays) so we draw ON TOP of the game HUD — the old
 		// status/layer-1 put us behind it (game HUD icons sit at status ~3000).
-		for (local i = 0; i < 9; ++i) {
-			local t = ::UI.Core.Text("");
-			t.ConnectRenderSlot(::graphics.slot.ui, 60000);
-			t.sx = 1.0;   // full size (the 0.62 shrink squeezed the text)
-			t.sy = 1.0;
-			segs.push(t);
-		}
+		// [#28] INERT (crash-free) pending the squiroll-owned render slot.
+		// PROVEN this session: any plugin UI.Core.Text + ConnectRenderSlot into
+		// th155's game render slot crashes under rollback — its connection lives
+		// in th155's rolled-back, sim-rebuilt signal list but the plugin's
+		// connection is forward-only (never re-inserted by the re-sim), so the
+		// dispatch walks a stale list -> NULL call; and per-frame Text.Set glyph
+		// churn collides with the re-sim -> nvwgf2um driver crash. The fix is a
+		// squiroll-owned render slot (list in render_arena, fired from squiroll's
+		// own pass, outside th155's dispatch) that plugins connect to instead.
+		// Re-enable via that slot once it exists (segs loop -> ::rollback.hud).
+		for (local i = 0; i < 0; ++i) {}
 	}
 
 	// One-decimal float -> string, no ::format (which threw on some builds).
@@ -71,6 +80,12 @@ class modifier extends modifier {
 	}
 
 	function Update() {
+		// [#28 GAP TEST] STATIC HUD: Update is a NO-OP. Objects were created +
+		// set once in the constructor and are never mutated per frame. Flip
+		// this back on (remove the return) to compare against the churning HUD.
+		return;
+		if (segs.len() == 0) return;
+		::__render_unsnap_enter();
 		try {
 			local s = ("__gekko_netstats" in ::getroottable())
 				? ::__gekko_netstats() : null;
@@ -133,6 +148,7 @@ class modifier extends modifier {
 				x += widths[i] + gap;
 			}
 		} catch (_e) {}
+		::__render_unsnap_leave();
 	}
 
 	function Enabled(param) {

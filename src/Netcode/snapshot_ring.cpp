@@ -1249,6 +1249,17 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
     // holds every page's state as of capture(g_cur), so reverting the current
     // write-watch dirty set to the mirror completes the chain:
     //     live --(mirror)--> g_cur --(ring deltas)--> target.
+    // [#28 experiment] SQUIROLL_NO_STEP0: skip the post-capture revert for the
+    // tf4 arenas (3/4) — the render pass writes draw-command/vertex scratch into
+    // region A AFTER the save, and the D3D driver retains pointers into that
+    // scratch from the last Present. STEP 0 rewinds those pages under the driver,
+    // dangling its pointers -> nvwgf2um exec-at-heap. Leaving the tf4 post-capture
+    // writes LIVE keeps the driver's scratch pointers valid. Diagnostic gate:
+    //   =0 (default) revert all arenas (current behaviour)
+    //   =1 skip revert for tf4 arenas only (3,4) — test the driver-crash cause
+    //   =2 skip revert for ALL arenas
+    static const int no_step0 = []{
+        const char* e = getenv("SQUIROLL_NO_STEP0"); return e ? atoi(e) : 0; }();
     for (int a = 0; a < NARENA; ++a) {
         Arena& A = g_ar[a];
         if (!A.size) continue;
@@ -1262,11 +1273,14 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
             log_printf("[snapshot_ring] !! restore GetWriteWatch failed arena=%d\n", a);
             continue;
         }
-        for (ULONG_PTR i = 0; i < count; ++i) {
-            uint32_t off = (uint32_t)((uint8_t*)g_pgbuf[i] - A.base);
-            if (off + PAGE > A.size) continue;
-            memcpy(A.base + off, A.mirror + off, PAGE);   // live -> state(g_cur)
-            // mirror/phash already hold the capture(g_cur) value — untouched.
+        const bool skip_revert = (no_step0 == 2) || (no_step0 == 1 && (a == 3 || a == 4));
+        if (!skip_revert) {
+            for (ULONG_PTR i = 0; i < count; ++i) {
+                uint32_t off = (uint32_t)((uint8_t*)g_pgbuf[i] - A.base);
+                if (off + PAGE > A.size) continue;
+                memcpy(A.base + off, A.mirror + off, PAGE);   // live -> state(g_cur)
+                // mirror/phash already hold the capture(g_cur) value — untouched.
+            }
         }
         LARGE_INTEGER w2; QueryPerformanceCounter(&w2); r_s0cp += w2.QuadPart - w1.QuadPart;
     }

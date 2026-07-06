@@ -684,6 +684,53 @@ uint32_t rng_save(uint8_t* out, uint32_t cap) {
     return (uint32_t)(p - out);   // never 0: 8-byte header stands even when empty
 }
 
+// [#28] restore-write software watchpoint. engine_snap::load / rng_load write
+// to blob-stored addresses WITHOUT re-validation (perf). If one of those
+// "stable" addresses was freed and reused for a D3D-runtime object, the restore
+// clobbers it -> the driver type-confusion crash under rollback. The D3D object
+// heap sits at ~0x05M (device/context) and ~0x14-0x18M (texture objects, the
+// crash EIP band). Log any restore target in the low-heap band below the
+// snapshot arenas (arenas start at 0x24M), LOUDLY if it lands in the crash band.
+// Returns TRUE if the caller should SKIP this restore write. SQUIROLL_SKIP_D3D_BAND
+// causes writes into the D3D-object heap band to be skipped — the causation test:
+// if the crash stops, these writes ARE corrupting D3D memory; if desync appears,
+// they were legit sim state co-located in the shared heap.
+static bool in_d3d_band(uint32_t a) {
+    return (a >= 0x14000000u && a < 0x18000000u) ||
+           (a >= 0x05000000u && a < 0x06000000u);
+}
+static bool g_skip_d3d_band = []{ const char* e = getenv("SQUIROLL_SKIP_D3D_BAND");
+                                  return e && atoi(e); }();
+static bool restore_wp(const char* tag, uint32_t a, uint32_t l) {
+    static int budget = 60;
+    if (a < 0x01000000u || a >= 0x24000000u) return false;
+    if (!in_d3d_band(a)) return false;       // only the D3D-band clobbers matter
+    if (budget <= 0) return g_skip_d3d_band;
+    --budget;
+    // Dump the CURRENT first word at the target: if it's a pointer into
+    // d3d11.dll / nvwgf2um.dll it's a live D3D COM object's VTABLE and this
+    // restore is clobbering it (the type-confusion crash). Read via a
+    // committed-check so a bad addr can't fault us here.
+    uint32_t cur = 0; const char* vt = "?";
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((void*)(uintptr_t)a, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT) {
+        cur = *(const uint32_t*)(uintptr_t)a;
+        // is `cur` a code/vtable pointer into a DLL module (not our heaps)?
+        MEMORY_BASIC_INFORMATION m2;
+        if (VirtualQuery((void*)(uintptr_t)cur, &m2, sizeof m2) &&
+            m2.State == MEM_COMMIT && m2.Type == MEM_IMAGE) {
+            char name[MAX_PATH] = {0};
+            GetModuleFileNameA((HMODULE)m2.AllocationBase, name, MAX_PATH);
+            const char* b = name; for (const char* q = name; *q; ++q) if (*q=='\\') b = q+1;
+            vt = b;
+        }
+    }
+    log_printf("[#28wp] %s restore-write dst=%08x len=%u cur=%08x vtmod=%s "
+               "**D3D-HEAP BAND**%s\n", tag, a, l, cur, vt,
+               g_skip_d3d_band ? " [SKIPPED]" : "");
+    return g_skip_d3d_band;
+}
+
 void rng_load(const uint8_t* blob, uint32_t len) {
     if (len < 8) return;
     const uint8_t* p = blob; const uint8_t* e = blob + len;
@@ -695,7 +742,8 @@ void rng_load(const uint8_t* blob, uint32_t len) {
         memcpy(&a, p, 4); p += 4; memcpy(&l, p, 4); p += 4;
         if (p + l > e) return;
         // No region_ok: save-validated, battle-stable addresses (see load()).
-        if (a && l && l <= 0x9C8) memcpy((void*)(uintptr_t)a, p, l);
+        if (a && l && l <= 0x9C8) { if (!restore_wp("rng", a, l))
+            memcpy((void*)(uintptr_t)a, p, l); }
         p += l;
     }
 }
@@ -724,7 +772,7 @@ void load(const uint8_t* blob, uint32_t len) {
         // singletons allocated once), so per-load VirtualQuery was pure overhead
         // (~5.5ms/load). A stale-address blob can't reach us: the cache resets at
         // arm and gekko only restores same-match frames.
-        if (a) memcpy((void*)(uintptr_t)a, p, l);
+        if (a) { if (!restore_wp("eng", a, l)) memcpy((void*)(uintptr_t)a, p, l); }
         p += l;
     }
 }

@@ -555,6 +555,32 @@ static bool bp_writable(uint32_t a, uint32_t n) {
     return (uint64_t)a + n <= (uint64_t)rbase + mbi.RegionSize;
 }
 
+// [#28] shared-heap D3D-clobber watchpoint (mirror of engine_snap.cpp). A
+// restore write into the D3D-object heap band (~0x05M device/context, ~0x14-
+// 0x18M texture objects) clobbers a live D3D COM object = the driver
+// type-confusion crash under rollback. Log (first 60) + optionally SKIP the
+// write (SQUIROLL_SKIP_D3D_BAND) to prove causation.
+static bool bp_d3d_band(uint32_t a) {
+    return (a >= 0x14000000u && a < 0x18000000u) ||
+           (a >= 0x05000000u && a < 0x06000000u);
+}
+static bool g_bp_skip_band = []{ const char* e = getenv("SQUIROLL_SKIP_D3D_BAND");
+                                 return e && atoi(e); }();
+static bool bp_wp(const char* tag, uint32_t a, uint32_t l) {
+    if (!bp_d3d_band(a)) return false;
+    static int budget = 60;
+    if (budget > 0) {
+        --budget;
+        uint32_t cur = 0; MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((void*)(uintptr_t)a, &mbi, sizeof mbi) &&
+            mbi.State == MEM_COMMIT) cur = *(const uint32_t*)(uintptr_t)a;
+        log_printf("[#28wp] %s restore-write dst=%08x len=%u cur=%08x "
+                   "**D3D-HEAP BAND**%s\n", tag, a, l, cur,
+                   g_bp_skip_band ? " [SKIPPED]" : "");
+    }
+    return g_bp_skip_band;
+}
+
 void boostpool_load(const uint8_t* blob, uint32_t len) {
     if (len < 8) return;
     const uint8_t* p   = blob;
@@ -606,7 +632,8 @@ void boostpool_load(const uint8_t* blob, uint32_t len) {
             bool probe_here = (g_va_probe >= addr && g_va_probe < addr + size);
             uint32_t va_live  = probe_here ? *(const uint32_t*)(uintptr_t)g_va_probe : 0;
             uint32_t va_blob  = probe_here ? *(const uint32_t*)(p + (g_va_probe - addr)) : 0;
-            if (ok_target) memcpy((void*)(uintptr_t)addr, p, size);
+            if (ok_target && !bp_wp("boost", addr, size))
+                memcpy((void*)(uintptr_t)addr, p, size);
             if (probe_here && _llog) {
                 _probe_seen = true;
                 log_printf("[bpload] loadframe=%d f=%d d=%d pool#%u block %08X ok=%d "
@@ -675,7 +702,7 @@ void load(const uint8_t* blob, uint32_t len) {
             uint32_t sa = 0;
             if (!get_u32(sa)) return;
             if (p + ss > end) return;
-            memcpy((void*)(uintptr_t)sa, p, ss);
+            if (!bp_wp("bppool", sa, ss)) memcpy((void*)(uintptr_t)sa, p, ss);
             p += ss;
         }
 

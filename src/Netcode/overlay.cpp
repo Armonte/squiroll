@@ -22,6 +22,7 @@
 #include "TF4.h"
 #include "bt.h"
 #include "sqrat.h"
+#include "d3d_probe.h"    // [#28] region-A D3D resource probe
 
 static constexpr uint8_t hitbox_vert_cso[] = {
 #include "shaders/hitbox_vert.cso.h"
@@ -726,6 +727,11 @@ void overlay_clear() {
 
 static HitboxConstantBuffer hitbox_last_cb = {};
 void overlay_draw() {
+    { static bool o = false; if (!o) { o = true;
+        log_printf("[#28tid] overlay_draw(render) thread tid=%lu\n",
+                   GetCurrentThreadId()); } }
+    d3d_probe_arm();   // [#28] one-shot D3D vtable probe (SQUIROLL_D3D_PROBE=1)
+
     if (!overlay_supported)
         return;
 
@@ -823,4 +829,44 @@ void overlay_draw() {
     imm->VSSetShaderResources(0, 1, &null_srv);
     imm->PSSetShader(orig_ps, nullptr, 0);
     imm->PSSetConstantBuffers(0, 1, &null_buf);
+}
+
+// ---------------------------------------------------------------------------
+// GPU idle-sync before a rollback restore (task #28). The NVIDIA D3D11 driver
+// processes the submitted command queue on its own worker threads AFTER
+// Present returns; the next tick's rollback then rewrites tf4-mspace memory
+// those threads still reference -> exec-at-heap crash on a driver thread.
+// Flush the immediate context and spin on an EVENT query until the GPU has
+// drained, so nothing is in-flight when the restore rewrites the arenas.
+// Same thread as render (better_game_loop), so touching the immediate context
+// here is safe.
+void gpu_sync_idle() {
+    ID3D11Device*        dev = d3d11_dev ? *d3d11_dev : nullptr;
+    ID3D11DeviceContext* imm = d3d11_imm ? *d3d11_imm : nullptr;
+    static int diag = 40;   // throttled diagnostics for the first calls
+    if (!dev || !imm) {
+        if (diag > 0) { --diag; log_printf("[gpusync] SKIP dev=%p imm=%p\n", dev, imm); }
+        return;
+    }
+    static ID3D11Query* q = nullptr;
+    if (!q) {
+        D3D11_QUERY_DESC qd{};
+        qd.Query = D3D11_QUERY_EVENT;
+        if (FAILED(dev->CreateQuery(&qd, &q)) || !q) {
+            if (diag > 0) { --diag; log_printf("[gpusync] CreateQuery FAILED\n"); }
+            imm->Flush();
+            return;
+        }
+    }
+    imm->End(q);          // signals when the GPU reaches this point
+    imm->Flush();         // kick the queue so the event can actually complete
+    int spin = 0;
+    HRESULT hr = S_FALSE;
+    for (; spin < 8000000; ++spin) {
+        BOOL done = FALSE;
+        hr = imm->GetData(q, &done, sizeof(done), 0);
+        if (hr == S_OK) break;      // GPU drained
+        if (hr != S_FALSE) break;   // error — don't hang
+    }
+    if (diag > 0) { --diag; log_printf("[gpusync] drained spin=%d hr=0x%08x\n", spin, (unsigned)hr); }
 }

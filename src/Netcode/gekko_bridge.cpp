@@ -36,6 +36,7 @@
 #include "snapshot_ring.h" // dirty-page rollback snapshot for the big arenas
 #include "input_hist.h"    // per-player input-history capture
 #include "crash_handler.h" // watch_cxx — log C++ throws in a re-sim
+#include "overlay.h"       // gpu_sync_idle — drain GPU before a rollback restore (#28)
 #include "rollback.h"      // layer-4 sq-diff identifier
 #include <squirrel.h>
 // squiroll routes every sq_* call through a runtime-filled KITE table —
@@ -1628,6 +1629,13 @@ void load_state_from_buf(const void* buf, uint32_t len) {
                    hdr->magic, hdr->version);
         return;
     }
+
+    // [#28] thread audit: log the restore thread TID once so it can be compared
+    // against the D3D DRAW thread ([d3dprobe] DRAW thread). Same TID = render
+    // and rollback serialize on one thread (no context race); different =
+    // concurrent immediate-context use during the arena rewrite.
+    { static bool once = false; if (!once) { once = true;
+        log_printf("[#28tid] restore thread tid=%lu\n", GetCurrentThreadId()); } }
 
     acrt_getptd()->rand_state = hdr->rand_state;
     // TODO: restore frame counter if/where it lives
@@ -3791,8 +3799,15 @@ bool tick() {
                            e->data.connected.handle);
                 break;
             case GekkoPlayerDisconnected:
-                log_printf("[gekko_bridge] PlayerDisconnected handle=%d\n",
+                // The remote peer stopped responding for DISCONNECT_TIMEOUT
+                // (5s) — crash, quit, or a dead link. GekkoNet would otherwise
+                // synthesize its inputs and let us play on solo forever (the
+                // "surviving instance hangs" symptom + it holds Netcode.dll open
+                // across a redeploy). End the session so the survivor unwinds.
+                log_printf("[gekko_bridge] !! PlayerDisconnected handle=%d — "
+                           "ending session (peer dropped)\n",
                            e->data.disconnected.handle);
+                if (!g_solo) { log_flush(); request_shutdown(); }
                 break;
             case GekkoSessionStarted:
                 // vs.Initialize already ran under the vanilla loop and
@@ -4036,6 +4051,27 @@ bool tick() {
             log_printf("[evorder]%s\n", line);
         }
     }
+
+    // [#28] Experimental GPU drain before a rollback restore. DISPROVEN as a
+    // fix: instrumentation showed gpu_sync_idle genuinely blocks until the GPU
+    // is idle (spin=2.5k..27k, hr=S_OK) yet the nvwgf2um driver-thread
+    // exec-at-heap crash persists. That rules out a timing race — the driver
+    // holds PERSISTENT pointers INTO tf4-mspace region A (a callback/vtable
+    // whose bytes the restore rewrites), so it is a reference-consistency
+    // problem, not "GPU still reading". Gated OFF by default (env opt-in) so
+    // the costly per-rollback stall is gone; kept for A/B experiments.
+    //   SQUIROLL_GPU_SYNC=1 : drain only on batches that contain a Load (cheap)
+    //   SQUIROLL_GPU_SYNC=2 : drain EVERY tick before events (catches the case
+    //                         where the driver references arena memory on a
+    //                         rollback-ADJACENT frame the Load-gate misses)
+    static const int gpu_sync_on = env_int("SQUIROLL_GPU_SYNC", 0);
+    if (gpu_sync_on && !g_solo && g_session_started) {
+        bool want = (gpu_sync_on >= 2);
+        if (!want) for (int i = 0; i < count; ++i)
+            if (uevents[i]->type == GekkoLoadEvent) { want = true; break; }
+        if (want) gpu_sync_idle();
+    }
+
     bool advanced = false;
     for (int i = 0; i < count; ++i) {
         GekkoGameEvent* e = uevents[i];
