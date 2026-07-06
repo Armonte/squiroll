@@ -43,8 +43,8 @@ class modifier extends modifier {
 		for (local i = 0; i < 9; ++i) {
 			local t = ::UI.Core.Text("");
 			t.ConnectRenderSlot(::graphics.slot.ui, 60000);
-			t.sx = 0.62;
-			t.sy = 0.62;
+			t.sx = 1.0;   // full size (the 0.62 shrink squeezed the text)
+			t.sy = 1.0;
 			segs.push(t);
 		}
 	}
