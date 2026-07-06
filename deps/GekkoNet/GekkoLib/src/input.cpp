@@ -75,6 +75,19 @@ void Gekko::InputBuffer::AddInput(Frame frame, u8* input)
                 const Frame diff = _last_predicted_input - _first_predicted_input;
                 for (Frame i = 0; i <= diff; i++) {
                     const Frame pred_frame = _first_predicted_input + i;
+                    // SQUIROLL FIX (baked-frame desync): the sim may have
+                    // already consumed the OLD predicted value for this
+                    // frame. Rewriting the buffer silently means the later
+                    // real arrival for pred_frame can MATCH the rewritten
+                    // value ("correct prediction") and never mark it
+                    // incorrect -> the wrong advance stays baked into the
+                    // timeline forever (cross-peer sustained desync at a
+                    // multi-frame correction sequence). Mark every frame
+                    // whose buffered value actually changes; over-marking
+                    // only deepens the rollback, never corrupts.
+                    if (i > 0 && !_inputs[pred_frame % _buff_size]->IsEqualTo(input)) {
+                        _incorrent_predicted_inputs.push_back(pred_frame);
+                    }
                     _inputs[pred_frame % _buff_size]->Init(pred_frame, input, _input_size);
                 }
 
