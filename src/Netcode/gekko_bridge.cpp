@@ -1625,10 +1625,14 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         if (g_arena_rollback)
             ok = ok && put_section("cpp_arena", &cpp_arena::save);
         cpp_sect_end = p;
-        // [M4-diag] skip bullet's 7.6MB blob in structural to test whether its
-        // save/restore cost is what starves re-sim catch-up (#17). Physics will
-        // desync (expected); the question is whether it now CONVERGES to forward.
-        if (g_arena_rollback) ok = ok && put_section("bullet", &bullet_arena::save);
+        // Bullet physics arena is SIM state — save+restore in BOTH raw and
+        // structural mode (the [M4-diag] skip that omitted it in structural was
+        // reverted: skipping it left physics un-rewound, which corrupted re-sim
+        // and stalled the peers — NOT a perf win, since the real cost was the
+        // ::battle Squirrel walk, now fixed). Bullet's deep pointer graph gets a
+        // proper minimal serializer later (task #41); for now the raw blob is
+        // correct and its ~7.6MB memcpy is cheap vs the Squirrel walk.
+        ok = ok && put_section("bullet", &bullet_arena::save);
         ok = ok && put_section("input",     &input_rec_save);
         // [M4] RNG rides a separate "restore-but-not-checksum" section that the
         // raw path handles via snapshot_ring, NOT via Trailer 2. Append it to
@@ -1961,13 +1965,13 @@ void load_state_from_buf(const void* buf, uint32_t len) {
             }
             load_fn(ap, slen); ap += slen; return true;
         };
-        // Order matches the structural-mode save (sq + cpp omitted): pools,
-        // boostpools, engine, bullet, input, rng.
-        // [M4-diag] bullet skipped in structural save (see save side) — restore
-        // order: pools, boostpools, engine, input, rng.
+        // Order MUST match the structural-mode save (sq + cpp omitted): pools,
+        // boostpools, engine, bullet, input, rng. (bullet restored again after
+        // the [M4-diag] skip was reverted.)
         if (get_section("pools",      &battle_pools::load) &&
             get_section("boostpools", &battle_pools::boostpool_load) &&
             get_section("engine",     &engine_snap::load) &&
+            get_section("bullet",     &bullet_arena::load) &&
             get_section("input",      &input_rec_load))
             get_section("rng",        &engine_snap::rng_load);
     }
