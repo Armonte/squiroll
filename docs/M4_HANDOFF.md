@@ -1,5 +1,26 @@
 # M4 Handoff — Structural Rollback: minimal serialization
 
+> ## ⚡ 2026-07-06 RESOLUTION — the godlike-fast-correct path already exists (RAW mode)
+> The "structural SAVE mode" (`SQUIROLL_ARENA_ROLLBACK=0`) that produced the 9MB state was a **detour**. The correct design was already implemented in **raw mode** (default, `=1`):
+> - **save/restore = `snapshot_ring` dirty-page** (~24KB/frame churn for bullet, KB total) → GekkoNet state = a tiny frame handle, **NOT 9MB**.
+> - **cross-peer desync checksum = the structural `::battle` hash** (`gekko_bridge.cpp:1436-1486`, `final_cs`, `!g_solo` only) — pointer-independent, canonical, matches byte-for-byte between peers. This is the ONE job structural is uniquely good at.
+> - Today's **method-name omission fix** (`raw_ser_*`) directly accelerated that checksum: `call_squirrel_save` blob 170KB→38KB, `save_battle` ~4.7ms→**~3.1ms**.
+>
+> **PROOF (`run_both_notf4a.bat`, raw dual, 6% loss + 20ms jitter):** both peers ran the **full 90s, ZERO desync, clean exit** (`f=3531/3526`), **~39fps**. Dirty-page sustains dual; the structural checksum agrees cross-peer. Correctness = DONE.
+>
+> **REMAINING (not correctness):** (1) perf headroom 39→60fps under stress = task #25 (the ~3.1ms checksum + snapshot_ring capture; consider hashing a minimal sim-field set instead of the full ::battle walk). (2) validate the REAL online flow (lobby→CSS→battle) not just auto_connect (#24). (3) M5 (#36): decide whether to keep/retire the `=0` structural-save path (now only useful as the checksum's serializer + a dev oracle).
+>
+> ### Perf (task #25/#26) + shipping-hardening status (2026-07-06)
+> - **60fps: MET on good connections** — `run_both_good.bat` (15ms delay, 0 loss/jitter) = 59.8fps both peers, 0 rollbacks, 0 desync. Bad-connection torture (`run_both_notf4a.bat`, 6% loss) degrades gracefully to ~48fps. Perf commits: `bc43714` (Lever 1 diag strip, 39→46 — the big win), `f64e694` (Lever 2b/3a checksum load-only skip, →48). Remaining save ~6.5ms = genuine work (checksum walk + dirty-page capture + pool serialize); further trimming only helps the bad-conn margin (diminishing).
+> - **#27 GC crash: MITIGATED + verified** — GC suppressed while armed (sound: refcounting keeps live flat ~8.5MB, cyclic leak ~750KB/match vs 64MB cap, 0 crash/OOM). Proper fix (snapshot the GC-chain head) → M5 #36.
+> - **#21 rollback-SFX: HANDLED** — audio write skipped during re-sim (cl_iter_guard.cpp:206), no double-play.
+> - **GENUINE REMAINING GAPS (untested/unbuilt):** #24 real lobby→CSS→battle flow (only auto_connect tested), #29 peer-disconnect → unwind to menu (currently closes), #23 mod-plugin round-end guards, #22 multi-round CSS loop.
+>
+> The sections below are the PRE-resolution plan (kept for context). The structural-SAVE minimization work (M4a/b/c/d) is **moot for shipping** — raw dirty-page already wins. Structural serialization lives on ONLY as the checksum.
+
+---
+
+
 **Status: M4 in progress. Structural serialization is PROVEN CORRECT for PvP. The remaining work is a performance redesign: make the save MINIMAL (KB, not MB) so it's faster than the raw dirty-page path.** This resolves the dual real-time stall and delivers the "render is never rewound" goal at speed.
 
 All M4 work is gated behind `SQUIROLL_ARENA_ROLLBACK=0` — the raw/default build is byte-for-byte unchanged and unaffected. Committed: `7057e50` (+ uncommitted diagnostics, see §6).

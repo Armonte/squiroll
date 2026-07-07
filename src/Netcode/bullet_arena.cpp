@@ -199,6 +199,13 @@ size_t   live_bytes(){ return g_meta ? g_meta->live_bytes : 0; }
 uint32_t save(uint8_t* out, uint32_t cap) {
     if (!g_meta) return 0;
     uint32_t n = g_meta->bump;
+    // NOTE: this copies [base,bump) = ~7.6MB every frame, but the MEASURED churn
+    // is only ~24KB/frame (6 pages) and most of the 5.5MB live is immutable
+    // collision shapes + broadphase. th155's Bullet is collision-ONLY
+    // (btCollisionWorld + btGhostObject, no solver/dynamics), and the ghost
+    // transforms are re-driven from actor state each frame — so a minimal
+    // structural bullet serializer (walk the world's ghosts, in-place restore)
+    // will replace this full copy (task #41).
     if (n > cap) {
         log_printf("[bullet_arena] !! save OVERFLOW used=%u > cap=%u\n", n, cap);
         return 0;
