@@ -37,7 +37,15 @@ Also built: UI framework (`::UI.Menu`) + a config-page template with Enum toggle
 
 ---
 
-## 3. Design decisions (need your call)
+## 3. Design decisions — DECIDED (2026-07-06)
+
+- **D1 = Per-match choice in the online menu** (option B). The delay/rollback pick is surfaced at match time in `network.nut`'s match dialog, flowing into the handshake negotiation. (Not a global config toggle.)
+- **D2 = Symmetric AND.** `use_rollback = local.capable && local.wanted && remote.capable && remote.wanted`. Vanilla-safe, either player can veto, no disagreement.
+- **D3 = Endpoint wiring first**, then negotiation, then per-match UI, then real-flow validation.
+
+**IMPORTANT — validation dependency:** the selector + negotiation live in the real `AcceptMatch`/`BeginMatch` path that `auto_connect` BYPASSES. So all of this can only be validated over the REAL two-client lobby flow (#24) — it can't be exercised by the solo/auto_connect harness. Real-flow validation needs two clients through the actual lobby (user-driven).
+
+### Original options (kept for context)
 
 ### D1 — Where the choice lives
 - **(A, recommended) Global preference + negotiation.** A persistent "Netcode: Delay / Rollback" toggle in the config page; the per-match resolution is handled by negotiation (§4). Simple, and it gives the full behavior: you set your preference, rollback happens iff both peers prefer+support it.
