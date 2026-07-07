@@ -533,7 +533,9 @@ static unsigned int __fastcall pop_tap(void* self, void* /*edx*/,
     uint32_t  ri2 = *(uint32_t*)(q + 4);
     // rb frames: ALWAYS log (the 600-line lifetime quota ran out before
     // late splits — the one blind spot). Forward: early window only.
-    if (g_trace_rb || g_trace_frame <= 8) {
+    // Diagnostic only — this [pop] log fires on every re-sim pop (5k+/run); gate
+    // it behind SQUIROLL_DIAG so the shipping/perf build's hot input path is clean.
+    if (snapshot_ring::diag_on() && (g_trace_rb || g_trace_frame <= 8)) {
         static int fwd_quota = 40;
         bool ok = g_trace_rb ? true : (fwd_quota-- > 0);
         if (ok) {
@@ -778,7 +780,10 @@ static SQInteger gekko_vec3_register(HSQUIRRELVM vm) {
             // was undone; if silent, the pop targets ANOTHER object after
             // restore (stale queue->state pairing).
             g_ig_probe2 = (const int32_t*)up;
-            if (up) {
+            // The Dr0 hardware watchpoint fires a debug exception on EVERY write
+            // to the counter (kernel round-trip each hit) — pure diagnostic and a
+            // real per-frame perf drain. Only arm it under SQUIROLL_DIAG.
+            if (up && snapshot_ring::diag_on()) {
                 actor2d_log::watch_arm((uint32_t)(uintptr_t)(g_ig_probe2 + 2));
                 log_printf("[gekko_bridge] Dr0 armed on P1 InputGlobal y @%p\n",
                            (const void*)(g_ig_probe2 + 2));
@@ -1331,7 +1336,7 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         // names the section whose code path ZEROES the live InputGlobal
         // during re-sim saves (velwatch: pop writes 1, then 4x memcpy'd
         // zeros before the next advance, EIP = CRT memcpy).
-        #define SECBR(tag) do { if (g_ig_probe2 && g_trace_rb) \
+        #define SECBR(tag) do { if (snapshot_ring::diag_on() && g_ig_probe2 && g_trace_rb) \
             log_printf("[secbr] f=%u rb=%d " tag " p1y=%d\n", \
                        frame, g_trace_rb, g_ig_probe2[2]); } while (0)
         SECBR("pre-bp   ");
@@ -1445,7 +1450,7 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                 // counters AS THE TEXT WALK WILL SEE THEM. Bracketed against
                 // POST-run/POST-act, this pins the window where a counter
                 // reset lands between the pop and the save.
-                if (g_ig_probe && g_trace_rb)
+                if (snapshot_ring::diag_on() && g_ig_probe && g_trace_rb)
                     log_printf("[igxs] f=%u rb=%d SAVE-time p0(x=%d y=%d "
                                "b1=%d b2=%d b3=%d)\n",
                                frame, g_trace_rb, g_ig_probe[1], g_ig_probe[2],
@@ -2784,7 +2789,7 @@ void advance_one_frame() {
     // field every sustained desync split on). Logged early frames + EVERY
     // re-sim advance (rb=1): restored -> PRE-run -> POST-run shows whether
     // the corrected input's pop ticks the counter during the re-advance.
-    bool igx_on = g_ig_probe && !g_solo && (g_trace_frame <= 8 || g_trace_rb);
+    bool igx_on = snapshot_ring::diag_on() && g_ig_probe && !g_solo && (g_trace_frame <= 8 || g_trace_rb);
     if (igx_on)
         log_printf("[igx] f=%d rb=%d PRE-run   p0(x=%d y=%d b1=%d b2=%d b3=%d) p1(x=%d y=%d b1=%d)\n",
                    g_trace_frame, g_trace_rb,
