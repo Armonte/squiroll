@@ -861,7 +861,8 @@ static void register_cpp_ser() {
 // Call ::__gekko_state.save_battle() and copy its returned string into
 // out (up to cap bytes). Returns bytes written; 0 if anything failed
 // (the Save event then has empty squirrel data — still consistent).
-static uint32_t call_squirrel_save(uint8_t* out, uint32_t cap, uint32_t frame) {
+static uint32_t call_squirrel_save(uint8_t* out, uint32_t cap, uint32_t frame,
+                                   bool checksum_only = false) {
     if (!v) return 0;
     SQInteger top0 = sq_gettop(v);
     sq_pushroottable(v);
@@ -871,12 +872,16 @@ static uint32_t call_squirrel_save(uint8_t* out, uint32_t cap, uint32_t frame) {
     if (SQ_FAILED(sq_get(v, -2))) { sq_settop(v, top0); return 0; }
     // stack: root, gekko_state, save_battle
     sq_push(v, -2);  // `this` = gekko_state table
-    sq_pushinteger(v, (SQInteger)frame);  // save_battle(frame) — keys _keep
+    sq_pushinteger(v, (SQInteger)frame);  // save_battle(frame, checksum_only)
+    // checksum_only: raw mode uses this text purely as the cross-peer checksum
+    // (restore = snapshot_ring), so save_battle skips the load-support _keep ring
+    // (a clone-per-save that churns sq_arena and inflates the dirty-page capture).
+    sq_pushbool(v, checksum_only ? SQTrue : SQFalse);
     // PERF: time the Squirrel walker. Logs avg us every 600 saves.
     LARGE_INTEGER _ps0, _ps1, _psf;
     QueryPerformanceFrequency(&_psf);
     QueryPerformanceCounter(&_ps0);
-    SQRESULT _sr = sq_call(v, 2, SQTrue, SQTrue);
+    SQRESULT _sr = sq_call(v, 3, SQTrue, SQTrue);
     QueryPerformanceCounter(&_ps1);
     {
         static uint64_t acc = 0, cnt = 0;
@@ -1455,7 +1460,8 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                                "b1=%d b2=%d b3=%d)\n",
                                frame, g_trace_rb, g_ig_probe[1], g_ig_probe[2],
                                g_ig_probe[3], g_ig_probe[4], g_ig_probe[5]);
-                uint32_t sqn = call_squirrel_save(sqscratch, SQSCRATCH, frame);
+                uint32_t sqn = call_squirrel_save(sqscratch, SQSCRATCH, frame,
+                                                  /*checksum_only=*/true);
                 final_cs = fletcher32(sqscratch, sqn);
                 if (frame <= 5 && g_trace_rb == 0)
                     log_printf("[sqstruct] f=%u len=%u struct_cs=0x%08x "
@@ -1467,22 +1473,29 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                 // frame's text to disk — a plain `diff` then NAMES the exact
                 // gameplay field that split (the whole point of a canonical
                 // structural format).
-                uint32_t ri = frame % SQTEXT_RING;
-                // Save-count per frame: >1 means the frame was RE-SAVED after
-                // a rollback correction; 1 at a corrected frame means gekko
-                // never re-saved it and the exchanged checksum is the stale
-                // pre-correction one (the f3744 question).
-                g_sqtext_n[ri] = (g_sqtext_frame[ri] == frame &&
-                                  !g_sqtext[ri].empty())
-                                     ? (uint8_t)(g_sqtext_n[ri] + 1) : 1;
-                g_sqtext[ri].assign((const char*)sqscratch, sqn);
-                g_sqtext_frame[ri] = frame;
-                g_sqtext_cs[ri]    = final_cs;
-                g_sqtext_rb[ri]    = (uint8_t)(g_trace_rb ? 1 : 0);
-                { int bc = -1; read_battle_int(_SC("count"), &bc);
-                  g_sqtext_bcount[ri] = bc; }
-                g_sqtext_in[ri][0] = forced_inputs[0];
-                g_sqtext_in[ri][1] = forced_inputs[1];
+                // Ring-keep the canonical TEXT per frame ONLY under diag: this
+                // is purely the DesyncDetected offline-dump source. Copying 38KB
+                // into a std::string slot (+ read_battle_int) EVERY save is a
+                // real per-save cost with no bearing on the checksum GekkoNet
+                // compares (final_cs, already set). Skip it in the perf build.
+                if (snapshot_ring::diag_on()) {
+                    uint32_t ri = frame % SQTEXT_RING;
+                    // Save-count per frame: >1 means the frame was RE-SAVED after
+                    // a rollback correction; 1 at a corrected frame means gekko
+                    // never re-saved it and the exchanged checksum is the stale
+                    // pre-correction one (the f3744 question).
+                    g_sqtext_n[ri] = (g_sqtext_frame[ri] == frame &&
+                                      !g_sqtext[ri].empty())
+                                         ? (uint8_t)(g_sqtext_n[ri] + 1) : 1;
+                    g_sqtext[ri].assign((const char*)sqscratch, sqn);
+                    g_sqtext_frame[ri] = frame;
+                    g_sqtext_cs[ri]    = final_cs;
+                    g_sqtext_rb[ri]    = (uint8_t)(g_trace_rb ? 1 : 0);
+                    { int bc = -1; read_battle_int(_SC("count"), &bc);
+                      g_sqtext_bcount[ri] = bc; }
+                    g_sqtext_in[ri][0] = forced_inputs[0];
+                    g_sqtext_in[ri][1] = forced_inputs[1];
+                }
             }
         }
         LARGE_INTEGER _c2; QueryPerformanceCounter(&_c2);

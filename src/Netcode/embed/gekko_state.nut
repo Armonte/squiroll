@@ -452,7 +452,11 @@
 
 ::__gekko_state._vec3_registered <- false;
 
-::__gekko_state.save_battle <- function (frame = 0) {
+// checksum_only: raw mode uses this text ONLY as the pointer-independent
+// cross-peer checksum (restore comes from snapshot_ring, load_battle is never
+// called), so skip the load-support _keep ring — cloning infoActor+task every
+// save is pure sq_arena churn that inflates the dirty-page capture cost.
+::__gekko_state.save_battle <- function (frame = 0, checksum_only = false) {
     if (::__gekko_state._bisect_level == 0) return "";
     // One-shot: hand the native walker a live Vector3 sample so it can
     // recognize every Vector3 by class pointer and emit x/y/z VALUES
@@ -512,14 +516,16 @@
     // are NOT in the text blob; load_battle restores them from _keep.
     // infoActor/task are shallow-cloned so a later in-place mutation of
     // the live container can't corrupt the parked snapshot.
-    local slot = frame % ::__gekko_state._keep_ring;
-    local ia = ("infoActor" in ::battle) ? ::battle.infoActor : null;
-    local tk = ("task" in ::battle) ? ::battle.task : null;
-    ::__gekko_state._keep[slot] = {
-        battleUpdate = ("battleUpdate" in ::battle) ? ::battle.battleUpdate : null,
-        infoActor    = (typeof ia == "array") ? (clone ia) : ia,
-        task         = (typeof tk == "table") ? (clone tk) : null,
-    };
+    if (!checksum_only) {
+        local slot = frame % ::__gekko_state._keep_ring;
+        local ia = ("infoActor" in ::battle) ? ::battle.infoActor : null;
+        local tk = ("task" in ::battle) ? ::battle.task : null;
+        ::__gekko_state._keep[slot] = {
+            battleUpdate = ("battleUpdate" in ::battle) ? ::battle.battleUpdate : null,
+            infoActor    = (typeof ia == "array") ? (clone ia) : ia,
+            task         = (typeof tk == "table") ? (clone tk) : null,
+        };
+    }
     // Periodic snapshot log so we can see the round phase machine
     // actually advancing (state 2->4->8->64) across the match.
     ::__gekko_state._save_tick = (::__gekko_state._save_tick + 1) % 1200;
