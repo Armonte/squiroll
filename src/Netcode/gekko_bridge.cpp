@@ -442,17 +442,21 @@ static void raw_ser_table(RawSer& c, const SqTable* t) {
         if (a.kind == 1)      return raw_str_less(a.ks, b.ks);
         return false;
     });
+    // [M4] Honor skip-keys in TABLES too (the cosmetic fields recur inside actor
+    // property/snapshot/clone tables). OMIT them entirely rather than emitting
+    // `key;?;` — the deser is count-driven and load_into leaves any key absent
+    // from `data` untouched, so this is identical in effect but far smaller.
+    size_t keep = 0;
+    for (const KV& kv : kvs)
+        if (!(kv.kind == 1 && raw_is_skip_key(kv.ks))) ++keep;
     c.out += 't';
-    raw_ser_append_int(c.out, (long long)kvs.size());
+    raw_ser_append_int(c.out, (long long)keep);
     c.out += ":{";
     for (const KV& kv : kvs) {
+        if (kv.kind == 1 && raw_is_skip_key(kv.ks)) continue;
         if (kv.kind == 0)      { c.out += 'i'; raw_ser_append_int(c.out, kv.ki); c.out += ';'; }
         else if (kv.kind == 1) { raw_emit_string(c.out, kv.ks); }
         else                   { c.out += "n;"; }
-        // [M4] Honor skip-keys in TABLES too (not just instances) — the cosmetic
-        // fields recur inside actor property/snapshot/clone tables. Emit `?;` so
-        // load_into leaves the live slot alone (deser returns the skip sentinel).
-        if (kv.kind == 1 && raw_is_skip_key(kv.ks)) { c.out += "?;"; continue; }
         raw_ser(c, *kv.val);
     }
     c.out += '}';
@@ -636,20 +640,25 @@ static void raw_ser_instance(RawSer& c, const SQObject& o) {
         return raw_str_less(a.name, b.name);
     });
 
+    // Methods (incl. Sqrat-bound native accessors) and per-peer skip keys carry
+    // NO sim state — OMIT them entirely (no name, no value) instead of emitting
+    // `sN:name;?;`. That skipped-member noise was ~88% of the blob and dominated
+    // both save (4.7ms) and load (16ms) time. The reader is count-driven + keyed
+    // (deser reads exactly <count> k/v pairs and sets by key; a member absent
+    // from `data` leaves the live slot untouched — identical to the old `?;`
+    // skip-sentinel path in load_into), so a reduced member set is safe.
+    size_t keep = 0;
+    for (const Mem& m : ms)
+        if (!(m.is_method || raw_is_skip_key(m.name))) ++keep;
     c.out += 'I';
     raw_ser_append_int(c.out, my_id);
     c.out += ':';
-    raw_ser_append_int(c.out, (long long)ms.size());
+    raw_ser_append_int(c.out, (long long)keep);
     c.out += ":{";
     c.cur_depth++;
     for (const Mem& m : ms) {
+        if (m.is_method || raw_is_skip_key(m.name)) continue;
         raw_emit_string(c.out, m.name);
-        // Methods (incl. Sqrat-bound native accessors) and per-peer skip
-        // keys emit `?;` — never read off the instance.
-        if (m.is_method || raw_is_skip_key(m.name)) {
-            c.out += "?;";
-            continue;
-        }
         raw_ser(c, inst->values[m.idx]);   // FIELD — raw instance value slot
     }
     c.cur_depth--;
@@ -866,11 +875,11 @@ static uint32_t call_squirrel_save(uint8_t* out, uint32_t cap, uint32_t frame) {
     QueryPerformanceCounter(&_ps1);
     {
         static uint64_t acc = 0, cnt = 0;
-        acc += (uint64_t)(_ps1.QuadPart - _ps0.QuadPart) * 1000000ull / _psf.QuadPart;
-        if (++cnt % 600 == 0) {
-            log_printf("[perf] save_battle: avg %llu us/call over %llu calls\n",
-                       acc / cnt, cnt);
-        }
+        uint64_t this_us = (uint64_t)(_ps1.QuadPart - _ps0.QuadPart) * 1000000ull / _psf.QuadPart;
+        acc += this_us; ++cnt;
+        if (cnt <= 20 || cnt % 600 == 0)
+            log_printf("[perf] save_battle: this=%llu us avg=%llu us over %llu calls\n",
+                       this_us, acc / cnt, cnt);
     }
     if (SQ_FAILED(_sr)) { sq_settop(v, top0); return 0; }
     const SQChar* sqstr = nullptr;
@@ -914,11 +923,11 @@ static void call_squirrel_load(const uint8_t* data, uint32_t len, uint32_t frame
     QueryPerformanceCounter(&_pl1);
     {
         static uint64_t acc = 0, cnt = 0;
-        acc += (uint64_t)(_pl1.QuadPart - _pl0.QuadPart) * 1000000ull / _plf.QuadPart;
-        if (++cnt % 600 == 0) {
-            log_printf("[perf] load_battle: avg %llu us/call over %llu calls\n",
-                       acc / cnt, cnt);
-        }
+        uint64_t this_us = (uint64_t)(_pl1.QuadPart - _pl0.QuadPart) * 1000000ull / _plf.QuadPart;
+        acc += this_us; ++cnt;
+        if (cnt <= 20 || cnt % 600 == 0)
+            log_printf("[perf] load_battle: this=%llu us avg=%llu us over %llu calls\n",
+                       this_us, acc / cnt, cnt);
     }
     if (SQ_FAILED(_lr)) {
         log_printf("[gekko_bridge] __gekko_state.load_battle threw\n");
@@ -1578,6 +1587,11 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
             }
             *len_field = wrote;
             p += wrote;
+            // [M4-secsize] MEASURE each structural section's real byte cost on
+            // the first few forward frames, so we optimize the actual biggest
+            // chunk instead of an assumed one (pools turned out already-live-only).
+            if (!g_arena_rollback && g_trace_rb == 0 && frame <= 3)
+                log_printf("[secsize] f=%u %-10s = %u bytes\n", frame, name, wrote);
             return true;
         };
         // cpp_arena holds render-signal state (DrawCommandSlot / boost::signals2
@@ -1611,8 +1625,11 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         if (g_arena_rollback)
             ok = ok && put_section("cpp_arena", &cpp_arena::save);
         cpp_sect_end = p;
-        ok = ok && put_section("bullet",    &bullet_arena::save)
-                && put_section("input",     &input_rec_save);
+        // [M4-diag] skip bullet's 7.6MB blob in structural to test whether its
+        // save/restore cost is what starves re-sim catch-up (#17). Physics will
+        // desync (expected); the question is whether it now CONVERGES to forward.
+        if (g_arena_rollback) ok = ok && put_section("bullet", &bullet_arena::save);
+        ok = ok && put_section("input",     &input_rec_save);
         // [M4] RNG rides a separate "restore-but-not-checksum" section that the
         // raw path handles via snapshot_ring, NOT via Trailer 2. Append it to
         // Trailer 2 ONLY in structural mode (where restore reads it below). The
@@ -1946,10 +1963,11 @@ void load_state_from_buf(const void* buf, uint32_t len) {
         };
         // Order matches the structural-mode save (sq + cpp omitted): pools,
         // boostpools, engine, bullet, input, rng.
+        // [M4-diag] bullet skipped in structural save (see save side) — restore
+        // order: pools, boostpools, engine, input, rng.
         if (get_section("pools",      &battle_pools::load) &&
             get_section("boostpools", &battle_pools::boostpool_load) &&
             get_section("engine",     &engine_snap::load) &&
-            get_section("bullet",     &bullet_arena::load) &&
             get_section("input",      &input_rec_load))
             get_section("rng",        &engine_snap::rng_load);
     }
