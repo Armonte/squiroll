@@ -17,6 +17,12 @@ upnp_port <- 0;
 local_device_id <- 0;
 input_local <- null;
 rand_seed <- 0;
+// [#44 netcode negotiation] per-MATCH resolved netcode: true = GekkoNet rollback,
+// false = vanilla delay. The HOST computes the symmetric AND of both peers'
+// wants (`gekko_enabled`, or the per-match menu pick from #45) and ships the
+// result in the "yes" handshake so both sides arm identically. A peer that never
+// advertises `rollback_wanted` (vanilla / older squiroll) resolves to delay.
+use_rollback <- false;
 server_profile <- null;
 client_profile <- null;
 history <- [];
@@ -159,6 +165,9 @@ function StartupServer(port,mode) {
 			name = request.name
 			color = request.color
 			allow_watch = request.allow_watch
+			// [#44] the connecting client's netcode want (absent on a vanilla
+			// peer -> treated as false -> delay, preserving cross-play).
+			rollback_wanted = ("rollback_wanted" in request) ? request.rollback_wanted : false
 		};
 		reply.name <- ::config.network.player_name;
 		return true;
@@ -333,6 +342,9 @@ function StartupClient(addr,port,mode) {
 		battle_num = 1
 		name = ::config.network.player_name.len() > 16 ? "P2" : ::config.network.player_name
 		color = ::savedata.GetColorNum()
+		// [#44] this peer's netcode preference. Source is gekko_enabled for now;
+		// #45's per-match menu pick overrides it. The host ANDs it with its own.
+		rollback_wanted = ::setting.network.gekko_enabled
 	};
 
 	if (mode & 1)connect_param.is_watch <- false;
@@ -377,6 +389,9 @@ function BeginMatch(table) {
 	is_client = true;
 	rand_seed = table.rand_seed;
 	srand(rand_seed);
+	// [#44] the host already computed the symmetric-AND result; adopt it so the
+	// client arms delay/rollback identically. Absent (older host) -> delay.
+	use_rollback = ("use_rollback" in table) ? table.use_rollback : false;
 
 	player_name = [table.name.len() > 16 ? "P1" : table.name,::config.network.player_name];
 	color_num = [table.color, ::savedata.GetColorNum()];
@@ -409,7 +424,8 @@ function BeginMatch(table) {
 		// menus, rollback for battle. peer_ip/peer_port come from ::setting
 		// for now (two-local-instance testing); the punched-endpoint resolve
 		// is the next step.
-		if (::setting.network.gekko_enabled) {
+		// [#44] arm on the negotiated result, not the raw config flag.
+		if (::network.use_rollback) {
 			local gk_port_base = ::setting.network.peer_port;
 			::setting.network.gekko_watch_for_fight_dual(
 				gk_port_base + 11, gk_port_base + 10, 1,
@@ -441,6 +457,10 @@ function AcceptMatch() {
 	rand_seed = ::manbow.timeGetTime();
 	srand(rand_seed);
 	allow_watch = ::config.network.allow_watch && received_request.allow_watch;
+	// [#44] symmetric AND — rollback only if BOTH the host wants it (gekko_enabled
+	// / #45 pick) AND the connecting client advertised rollback_wanted. The host
+	// is authoritative and ships the result in "yes" so both peers arm identically.
+	use_rollback = ::setting.network.gekko_enabled && received_request.rollback_wanted;
 	received_request = null;
 	::sound.PlaySE(120);
 	::loop.Fade(function () {
@@ -453,6 +473,8 @@ function AcceptMatch() {
 			use_lobby = ::network.use_lobby
 			name = ::config.network.player_name.len() > 16 ? "P1" : ::config.network.player_name
 			color = ::network.color_num[0]
+			// [#44] the negotiated result — client arms delay/rollback to match.
+			use_rollback = ::network.use_rollback
 		});
 		foreach (chunk in ::network.chunked_icon) {
             ::network.inst.SendToChild(0, {
@@ -463,8 +485,11 @@ function AcceptMatch() {
         ::discord.rpc_set_details("VS online");
 		::menu.network.Suspend();
 		// ROLLBACK (real-flow arm, host = slot 0) — see the BeginMatch note.
-		if (::setting.network.gekko_enabled) {
+		// [#44] arm on the negotiated result, not the raw config flag.
+		if (::network.use_rollback) {
 			local gk_port_base = ::setting.network.peer_port;
+			// [#43 TODO] peer_ip/peer_port are the LAN test-rig values; real NAT
+			// play must feed the punched endpoint (punch_ip_buffer) here.
 			::setting.network.gekko_watch_for_fight_dual(
 				gk_port_base + 10, gk_port_base + 11, 0,
 				::setting.network.peer_ip);
