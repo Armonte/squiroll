@@ -32,3 +32,8 @@ src/Netcode/embed/*.nut.h
 squiroll.log
 squiroll_dbg.txt
 *.bak
+**/bin/
+**/obj/
+**/publish/
+*.nut.h
+*.txt.h

@@ -205,6 +205,7 @@ static inline void set_network_constants(HSQUIRRELVM v) {
     sq_setinteger(v, _SC("peer_port"), get_peer_port());
     sq_setinteger(v, _SC("device_id"), get_device_id());
     sq_setbool(v, _SC("gekko_enabled"), get_gekko_enabled());
+    sq_setbool(v, _SC("auto_accept"),get_auto_accept_enabled());
     //only add to config file if needed
     //sq_setbool(v, _SC("hide_lobby"), false);//more useful once we get custom lobbies
 }

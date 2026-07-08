@@ -226,6 +226,8 @@ function _SetupModifiers(param) {
 			::print(::format("Activating %s...\n",name));
 			AddTask(modifier.task);
 		}
+		// (Daze 67c4433) new plugin system tracks the live modifier task by name.
+		::plugin.active_modifiers[name] <- modifier.task;
 	}
 }
 
@@ -253,6 +255,7 @@ function _ClearRPC() {
 }
 
 function _ClearModifiers() {
+    ::plugin.active_modifiers = {};
 	foreach(plugin in modifiers) {
 		if (!plugin.task)continue;
 		::loop.DeleteTask(plugin.task);

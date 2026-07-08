@@ -1,19 +1,35 @@
+left <- 320;
+right <- ::graphics.width - left;
+center <- ::graphics.width / 2;
+item_y <- 166;
+title_y <- 96;
+spacing <- 42;
+width <- 548;
+
 // CORE ELEMENTS
 class Entry {
+    item_table = {};
+    visible = false;
+    idx = 0;
+    target = null;
     elem = null;
-    visible = null;
 
-    constructor(idx,str) {
-        visible = false;
-        elem = {
-            label = ::UI.Core.Text(str,::font.system,576)
-        };
-        elem.label.y = 200 + (idx * 42) - 34;
-        elem.label.x = 320;
+    constructor(it) {
+        foreach (lang,t in it) {
+            foreach (k,v in t) {
+                item_table[lang][k] <- v;
+            }
+        }
     }
 
     function OnClick() {}
-  
+    function Initialize() {}
+
+    function Release() {
+        foreach (e in elem)e.Release();
+        elem = null;
+    }
+
     function ConnectRenderSlot(slot,priority) {
         foreach (e in elem)e.ConnectRenderSlot(slot,priority);
     }
@@ -34,109 +50,21 @@ class Entry {
     }
 };
 
-// STRUCTURE ELEMENTS
-class Title extends Entry {
-    constructor(str) {
-        elem = {
-            label = ::UI.Core.Text(str,::font.system,576)
-        };
-        elem.label.sx = 1.75;
-        elem.label.sy = 1.75;
-        elem.label.SetGradation(true);
-        elem.label.red2 = 1.0;
-        elem.label.green2 = 0.75;
-        elem.label.blue2 = 0.83;
-
-        elem.label.x = 640 - ((elem.label.width * elem.label.sx) / 2);
-        elem.label.y = 96 - (elem.label.height * elem.label.sy);
-    }
-};
-
-class Header extends Entry {
-    constructor(idx,str) {
-        elem = {
-            label = ::UI.Core.Text(str,::font.system,576)
-        };
-        elem.label.y = 200 + (idx * 42) - 34;
-        elem.label.x = 640 - ((elem.label.width * elem.label.sx) / 2);
-    }
-};
-
-// LOGICAL ELEMENTS
-class Button extends Entry {
-    onclick = null;
-    constructor(idx,str,on_click) {
-        base.constructor(idx,str)
-        onclick = on_click;
-    }
-
-    function OnClick() {
-        onclick();
-    }
-};
-
-class Value extends Entry {
-    ptr = null;
-    onclick = null;
-
-    constructor(idx,str,src,on_click) {
-        ptr = src;
-        onclick = on_click;
-        base.constructor(idx,str);
-        local val = elem.val <- ::UI.Core.LiveText(ptr);
-        val.x = ::graphics.width - 320 - (val.width * val.sx);
-        val.y = 200 + (idx * 42) - 34;
-    }
-
-    function OnClick() {
-        onclick();
-    }
-};
-
-class Enum extends Entry {
-    onclick = null;
-
-    constructor(idx,str,init,on_click,opts = ["disabled","enabled"]) {
-        base.constructor(idx,str);
-        onclick = on_click;
-        local val = elem.val <- ::UI.Core.Enum(idx,opts);
-        local w = 0;
-        local h = 0;
-        foreach (v in opts) {
-            val.Set(v);
-            if (val.width > w)w = val.width;
-            if (val.height > h)h = val.height;
-        }
-
-        val.x = ::graphics.width - 320 - (w * val.sx);
-        val.y = 200 + (idx * 42) - 34;
-
-        val.left = val.x - 8;
-        val.right = val.x + w + 8;
-        val.top = val.y + 10;
-        val.bottom = val.top + h + 3;
-        val.cursor.val = init;
-    }
-
-    function OnClick() {
-        onclick();
-    }
-};
-
 class Page {
+    visible = false;
+    x = 0;
+    y = 0;
+    item = [];
     uiBase = null;
-    item = null;
-    visible = null;
-    x = null;
-    y = null;
 
     constructor(...) {
         uiBase = UIBase();
         uiBase.target = this;
-        visible = false;
-        x = 0;
-        y = 0;
         item = vargv;
+    }
+
+    function Initialize() {
+        foreach (e in item)e.Initialize();
     }
 
     function ConnectRenderSlot(_slot,priority) {
@@ -159,8 +87,6 @@ class Page {
 
 function Create(...) {
     help <- ["B1","ok",null,"B2","return",null,"UD","select"];
-    help_item <- ["B1","ok",null,"B2","cancel",null,"LR","change"];
-
     common_cursor <- null;
     common_callback_ok <- null;
     common_callback_cancel <- null;
@@ -170,6 +96,7 @@ function Create(...) {
             highlight <- UIItemHighlight();
             pager <- UIPager();
             foreach (page in action.page) {
+                page.Initialize();
                 pager.Append(page.uiBase);   
                 page.ConnectRenderSlot(::graphics.slot.front,0);
             }
@@ -243,11 +170,32 @@ function Create(...) {
         
         cursor_index.Update();
         if (cursor_index.ok){
-            local item = page[cursor_page.val].item[cursor_index.val];
+            local p = page[cursor_page.val];
+            local item = p.item[cursor_index.val];
             item.OnClick();
         }else if (cursor_index.cancel){
             ::loop.End();
         }
     }
     page <- vargv;
+    foreach (p in page) {
+        foreach (i,e in p.item) {
+            e.target = this;
+            e.idx = i - 1;
+        }
+    }
 }
+//OBJECTS
+Struct <- {};
+::manbow.CompileFile("squiroll/UI/menu/struct.nut",Struct);
+Value <- {};
+::manbow.CompileFile("squiroll/UI/menu/value.nut",Value);
+Enum <- {};
+::manbow.CompileFile("squiroll/UI/menu/enum.nut",Enum);
+Button <- {};
+::manbow.CompileFile("squiroll/UI/menu/button.nut",Button);
+//MENU TYPES
+Config <- {};
+::manbow.CompileFile("squiroll/UI/menu/config.nut",Config);
+Network <- {};
+::manbow.CompileFile("squiroll/UI/menu/network.nut",Network);
