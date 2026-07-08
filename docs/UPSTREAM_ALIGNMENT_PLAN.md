@@ -48,6 +48,16 @@ New framework is **declarative + config-pointer-bound**:
    - #45 selector UI — `::UI.Menu.Enum` per §3.
 6. **Validate** real lobby→CSS→battle for delay + rollback (two clients).
 
+## 4b. MERGE BASE — use `67c4433`, not the broken-WIP tip (2026-07-08)
+
+Comparison of merge scope onto local-dev:
+- **`67c4433` (Jun 21, "Merge PR #30 practice") — RECOMMENDED BASE.** Already contains Daze's **new UI framework (`embed/UI`), `netplay.nut`, `network_new.nut`** — i.e. the full menu/netplay design direction — with **working matchmaking**. **10 conflicts.**
+- `2e0b321` ("menus rewrite wip") — his BROKEN tip (matchmaking broken). Adds 2 more conflicts (`loop.nut` ↔ your `better_game_loop` takeover, `embed_manifest.txt`) and imports the breakage. **12 conflicts.**
+
+→ Merge `67c4433` (stable, has the architecture); merge his `2e0b321` menus-rewrite as a **separate later increment** once he lands it. Align the selector DESIGN to his rewrite direction regardless (studied from 2e0b321 — the `::UI.Menu.Enum` fit holds).
+
+Conflict resolutions (both bases): `.gitignore` union · `build.sh` = **keep local-dev's** (incremental/cached, far ahead of his simple one) · `config.cpp`/`plugin.cpp` = union of additions · `network_config.nut` = take his deletion (folded into new UI) · **semantic (care):** `battle.nut`/`network_component.nut` (arm site) / `manager.nut`/`input_display.nut`/`ping_display.nut` (his plugin-API refactor ↔ your rollback tweaks).
+
 ## 5. Open coordination questions (with Daze)
 
 - **Timing:** merge his WIP-broken tip now (on the integration branch, help fix matchmaking) vs wait for his rewrite to stabilize? His "moving lobby logic breaks matchmaking" is unresolved.
