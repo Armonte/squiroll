@@ -48,6 +48,9 @@ void patch_se_lobby(void* base_address);
 SOCKET WSAAPI inherit_punch_socket(int af, int type, int protocol, LPWSAPROTOCOL_INFOW lpProtocolInfo, GROUP g, DWORD dwFlags);
 int WSAAPI bind_inherited_socket(SOCKET s, const sockaddr* name, int namelen);
 int WSAAPI close_punch_socket(SOCKET s);
+// [#43] the lobby's punched UDP socket (INVALID_SOCKET when no hole is open),
+// for GekkoNet to ride the NAT hole during the fight.
+SOCKET get_punch_socket();
 
 #if CONNECTION_LOGGING & CONNECTION_LOGGING_UDP_PACKETS
 int WSAAPI WSASendTo_log(

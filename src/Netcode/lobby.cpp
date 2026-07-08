@@ -347,6 +347,16 @@ SOCKET get_or_create_punch_socket(uint16_t port) {
     return sock;
 }
 
+// [#43] Expose the lobby's already-punched UDP socket so GekkoNet can ride the
+// open NAT hole during the fight. Safe because better_game_loop skips the game's
+// own recv on this socket while gekko owns the loop (window_update_frame is not
+// called), so gekko reads/writes punch_socket directly. Returns INVALID_SOCKET
+// when no hole is open (LAN / auto_connect path -> gekko uses its own socket).
+SOCKET get_punch_socket() {
+    std::lock_guard<SpinLock> lock(punch_lock);
+    return punch_socket;
+}
+
 /*
 SOCKET recreate_punch_socket(uint16_t port) {
     std::lock_guard<SpinLock> lock(punch_lock);
