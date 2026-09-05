@@ -169,6 +169,7 @@ function StartupServer(port,mode) {
 			// peer -> treated as false -> delay, preserving cross-play).
 			rollback_wanted = ("rollback_wanted" in request) ? request.rollback_wanted : false
 		};
+		::print("[#44] host got connection request: req_has_rollback_wanted=" + ("rollback_wanted" in request) + " val=" + received_request.rollback_wanted + "\n");
 		reply.name <- ::config.network.player_name;
 		return true;
 	}.bindenv(this);
@@ -346,6 +347,7 @@ function StartupClient(addr,port,mode) {
 		// #45's per-match menu pick overrides it. The host ANDs it with its own.
 		rollback_wanted = ::setting.network.gekko_enabled
 	};
+	::print("[#44] client Connect: connect_param has rollback_wanted=" + connect_param.rollback_wanted + " (fields=" + connect_param.len() + ")\n");
 
 	if (mode & 1)connect_param.is_watch <- false;
 
@@ -392,6 +394,7 @@ function BeginMatch(table) {
 	// [#44] the host already computed the symmetric-AND result; adopt it so the
 	// client arms delay/rollback identically. Absent (older host) -> delay.
 	use_rollback = ("use_rollback" in table) ? table.use_rollback : false;
+	::print("[#44] BeginMatch: table.use_rollback=" + ("use_rollback" in table ? table.use_rollback : "ABSENT") + " -> use_rollback=" + use_rollback + "\n");
 
 	player_name = [table.name.len() > 16 ? "P1" : table.name,::config.network.player_name];
 	color_num = [table.color, ::savedata.GetColorNum()];
@@ -461,6 +464,9 @@ function AcceptMatch() {
 	// / #45 pick) AND the connecting client advertised rollback_wanted. The host
 	// is authoritative and ships the result in "yes" so both peers arm identically.
 	use_rollback = ::setting.network.gekko_enabled && received_request.rollback_wanted;
+	::print("[#44] AcceptMatch: my_want=" + ::setting.network.gekko_enabled
+	        + " client_want=" + received_request.rollback_wanted
+	        + " -> use_rollback=" + use_rollback + "\n");
 	received_request = null;
 	::sound.PlaySE(120);
 	::loop.Fade(function () {

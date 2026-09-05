@@ -169,6 +169,7 @@ function Initialize() {
     server_port_h <- Cursor(1, 5, ::input_all);
     cursor_upnp <- Cursor(1, 2, ::input_all);
     cursor_allow_watch <- Cursor(1, 2, ::input_all);
+    lobbydbg_c <- 0;  // [lobbydbg] throttle counter for matchmaking trace
 
     cursor_lobby <- Cursor(1, room_name.len(), ::input_all);
 	local n = ::config.network.lobby_name;
@@ -550,7 +551,10 @@ function UpdateMatch() {
 	
 	//client only
 	local st_host = ::LOBBY.GetMatchHost();
+	if ((lobbydbg_c++ % 60) == 0)
+		::print("[lobbydbg] client UpdateMatch: net=" + ::LOBBY.GetNetworkState() + " userstate=" + ::LOBBY.GetLobbyUserState() + " matchhost='" + st_host + "' userdata='" + ::LOBBY.GetMatchUserData() + "'\n");
     if (st_host != "") {
+		::print("[lobbydbg] client GOT HOST '" + st_host + "'\n");
 		::print(st_host+"\n");
         ::LOBBY.SetLobbyUserState(::LOBBY.NO_OPERATION);
 		::network.Terminate();

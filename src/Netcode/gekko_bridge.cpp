@@ -202,7 +202,32 @@ static uint16_t read_local_input_bits() {
     if (g_active_input_session &&
         g_active_input_session->local_input)
     {
-        return poll_input_state(&g_active_input_session->local_input->state);
+        TF4InputDevice* dev = g_active_input_session->local_input;
+        uint16_t enc = poll_input_state(&dev->state);
+        // [inpdbg] Is local_input->state actually refreshed under gekko's
+        // session-started loop, or frozen at its arm-time value? Dump the
+        // device ptr + vtable (identifies the class) and the raw x/y/button
+        // ints. Log on CHANGE (up to a quota) so a stuck state is obvious
+        // (one line, then silence) vs a live one (a line per distinct input).
+        {
+            const TF4InputDeviceState* s = &dev->state;
+            static uint32_t last_sig = 0xDEADBEEF;
+            static int quota = 200;
+            uint32_t sig = (uint32_t)s->x ^ ((uint32_t)s->y << 8) ^ (enc << 16)
+                         ^ (s->buttons[0] ? 1u : 0) ^ (s->buttons[4] ? 2u : 0)
+                         ^ (s->buttons[5] ? 4u : 0) ^ (s->buttons[6] ? 8u : 0);
+            if (sig != last_sig && quota-- > 0) {
+                last_sig = sig;
+                log_printf("[inpdbg] dev=%p vt=%p x=%d y=%d "
+                           "b=[%u %u %u %u %u %u %u %u %u %u %u %u] enc=0x%04x\n",
+                           (void*)dev, *(void**)dev, s->x, s->y,
+                           s->buttons[0], s->buttons[1], s->buttons[2], s->buttons[3],
+                           s->buttons[4], s->buttons[5], s->buttons[6], s->buttons[7],
+                           s->buttons[8], s->buttons[9], s->buttons[10], s->buttons[11],
+                           enc);
+            }
+        }
+        return enc;
     }
     // Fallback: cached pre-arm value.
     return g_last_local_input_bits;

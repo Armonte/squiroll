@@ -16,6 +16,7 @@ function WaitInLobby() {
     if (!::config.network.upnp)::LOBBY.SetLobbyUserState(lobby_user_state);
     ::network.use_lobby = true;
     ::network.StartupServer(::config.network.hosting_port,0);
+    ::print("[lobbydbg] HOST WaitInLobby: WAIT_INCOMMING port=" + ::config.network.hosting_port + " ext_port=" + ::config.network.hosting_port + "\n");
     ::lobby.inc_user_count();
     return true;
 }
@@ -29,6 +30,7 @@ function SearchInLobby() {
     ::LOBBY.SetUserData("" + ::config.network.hosting_port);
     lobby_user_state = ::LOBBY.MATCHING;
     ::LOBBY.SetLobbyUserState(lobby_user_state);
+    ::print("[lobbydbg] CLIENT SearchInLobby: MATCHING, ext_port=" + ::config.network.hosting_port + "\n");
     return true;
 }
 
