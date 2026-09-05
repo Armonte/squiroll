@@ -1187,6 +1187,21 @@ extern "C" {
             //   ::hud.rect(x, y, w, h, r, g, b [, a])
             // Colours: floats [0,1] (packed native as 0xAARRGGBB). Coords:
             // 1280x720 game-HUD space, origin top-left.
+            // [plugins] ::__squiroll_env(name) -> string | null. Lets the Squirrel
+            // side read per-instance SQUIROLL_* launch overrides (used by the
+            // plugin-config override in plugin/core/cfg.nut) without adding a
+            // config.cpp getter per key.
+            sq_setfunc(v, _SC("__squiroll_env"), [](HSQUIRRELVM v) -> SQInteger {
+                const SQChar* name = nullptr;
+                if (sq_gettop(v) < 2 || SQ_FAILED(sq_getstring(v, 2, &name)) || !name)
+                    return sq_throwerror(v, _SC("__squiroll_env: expected <string>"));
+                char buf[512];
+                DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+                if (n == 0 || n >= sizeof(buf)) { sq_pushnull(v); return 1; }
+                sq_pushstring(v, buf, (SQInteger)n);
+                return 1;
+            });
+
             sq_createtable(v, _SC("hud"), [](HSQUIRRELVM v) {
                 sq_setfunc(v, _SC("clear"), [](HSQUIRRELVM v) -> SQInteger {
                     hud_clear();

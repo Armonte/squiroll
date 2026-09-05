@@ -7,6 +7,44 @@ class CFG {
 		data = cfg;
 		Read();
 		Write();
+		ApplyEnvOverrides();   // AFTER Write(): launch overrides never persist to the .ini
+	}
+
+	// [rollback test rig] Per-INSTANCE override: SQUIROLL_PLUGIN_CFG =
+	// "label:section.key=value;label:key=value;..." applied on top of the shared
+	// .ini, so two instances launched from the same folder can run different
+	// plugin configs (e.g. a cosmetic plugin on one peer only). Read via the
+	// native ::__squiroll_env (plugin.cpp). Silently a no-op when unset.
+	function ApplyEnvOverrides() {
+		local env = null;
+		try { env = ::__squiroll_env("SQUIROLL_PLUGIN_CFG"); } catch (e) { return; }
+		if (env == null || env.len() == 0) return;
+		local label = filepath.slice("plugin/config/".len());
+		if (label.len() > 4 && label.slice(label.len()-4) == ".ini") label = label.slice(0, label.len()-4);
+		foreach (entry in ::split(env, ";")) {
+			entry = ::strip(entry);
+			local colon = entry.find(":");
+			if (colon == null) continue;
+			if (::strip(entry.slice(0, colon)) != label) continue;
+			local rest = entry.slice(colon + 1);
+			local eq = rest.find("=");
+			if (eq == null) continue;
+			local path = ::strip(rest.slice(0, eq));
+			local str = ::strip(rest.slice(eq + 1));
+			try {
+				local dot = path.find(".");
+				local table = data;
+				local key = path;
+				if (dot != null) {
+					table = data[::strip(path.slice(0, dot))];
+					key = ::strip(path.slice(dot + 1));
+				}
+				table[key] = tovalue(str, typeof table[key]);
+				::print(::format("[plugin cfg] env override %s:%s=%s\n", label, path, str));
+			} catch (e) {
+				::print(::format("[plugin cfg] env override error %s:%s -> %s\n", label, path, e));
+			}
+		}
 	}
 
     function tovalue(str,type) {

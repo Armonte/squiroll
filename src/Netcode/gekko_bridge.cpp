@@ -405,6 +405,11 @@ static void raw_ser_append_int(std::string& s, long long n) {
 }
 
 // device_id / input / last_snap — per-peer process-local; emitted as `?;`.
+// Exact key compare against a literal (len = literal length, no NUL).
+static inline bool raw_str_eq(const SqString* s, const char* lit, size_t len) {
+    return s && (size_t)s->len == len && memcmp(s->val, lit, len) == 0;
+}
+
 static bool raw_is_skip_key(const SqString* s) {
     if (!s || s->len <= 0) return false;
     int32_t n = s->len;
@@ -653,6 +658,7 @@ static void raw_ser_instance(RawSer& c, const SQObject& o) {
 
     struct Mem { const SqString* name; bool is_method; int idx; };
     std::vector<Mem> ms;
+    bool is_plugin = false;
     for (int32_t i = 0; i < members->numofnodes; ++i) {
         const SqHashNode* nd = &members->nodes[i];
         if (nd->key._type != OT_STRING) continue;
@@ -661,7 +667,21 @@ static void raw_ser_instance(RawSer& c, const SQObject& o) {
         m.name      = (const SqString*)nd->key._unVal.pString;
         m.is_method = (enc & SQ_MEMBER_METHOD) != 0;
         m.idx       = (int)(enc & 0x00FFFFFF);
+        // [plugins] A class carrying `__squiroll_plugin` (plugin/core/manager.nut:
+        // the plugin `modifier` base class + ::plugin.Modifier) is PLUGIN state:
+        // cosmetic / per-peer, allowed to differ between peers (a plugin enabled
+        // on one side only) and never sim input. Emit the instance EMPTY so it
+        // cannot perturb the cross-peer checksum. Derived classes inherit the
+        // member (Squirrel copies base members into the derived class table).
+        if (!is_plugin && raw_str_eq(m.name, "__squiroll_plugin", 17))
+            is_plugin = true;
         ms.push_back(m);
+    }
+    if (is_plugin) {
+        c.out += 'I';
+        raw_ser_append_int(c.out, my_id);
+        c.out += ":0:{}";
+        return;
     }
     std::stable_sort(ms.begin(), ms.end(), [](const Mem& a, const Mem& b) {
         return raw_str_less(a.name, b.name);

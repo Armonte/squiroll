@@ -8,6 +8,11 @@ patches_csv <- {};
 active_modifiers <- {};
 
 class Modifier {
+	// [rollback] marker: the native cross-peer checksum (gekko_bridge
+	// raw_ser_instance) emits any instance whose class carries this member as
+	// EMPTY, so plugin state -- which may legitimately differ per peer (a
+	// cosmetic plugin enabled on one side only) -- never enters the checksum.
+	__squiroll_plugin = true;
 	task = null;
 	enabled = null;
 	async = null;
@@ -56,6 +61,7 @@ function NewPlugin(label) {
     local plugin = list[label] <- {
         config = {}
         modifier = class {
+            __squiroll_plugin = true;   // [rollback] checksum-exempt, see Modifier
             async = false;
             function Enabled(param){return false};
             function PreFrame(){return true};

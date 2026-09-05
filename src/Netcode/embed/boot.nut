@@ -25,10 +25,14 @@ function InstallLoopEndGuard() {
 // which in turn does ::menu.title.Hide / EndAnime / etc. Since we skip the
 // menu chain, those locals aren't safe to touch. Replace Suspend with a
 // minimal stub that just flags is_suspend.
+// NOTE (Daze 67c4433 merge): network.nut now creates the `is_suspend` slot
+// inside its Initialize() (menu init), which auto_connect skips -- so a plain
+// `is_suspend = true` threw "the index 'is_suspend' does not exist" and left
+// both peers in the exception trap. `<-` creates-or-overwrites the slot.
 function StubMenuNetworkSuspend() {
     if (!("network" in ::menu)) return;
     ::menu.network.Suspend = function () {
-        is_suspend = true;
+        is_suspend <- true;
     };
 }
 
