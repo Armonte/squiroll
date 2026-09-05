@@ -266,8 +266,15 @@ bool common_init(
     }
 
 #if !DISABLE_ALL_LOGGING_FOR_BUILD
-    if (log_type != NO_LOGGING) {
-        enable_debug_console(log_type == LOG_TO_PARENT_CONSOLE);
+    // [fix] The FILE log now ALWAYS opens; only a CONSOLE is gated on the
+    // console log types. netcode_mod_init (thcrap/normal English play) passes
+    // NO_LOGGING, which used to route log_printf to a no-op -> NO squiroll log
+    // under the normal thcrap chain (only aocf_crash.log survived via the crash
+    // handler's raw WriteFile). The file log is cheap, crash-survivable, and the
+    // ONLY diagnostic window when injected via thcrap (there is no console).
+    {
+        if (log_type == LOG_TO_PARENT_CONSOLE || log_type == LOG_TO_SEPARATE_CONSOLES)
+            enable_debug_console(log_type == LOG_TO_PARENT_CONSOLE);
         patch_throw_logs();
         // Tee stdout/stderr into squiroll.log without redirecting them, so
         // the console keeps live output AND the file survives a crash.
@@ -289,15 +296,6 @@ bool common_init(
         open_log_file(log_name);
         log_printf  = tee_printf;
         log_fprintf = tee_fprintf;
-    }
-    else {
-        log_printf = printf_dummy;
-        log_fprintf = fprintf_dummy;
-#if !ALWAYS_DISABLE_ORIGINAL_GAME_LOGGING
-        // Disable the original game's printf use
-        // when logging is disabled
-        disable_original_game_logging();
-#endif
     }
 #endif
 
