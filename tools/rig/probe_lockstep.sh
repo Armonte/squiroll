@@ -27,7 +27,7 @@ for ((r=first; r<first+count; r++)); do
   d1=$(grep -c "DESYNC" $p1); d2=$(grep -c "DESYNC" $p2)
   rb1=$(grep -o "nload=[0-9]*" $p1 | grep -o "[0-9]*" | paste -sd+ | bc); rb1=${rb1:-0}
   g1=$(grep -c "insguard\|updeff\]" $p1); g2=$(grep -c "insguard\|updeff\]" $p2)
-  cl=$(grep -c "CRASH (squiroll VEH)\|__purecall\|FASTFAIL via abort\|std::terminate\|RtlReportException\|FASTFAIL via __" aocf_crash.log 2>/dev/null)
+  cl=$(grep -c "CRASH (squiroll VEH)\|__purecall\|std::terminate\|RtlReportException\|FASTFAIL via abort\|FASTFAIL via __report\|FASTFAIL via __invoke" aocf_crash.log 2>/dev/null)
   hk=$(grep -ch "heapchk\] !!\|\[ivec\] !!" $p1 $p2 | paste -sd+ | bc)
   if [ -z "$f1" ] && [ -z "$f2" ] && [ "${cl:-0}" = 0 ]; then
     if [ "${retried:-}" != "$r" ]; then

@@ -150,7 +150,31 @@ here, so it was reverted rather than shipped. **Retry it against the SOLO rig
 with `SQUIROLL_BPVALIDATE=1` first**, where a mistake is a validator line rather
 than a cross-peer desync, and only then bring it to the dual rig.
 
-**The next real win is still incremental pool tracking.** The pools hold ~46,400 slots
+**Two further attempts, both reverted — record of what was tried.**
+
+*Limited saving* (`GekkoConfig::limited_saving`, which GekkoNet already implements
+as GDC §9). It does cut saves from ~1.9 per frame to roughly one per prediction
+window, but it is the wrong trade for this game: rollbacks then rewind to the last
+saved frame rather than the mispredicted one, so the cost reappears as deeper
+re-simulation and worse frame-time spikes. It also desynced within 120 frames,
+because `snapshot_ring::restore` requires an unbroken per-frame delta chain
+(`ring[f].frame == f` for every f from current back to the target) and sparse
+saves leave gaps. Supporting it would mean re-keying the ring on captures rather
+than frames. Not pursued: hiding cost in spikes is not the goal.
+
+*Pool paging* — the right idea, and the one to finish. The pool region is OUR
+allocation (tf4_arena's VirtualAlloc hook) and already carries MEM_WRITE_WATCH,
+so pool slots can ride the same dirty-page delta the arenas use, turning both the
+save walk and the load relink into O(pages actually written). The whole region is
+unusable for this (a background audio thread dirties ~3550 pages a frame in it)
+but `GetWriteWatch` takes a sub-range and the pool blocks are a small subset, so
+you register region B and restrict the query to the blocks. Wired up quickly;
+died at frame 2 of the first re-simulation. Likely causes, in order: the mirror is
+filled at arm time so any block created later has no valid pre-image, and each
+block's last 8 bytes are mspace link metadata that a rollback would rewind while
+the allocator's own state outside the blocks is not.
+
+**The next real win is still incremental pool tracking or pool paging.** The pools hold ~46,400 slots
 (~13.6 MB) of which only ~3,000 are live, so both save and load spend most of
 their time rediscovering a free list that changed by a handful of entries.
 Hooking the pool allocate/free to maintain the live set and free-list order as
