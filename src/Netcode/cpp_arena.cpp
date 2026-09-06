@@ -1174,9 +1174,14 @@ static void cdecl hook_free(void* block) {
 // malloc: pure diagnostic — call the original, then record {caller,size,ptr}
 // in the ring while armed. The caller address is malloc's return address
 // (safetyhook inline preserves the original call frame).
+// MALLOC WATCH ring (SQUIROLL_MALLOCWATCH=1). Diagnostic backing for
+// trace_alloc(): names the th155 malloc call site that produced a given block.
+// th155 mallocs constantly, so leaving the record on adds work to every single
+// allocation for a facility only used while chasing a specific pointer.
+static bool g_mw_on = false;
 static void* cdecl hook_malloc(size_t size) {
     void* p = g_h_malloc.unsafe_ccall<void*>(size);
-    if (g_armed) {
+    if (g_mw_on && g_armed) {
         uint32_t i = (g_mw_idx++) & (MW_RING - 1);
         g_mw[i].caller = (uint32_t)(uintptr_t)_ReturnAddress();
         g_mw[i].size   = (uint32_t)size;
@@ -1335,6 +1340,9 @@ void install() {
         if (g_flatten_jobs)
             log_printf("[cpp_arena] SQUIROLL_FLATTEN_JOBS=1 — cJobThread jobs run INLINE\n");
         char sb[8] = {0};
+        char mb[8] = {0};
+        g_mw_on = (GetEnvironmentVariableA("SQUIROLL_MALLOCWATCH", mb, sizeof mb) > 0
+                   && mb[0] == '1');
         DWORD sn = GetEnvironmentVariableA("SQUIROLL_SYNC_WORKERS", sb, sizeof sb);
         g_sync_workers = (sn > 0 && sn < sizeof sb && atoi(sb) != 0);
         if (g_sync_workers)
@@ -1480,7 +1488,7 @@ void install() {
     g_installed = (ok == 2);
     log_printf("[cpp_arena] install: arena=%p %uMB hooks=%d/2 mallocwatch=%d throwlog=%d\n",
                g_base, ARENA_SIZE / (1024u * 1024u), ok,
-               (int)g_h_malloc.enabled(), (int)g_h_throw.enabled());
+               (int)(g_h_malloc.enabled() && g_mw_on), (int)g_h_throw.enabled());
 }
 
 void trace_alloc(uint32_t addr) {

@@ -213,19 +213,66 @@ static naked void rwd_hook_entry() {
         jmp  dword ptr [g_rwd_orig]
     }
 }
-static void cdecl mapvb_check() {
+// DYNAMIC-VB RING OVERFLOW CHECK.
+//
+// render_map_dynamic_vertex_buffer sub-allocates out of one D3D11 dynamic vertex
+// buffer with NO BOUNDS CHECK: g_render_dynamic_vb_ring_offset (0x4DAE44) only
+// ever advances within a frame, and the caller memcpys into mapped_base+offset.
+// The offset is reset to 0 by the begin-frame reset, so vanilla is safe as long
+// as one frame never issues more draws than the buffer holds.
+//
+// Under rollback that assumption is not obviously safe: a re-simulation burst can
+// leave far more visual effects alive than a vanilla frame ever has, and a single
+// render frame then issues many more draws. Past the end of the buffer the memcpy
+// writes into whatever the driver placed after the mapping — which is exactly the
+// shape of the remaining death class (the fault lands inside Map's WRITE_DISCARD
+// rename, where the driver retires and frees the previous allocation).
+//
+// So: read the buffer's real ByteWidth once (ID3D11Buffer::GetDesc, vtable slot
+// 10 on x86 COM) and report when a sub-allocation would cross it. Cheap: the
+// GetDesc happens only when the buffer pointer changes.
+struct D3D11BufferDesc { uint32_t ByteWidth, Usage, BindFlags, CPUAccessFlags,
+                         MiscFlags, StructureByteStride; };
+static uint32_t g_dynvb_bytes = 0;
+static uint32_t g_dynvb_peak  = 0;
+static std::atomic<uint64_t> g_dynvb_over{0};
+static void cdecl mapvb_check(int size_bytes) {
     void* desc = *RENDER_DYNVB_DESC_PTR;
     if (!desc) return;
     void* buf = ((void**)desc)[1];
-    if (buf == g_dynvb_last) return;               // unchanged -> already checked
-    g_dynvb_last = buf;
-    if (!com_object_live(buf)) d3dres_report("dynamic_vb", buf, 0);
+    if (buf != g_dynvb_last) {                     // changed -> revalidate + re-read size
+        g_dynvb_last = buf;
+        g_dynvb_bytes = 0;
+        if (!com_object_live(buf)) { d3dres_report("dynamic_vb", buf, 0); return; }
+        typedef void (__stdcall* GetDesc_t)(void*, D3D11BufferDesc*);
+        void** vt = *(void***)buf;
+        D3D11BufferDesc d = {};
+        ((GetDesc_t)vt[10])(buf, &d);              // ID3D11Buffer::GetDesc
+        g_dynvb_bytes = d.ByteWidth;
+        log_printf("[dynvb] buffer %p ByteWidth=%u bytes\n", buf, g_dynvb_bytes);
+    }
+    // Mirror the sub-allocator's own arithmetic: it hands out the CURRENT offset
+    // and then advances by the 64-byte-aligned size.
+    const uint32_t off  = *(const uint32_t*)(uintptr_t)(0x4DAE44_R);
+    const uint32_t need = off + (((uint32_t)size_bytes + 63u) & ~63u);
+    if (need > g_dynvb_peak) g_dynvb_peak = need;
+    if (g_dynvb_bytes && need > g_dynvb_bytes) {
+        uint64_t n = g_dynvb_over.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n & 0x3F) == 0)
+            log_printf("[dynvb] !! RING OVERFLOW: offset=%u + %u > ByteWidth=%u "
+                       "f=%d rb=%d (#%llu) — this Map writes past the mapping\n",
+                       off, (uint32_t)size_bytes, g_dynvb_bytes,
+                       gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
+                       (unsigned long long)n);
+    }
 }
 static naked void mapvb_hook_entry() {
     __asm {
         pushad
         pushfd
+        push ecx                 // size_bytes
         call mapvb_check
+        add  esp, 4
         popfd
         popad
         jmp  dword ptr [g_mapvb_orig]
@@ -427,6 +474,18 @@ static int thiscall removeid_hook(int self, int target_id) {
 }
 
 } // namespace
+
+// Called once a second-ish from the frame loop side: how close the dynamic-VB
+// ring came to its limit. If the peak sits near ByteWidth in normal play, the
+// margin is thin and a rollback-heavy frame will cross it.
+void report_dynvb_peak() {
+    if (!g_dynvb_bytes) return;
+    log_printf("[dynvb] peak=%u / %u bytes (%u%%) overflows=%llu\n",
+               g_dynvb_peak, g_dynvb_bytes,
+               (unsigned)((uint64_t)g_dynvb_peak * 100 / g_dynvb_bytes),
+               (unsigned long long)g_dynvb_over.load(std::memory_order_relaxed));
+    g_dynvb_peak = 0;
+}
 
 void install() {
     g_h = safetyhook::create_inline((void*)CONCURRENT_LIST_ITER_STEP,

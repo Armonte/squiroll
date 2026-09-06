@@ -11,6 +11,10 @@ namespace cl_iter_guard {
 
 void install();
 
+// Dynamic-VB ring high-water report (see report_dynvb_peak in the .cpp). Called
+// from the frame loop roughly once a second; resets the peak each time.
+void report_dynvb_peak();
+
 } // namespace cl_iter_guard
 
 #endif // CL_ITER_GUARD_H

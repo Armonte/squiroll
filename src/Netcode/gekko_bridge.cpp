@@ -31,7 +31,8 @@
 #include "engine_snap.h"   // scheduler fixed-region snapshot
 #include "actor2d_log.h"   // actor2d_log::watch_arm (Dr0 write-watch)
 #include "better_game_loop.h" // sim_get_fps/sim_set_fps (freeze GetFPS during sim)
-#include "cpp_arena.h"     // C++ std::list node arena
+#include "cpp_arena.h"
+#include "cl_iter_guard.h"   // report_dynvb_peak (dynamic-VB ring high-water)     // C++ std::list node arena
 #include "bullet_arena.h"  // Bullet physics heap arena
 #include "snapshot_ring.h" // dirty-page rollback snapshot for the big arenas
 #include "input_hist.h"    // per-player input-history capture
@@ -1250,7 +1251,24 @@ static bool  g_lockstep_req = false;      // switch to lockstep requested
 static bool  g_in_lockstep  = false;      // transition running under lockstep
 static bool  g_lockstep_seen_leave = false; // state left 8 since the latch (the round really ended)
 static bool  g_restore_req  = false;      // prediction restore requested (next Round_Fight seen)
-static const unsigned char PREDICTION_WINDOW = 10;
+// Rollback depth. SQUIROLL_PREDICTION_WINDOW overrides it; 0 means the session
+// never predicts and therefore never rolls back, while every other part of the
+// stack (snapshots, arenas, the structural checksum) stays exactly as it is.
+// That makes it the clean A/B for "is this failure caused by rollback at all?" —
+// run the same rig at window 0 and see whether the symptom survives.
+static unsigned char prediction_window() {
+    static int w = -1;
+    if (w < 0) {
+        char b[8] = {0};
+        DWORD n = GetEnvironmentVariableA("SQUIROLL_PREDICTION_WINDOW", b, sizeof b);
+        w = (n > 0) ? atoi(b) : 10;
+        if (w < 0) w = 0;
+        if (w > 60) w = 60;
+        if (w != 10) log_printf("[gekko_bridge] prediction window overridden to %d\n", w);
+    }
+    return (unsigned char)w;
+}
+#define PREDICTION_WINDOW (prediction_window())
 
 static void reset_input_command_reserves();
 
@@ -3617,7 +3635,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
     // path; it must match the cap passed to save_state_to_buf below.
     config.state_size = gekko_state_size();
     config.max_spectators = 0;
-    config.input_prediction_window = 10;
+    config.input_prediction_window = PREDICTION_WINDOW;
     config.num_players = 2;
 
     gekko_start(g_session, &config);
@@ -4553,6 +4571,7 @@ bool tick() {
         // DIAGNOSTIC: is the remote peer's traffic actually arriving?
         // kb_received ~0 on a peer => its socket gets no packets from the
         // other side (one-directional delivery). Logged every 30 ticks.
+        if ((arena_log % 60u) == 3) cl_iter_guard::report_dynvb_peak();
         if (!g_solo && (arena_log % (log_trace_on() ? 3u : 30u)) == 1) {
             GekkoNetworkStats ns = {};
             uint8_t remote = (uint8_t)(1 - g_local_idx);
