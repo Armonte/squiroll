@@ -137,6 +137,8 @@ void diag_alloc_counts(int frame, int rb);
 
 uint8_t* base();        // arena base — the MEM_WRITE_WATCH region
 uint32_t used();        // high-water bytes (what save() writes)
+void churn_report(int top);  // log the top allocation sites by freed/live bytes
+void advance_frame();        // quarantine clock tick (see cpp_arena.cpp)
 uint32_t capacity();    // arena reservation
 
 // Rollback serialization: snapshot_ring holds this across restore/capture so a

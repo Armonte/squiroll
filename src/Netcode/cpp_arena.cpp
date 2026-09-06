@@ -45,7 +45,8 @@ namespace actor2d_log { void watch_arm(uint32_t addr); }  // Dr0 write-watch (VE
 
 // Frame/rollback counters owned by gekko_bridge — used to tag connection-lifecycle
 // trace lines so a forward save can be diffed against its rollback re-sim.
-namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; }
+namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb;     bool is_session_started();
+}
 
 namespace cpp_arena {
 namespace {
@@ -64,7 +65,8 @@ static constexpr uint32_t META_MAGIC = 0x4D504143;  // 'CAPM'
 // 16-byte block header; keeps the payload 16-byte aligned.
 struct Hdr {
     uint32_t cls;        // size-class shift, CLS_MIN_SH..CLS_MAX_SH
-    uint32_t reqsize;    // requested payload size
+    uint32_t reqsize;    // allocated: requested payload size. FREED: the arena
+                         // frame it was freed on (quarantine stamp).
     uint32_t link;       // free block: free-list link (arena offset of next).
                          // allocated block: caller RVA of the operator-new /
                          // raw_alloc site — DIAGNOSTIC, lets a rollback-
@@ -81,9 +83,11 @@ struct Meta {
     uint32_t magic;
     uint32_t bump;             // offset of next fresh SIM block (high-water, grows up)
     uint32_t live_bytes;       // currently-handed-out payload bytes
-    uint32_t free_off[NCLS];   // per-class free-list head offset (0 = empty)
+    uint32_t free_off[NCLS];   // per-class free-list HEAD (oldest freed; 0 = empty)
     uint32_t render_bump;      // next fresh RENDER block (grows up from RENDER_BASE)
-    uint32_t reserved[7];
+    uint32_t free_tail[NCLS];  // per-class free-list TAIL (newest freed; FIFO push here)
+    uint32_t frame;            // arena frame counter (advance_frame); quarantine clock
+    uint32_t reserved[6];
 };
 
 // The arena is split into a SIM region [Meta, RENDER_BASE) and a RENDER region
@@ -94,6 +98,8 @@ struct Meta {
 // render region stay valid; cpp is excluded from the desync checksum so the render
 // region diverging fwd-vs-resim is harmless. 16 MB is ample for per-frame render.
 static constexpr uint32_t RENDER_BASE = 112u * 1024 * 1024;
+// Frames a freed block must sit dead before arena_alloc may hand it out again.
+static constexpr int32_t QUARANTINE_FRAMES = 90;
 
 static uint8_t* g_base      = nullptr;
 static Meta*    g_meta      = nullptr;
@@ -491,6 +497,54 @@ static char thiscall haspend_hook(int self) {
     int use = -2, weak = -2;
     if (in_arena) { use = *(int*)(sc + 4); weak = *(int*)(sc + 8); }
     bool gl = ((uint32_t)self == *(uint32_t*)(0x49AFBC_R));
+    // PIN OUT-OF-ARENA SLOT-LIST CONTROL BLOCKS (2026-09-05). Symbolized crash
+    // (240 s dual baseline, twice): abort <- __purecall <- RunOneFrame 0x2FD14
+    // (the slot-list lock release, vtbl+4 _Destroy) during a RE-SIM. A control
+    // block whose vtable is the abstract _Ref_count_base = one that was already
+    // deleted. Chain: the ScriptAPI's slot-list sc lives OUTSIDE the arenas
+    // (allocated pre-arm / off-thread), the list gets replaced (copy-on-write on
+    // connect/disconnect) and the OUT block is deleted forward; a later rollback
+    // rewinds the ScriptAPI's pointer to that OUT block, whose bytes were never
+    // rewound -> dead vtable -> purecall. Fix: the first time we see an OUT sc
+    // on any ScriptAPI, take one extra strong + weak ref so it can never be
+    // deleted (a few dozen leaked bytes per distinct block). Arena blocks are
+    // rewound consistently and need nothing.
+    // Only the two REWOUND dispatchers matter (sim 0x49B01C, game-loop 0x49AFBC),
+    // and only while a rollback session is LIVE: the round transition swaps the
+    // game-loop dispatcher's list every frame (forward-only, never rewound) and
+    // pinning those just leaks.
+    bool rewound_api = gl || ((uint32_t)self == *(uint32_t*)(0x49B01C_R));
+    if (rewound_api && gekko_bridge::is_session_started() && !in_arena && sc >= 0x10000) {
+        static uint32_t pinned[32]; static int npin = 0;
+        bool seen = false;
+        for (int i = 0; i < npin; ++i) if (pinned[i] == sc) { seen = true; break; }
+        if (!seen) {
+            MEMORY_BASIC_INFORMATION mbi;
+            bool ok = VirtualQuery((void*)(uintptr_t)sc, &mbi, sizeof mbi) == sizeof mbi &&
+                      mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                      (uintptr_t)sc + 12 <= (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+            uint32_t vt = ok ? *(uint32_t*)sc : 0;
+            int u = ok ? *(int*)(sc + 4) : -1, w = ok ? *(int*)(sc + 8) : -1;
+            const uint8_t* img = (const uint8_t*)base_address;
+            uint32_t img_sz = ((const IMAGE_NT_HEADERS*)(img + ((const IMAGE_DOS_HEADER*)img)->e_lfanew))
+                                  ->OptionalHeader.SizeOfImage;
+            bool vt_in_img = vt >= (uint32_t)base_address && vt < (uint32_t)base_address + img_sz;
+            if (ok && vt_in_img && u > 0 && w > 0 && u < 100000 && w < 100000) {
+                InterlockedIncrement((volatile LONG*)(sc + 4));
+                InterlockedIncrement((volatile LONG*)(sc + 8));
+                if (npin < 32) pinned[npin++] = sc;
+                log_printf("[haspend] PIN OUT sc=%08X self=%08X%s vt=%08X use %d->%d weak %d->%d f=%d rb=%d\n",
+                           sc, (uint32_t)self, gl ? "*GL" : "", vt, u, u + 1, w, w + 1,
+                           gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb);
+            } else {
+                static int nbad = 0;
+                if (nbad < 10) { ++nbad;
+                    log_printf("[haspend] OUT sc=%08X self=%08X%s NOT pinnable (ok=%d vt=%08X use=%d weak=%d) f=%d rb=%d\n",
+                               sc, (uint32_t)self, gl ? "*GL" : "", (int)ok, vt, u, w,
+                               gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb); }
+            }
+        }
+    }
     // SELF-HEAL (2026-07-01): a dead control block (use<=0) on the PERSISTENT
     // game-loop signal is always corruption — entering the original would lock
     // (0->1), release (1->0) and dispose a live slot list, then spin forever in
@@ -665,9 +719,19 @@ static void* arena_alloc(size_t n, bool is_render) {
         // the sim (no recycle); 16 MB holds plenty of per-frame render churn.
         off = g_meta->render_bump;
         g_meta->render_bump += blk;
-    } else if (g_meta->free_off[ci]) {
+    } else if (g_meta->free_off[ci] &&
+               (int32_t)(g_meta->frame - ((Hdr*)(g_base + g_meta->free_off[ci]))->reqsize)
+                   >= QUARANTINE_FRAMES) {
+        // QUARANTINED RECYCLE: the FIFO head is the OLDEST freed block of this
+        // class; reuse it only once it has been dead for QUARANTINE_FRAMES
+        // arena frames, so any stale reader (the "immediate recycle" UAF class
+        // that made plain recycling crash 7/8 seeds) is long gone. Head/tail
+        // and the stamps all live in the snapshot, so forward and re-sim pop
+        // the same blocks in the same order.
         off = g_meta->free_off[ci];
-        g_meta->free_off[ci] = ((Hdr*)(g_base + off))->link;
+        uint32_t nx = ((Hdr*)(g_base + off))->link;
+        g_meta->free_off[ci] = nx;
+        if (!nx) g_meta->free_tail[ci] = 0;
     } else {
         if ((uint64_t)g_meta->bump + blk > RENDER_BASE) {
             if (g_warn) {
@@ -778,14 +842,24 @@ static void arena_free(void* p) {
     // (the zeroed block is never reused, so the stale read sees null). The
     // correct fix for the arena growth is a QUARANTINE (delay recycle N frames)
     // so the stale reference is gone before reuse — a follow-up.
+    // [2026-09-05] QUARANTINED recycle is now the DEFAULT (SQUIROLL_RECYCLE=0
+    // to leak-everything for A/B). FIFO per class: push the freed block at the
+    // TAIL stamped with the arena frame; arena_alloc pops the HEAD only after
+    // QUARANTINE_FRAMES (see arena_alloc). Leak-everything filled the 112 MB
+    // sim region at ~f6650 of a single round (churn_report: effect particles,
+    // CSV rows, strings, list nodes — ~5 KB/frame never reused).
     static int recycle = -1;
     if (recycle < 0) { char b[4] = {0};
-        recycle = (GetEnvironmentVariableA("SQUIROLL_RECYCLE", b, sizeof b) > 0 && b[0] != '0') ? 1 : 0; }
+        recycle = (GetEnvironmentVariableA("SQUIROLL_RECYCLE", b, sizeof b) > 0 && b[0] == '0') ? 0 : 1; }
     if (recycle) {
-        h->link = g_meta->free_off[ci];    // push onto the size-class free-list
-        g_meta->free_off[ci] = foff;
+        h->link    = 0;                    // newest: no next-newer yet
+        h->reqsize = g_meta->frame;        // quarantine stamp
+        uint32_t t = g_meta->free_tail[ci];
+        if (t) ((Hdr*)(g_base + t))->link = foff;
+        else   g_meta->free_off[ci] = foff;
+        g_meta->free_tail[ci] = foff;
     }
-    // else: leak (orphan) — arena_alloc bumps fresh. (void)foff kept implicit.
+    // else: leak (orphan) — arena_alloc bumps fresh.
     LeaveCriticalSection(&g_lock);
 }
 
@@ -1196,7 +1270,8 @@ void install() {
     g_meta->bump        = (sizeof(Meta) + 15u) & ~15u;  // first SIM block 16-aligned
     g_meta->render_bump = RENDER_BASE;                  // render region grows from here
     g_meta->live_bytes  = 0;
-    for (int i = 0; i < NCLS; ++i) g_meta->free_off[i] = 0;
+    for (int i = 0; i < NCLS; ++i) { g_meta->free_off[i] = 0; g_meta->free_tail[i] = 0; }
+    g_meta->frame = 0;
 
     // Install the FREE hook first: the instant the operator-new hook goes
     // live it hands out arena pointers, and their frees must already be
@@ -1585,6 +1660,61 @@ void trace_check(uint32_t frame, int rb) {
 }
 uint8_t* base()      { return g_base; }
 uint32_t used()      { return g_meta ? g_meta->bump : 0; }
+// Quarantine clock: once per sim advance (forward AND re-sim — Meta is rewound
+// with the snapshot, so the re-sim replays the same values) and once per vanilla
+// frame during the round transition (pre_arm_poll).
+void advance_frame() { if (g_meta) ++g_meta->frame; }
+
+// CHURN REPORT: walk every SIM block [first, bump) and rank by allocation site.
+// A freed block keeps its Hdr.link = caller RVA (recycle off never rewrites
+// it), so this names exactly WHO produced the leaked/free bytes vs the live
+// ones. Top `top` sites by freed bytes, then by live bytes.
+void churn_report(int top) {
+    if (!g_meta || !g_base) return;
+    struct Site { uint32_t rva, cls; uint32_t nlive, nfree; uint64_t blive, bfree; };
+    static Site sites[4096]; int ns = 0;
+    uint32_t off = (sizeof(Meta) + 15u) & ~15u, end = g_meta->bump;
+    uint32_t nblk = 0, nbad = 0; uint64_t tot_live = 0, tot_free = 0;
+    EnterCriticalSection(&g_lock);
+    while (off + sizeof(Hdr) <= end) {
+        const Hdr* h = (const Hdr*)(g_base + off);
+        if (h->cls < (uint32_t)CLS_MIN_SH || h->cls > (uint32_t)CLS_MAX_SH) { ++nbad; break; }
+        uint32_t blk = 1u << h->cls;
+        bool live = h->magic == HDR_MAGIC;
+        // freed blocks: link = FIFO next-offset, reqsize = free stamp -> the
+        // caller is gone; bucket them per size class under rva 0.
+        uint32_t rva = live ? h->link : 0;
+        int i = 0;
+        for (; i < ns; ++i) if (sites[i].rva == rva && sites[i].cls == h->cls) break;
+        if (i == ns && ns < 4096) { sites[ns] = Site{rva, h->cls, 0, 0, 0, 0}; ++ns; }
+        if (i < ns) {
+            if (live) { sites[i].nlive++; sites[i].blive += blk; }
+            else      { sites[i].nfree++; sites[i].bfree += blk; }
+        }
+        if (live) tot_live += blk; else tot_free += blk;
+        ++nblk; off += blk;
+    }
+    LeaveCriticalSection(&g_lock);
+    log_printf("[churn] blocks=%u live=%u KB freed(leaked)=%u KB bump=%u KB sites=%d bad=%u\n",
+               nblk, (uint32_t)(tot_live / 1024), (uint32_t)(tot_free / 1024),
+               g_meta->bump / 1024, ns, nbad);
+    for (int pass = 0; pass < 2; ++pass) {
+        log_printf("[churn] --- top %d sites by %s bytes ---\n", top, pass ? "LIVE" : "FREED");
+        for (int k = 0; k < top; ++k) {
+            int best = -1; uint64_t bb = 0;
+            for (int i = 0; i < ns; ++i) {
+                uint64_t v = pass ? sites[i].blive : sites[i].bfree;
+                if (v > bb) { bb = v; best = i; }
+            }
+            if (best < 0 || bb == 0) break;
+            Site& S = sites[best];
+            log_printf("[churn]   rva=%08X cls=%2u (%7u B) freed n=%-7u %8u KB | live n=%-6u %7u KB\n",
+                       S.rva, S.cls, 1u << S.cls, S.nfree, (uint32_t)(S.bfree / 1024),
+                       S.nlive, (uint32_t)(S.blive / 1024));
+            if (pass) S.blive = 0; else S.bfree = 0;   // consume for the next pick
+        }
+    }
+}
 uint32_t capacity()  { return ARENA_SIZE; }
 size_t   live_bytes(){ return g_meta ? g_meta->live_bytes : 0; }
 
