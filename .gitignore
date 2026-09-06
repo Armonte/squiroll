@@ -37,3 +37,4 @@ squiroll_dbg.txt
 **/publish/
 *.nut.h
 *.txt.h
+*.pdb
