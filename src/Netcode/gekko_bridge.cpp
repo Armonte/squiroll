@@ -550,7 +550,19 @@ static void*    g_rdr_e4_dev[2] = {nullptr, nullptr};
 // AND re-sim. Decides the "first re-advance applies the pre-inject value"
 // mystery: v=corrected at pop time => the decode/target is suspect;
 // v=stale => something rewrote the slot after inject.
-static void*    g_tap_vt[4]  = {nullptr, nullptr, nullptr, nullptr};
+// FULL vtable copy. The lambda's std::_Func_impl vtable is 5 entries:
+//   [0] _Copy  [1] _Move  [2] _Do_call (tapped)  [3] _Target_type
+//   [4] _Delete_this(bool)   <-- th155 0x6D780
+// inputsingle_cleanup (0x6D970) is std::_Func_class::_Tidy: it calls
+// _Ptr->_Delete_this(_Ptr != &_Space) = SLOT 4, both for the reader at +188 and
+// for the handler at +0xE4. Copying only 4 slots made the game call the dword
+// PAST this array (g_tap_orig) as _Delete_this: 0 -> EXEC-at-NULL, whose clguard
+// recovery pops the return address but NOT the pushed bool of that __stdcall
+// callee, shifting the caller's stack so the next free() took a garbage pointer
+// -> RtlFreeHeap(invalid) -> 0xC0000374 "heap corruption" (runs 36/52/53/58/59).
+// 8 slots: the real 5 plus slack, so a longer vtable can never run off the end.
+static void*    g_tap_vt[8]  = {nullptr, nullptr, nullptr, nullptr,
+                                nullptr, nullptr, nullptr, nullptr};
 static uint32_t g_tap_orig   = 0;
 // REBIND UNDO (2026-09-05). The in-place conversion below rewrote the game's
 // reader objects to tapped recorder lambdas and forced InputGlobal+188 to our
@@ -2699,11 +2711,13 @@ void advance_one_frame() {
                     // entries 0..3, invoke slot (index 2) -> pop_tap.
                     if (!g_tap_vt[2] && anchor_reader[0]) {
                         void** ovt = (void**)anchor_reader[0];
-                        for (int vi = 0; vi < 4; ++vi) g_tap_vt[vi] = ovt[vi];
+                        for (int vi = 0; vi < 8; ++vi) g_tap_vt[vi] = ovt[vi];
                         g_tap_orig  = (uint32_t)(uintptr_t)ovt[2];
                         g_tap_vt[2] = (void*)&pop_tap;
-                        log_printf("[gekko_bridge] pop tap: orig invoke=%p\n",
-                                   (void*)(uintptr_t)g_tap_orig);
+                        log_printf("[gekko_bridge] pop tap: vt=%p orig invoke=%p "
+                                   "delete_this=%p (slot 4)\n",
+                                   (void*)ovt, (void*)(uintptr_t)g_tap_orig,
+                                   g_tap_vt[4]);
                     }
                     fab = (void**)((gm_t)(0x306FBC_R))(2 * sizeof(void*));
                     if (fab) {
