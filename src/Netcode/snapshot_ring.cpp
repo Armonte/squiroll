@@ -115,6 +115,7 @@ struct Arena {
     uint32_t* phash;    // per-page hash, npages entries — tracks live state
 };
 static Arena  g_ar[NARENA];
+static bool   g_want_raw_cs = true;   // see set_want_raw_checksum
 static void** g_pgbuf = nullptr;   // GetWriteWatch address scratch
 
 struct Slot {
@@ -576,6 +577,8 @@ struct RollbackGuard {
     ~RollbackGuard() { cpp_arena::rollback_unlock(); }
 };
 
+void set_want_raw_checksum(bool on) { g_want_raw_cs = on; }
+
 uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint32_t nocsum_tail) {
     if (!g_armed) return 0;
     // NB: capture does NOT hold g_rollback_cs (unlike restore). Capture only
@@ -640,7 +643,12 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
             dp += REC;
             ++n;
             memcpy(A.mirror + off, A.base + off, PAGE);     // sync mirror -> frame
-            A.phash[off / PAGE] = hash_page(A.base + off);  // hash -> frame
+            // The per-page hash exists ONLY to feed fold_checksum and the
+            // divergence diagnostics. When the fold is skipped (dual netplay,
+            // see set_want_raw_checksum) hashing every dirty page is a third of
+            // the per-page work for a value nothing reads.
+            if (g_want_raw_cs)
+                A.phash[off / PAGE] = hash_page(A.base + off);  // hash -> frame
             // Tracked-page latch (cpp_arena only). On FORWARD save the
             // current bytes become the baseline for the next re-sim's
             // dword-level diff log. The gate on !is_resim() avoids the
@@ -725,8 +733,13 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
     S.sblob_len = sblob_len;
 
     LARGE_INTEGER pt1; QueryPerformanceCounter(&pt1);
+    // Skip the whole fold when nobody will read it (dual netplay — see
+    // set_want_raw_checksum). This is ~800us of the save: a ~1MB compaction copy
+    // plus a ~1MB FNV hash plus the page-hash fold, all discarded by the caller.
     // Exclude the restore-but-not-checksum tail (the RNG section) from the fold:
     // it is stored+restored above but its bytes are render-contaminated.
+    uint32_t cs = 0;
+    if (g_want_raw_cs) {
     uint32_t csum_len = (nocsum_tail <= sblob_len) ? sblob_len - nocsum_tail : sblob_len;
     // Render-heap (0x1a) pointer fields inside the bp section are restore-only:
     // battle_pools::save() emitted byte-exact nochecksum spans into this very
@@ -793,7 +806,8 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
             }
         }
     }
-    uint32_t cs = fold_checksum(fold_src, fold_len);
+    cs = fold_checksum(fold_src, fold_len);
+    }   // g_want_raw_cs
     LARGE_INTEGER pt2; QueryPerformanceCounter(&pt2);
 
     // PHASH TRIPWIRE (ungated, write-once): bp+eng are byte-identical at the

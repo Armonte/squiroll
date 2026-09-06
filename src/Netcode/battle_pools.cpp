@@ -304,6 +304,12 @@ uint32_t save(uint8_t* out, uint32_t cap) {
             ++nblk;
         });
         if (total > MAXSLOT) return 0;
+        // MEASURED 2026-09-06: these pools hold ~46,400 slots totalling ~13.6 MB,
+        // of which only ~3,000 (~400 KB) are live. So the free list this walk
+        // chases has ~43,000 nodes, and emitting it costs ~172 KB of the ~400 KB
+        // blob. That is why the walk below, not the slot copy, is the single
+        // largest item in the frame. It also rules out the obvious "just memcpy
+        // whole blocks" rewrite: that would make the blob 13.6 MB per save.
 
         // Mark every free slot in the bitmap by walking the free list.
         memset(g_freebits, 0, (total + 7) / 8);

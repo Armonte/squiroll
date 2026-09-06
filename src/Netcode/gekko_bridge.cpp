@@ -1608,6 +1608,10 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         }
         LARGE_INTEGER _c1; QueryPerformanceCounter(&_c1);
         SECBR("pre-cap  ");
+        // Dual netplay never reads the raw checksum: the cross-peer value is the
+        // structural one below, because a raw page/blob hash is pointer-
+        // contaminated between two processes. Solo still uses it.
+        snapshot_ring::set_want_raw_checksum(g_solo || snapshot_ring::diag_on());
         uint32_t cs = snapshot_ring::capture(frame, smb,
                                              (uint32_t)(sp - smb), rng_tail);
         SECBR("post-cap ");
@@ -1661,7 +1665,11 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         if (cs_every < 0) {
             char b[8] = {0};
             DWORD n_ = GetEnvironmentVariableA("SQUIROLL_CHECKSUM_EVERY", b, sizeof b);
-            cs_every = (n_ > 0) ? atoi(b) : 4;
+            // 30 frames = half a second. A desync is permanent once it
+            // happens, so detecting it within half a second costs nothing real,
+            // while every-4 spent ~730us of EVERY save on a walk whose result is
+            // read once. Soaks set 1.
+            cs_every = (n_ > 0) ? atoi(b) : 30;
             if (cs_every < 0) cs_every = 0;
             log_printf("[gekko_bridge] structural cross-peer checksum: %s\n",
                        cs_every == 0 ? "OFF"

@@ -42,6 +42,14 @@ bool diag_on();
 // Capture frame `frame`: store the three arenas' dirty-page deltas and a copy
 // of `sblob` (the serialized non-arena sections). Returns the full-state
 // desync checksum.
+// The RAW page+blob checksum capture() returns costs ~800us per save: it builds a
+// compacted copy of the whole small blob (skipping the nochecksum spans) and FNV-
+// hashes it, then folds every in-use page hash. DUAL netplay throws that value
+// away — the cross-peer checksum is the structural one from save_battle, because
+// a raw hash is pointer-contaminated between processes. Tell capture() when the
+// result is actually wanted so it can skip the work entirely.
+void set_want_raw_checksum(bool on);
+
 uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint32_t nocsum_tail = 0);
 
 // Roll the arenas back to `frame` and return that frame's sblob blob (its
