@@ -92,6 +92,8 @@ bool is_excluded_page(uint32_t pg);
 // alloc_rva (the operator-new caller RVA from the block header), reqsize and
 // payload base, and return true. Scans backwards for the block header —
 // diagnostic-only cost, safe to call from the VEH/fastfail path.
+// "sim" / "render" / "none": which cpp_arena region (if any) holds p.
+const char* region_of(const void* p);
 bool describe_block(uint32_t addr, uint32_t* alloc_rva, uint32_t* reqsize,
                     uint32_t* payload);
 

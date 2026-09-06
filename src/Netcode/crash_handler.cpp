@@ -18,6 +18,8 @@
 // snprintf because it touches none of those (it also has no %f, which we
 // don't need). Output goes to aocf_crash.log via raw WriteFile.
 
+namespace gekko_bridge { extern int g_trace_frame; extern int g_trace_rb; }
+
 namespace {
 
 static volatile LONG g_in_handler = 0;
@@ -80,6 +82,27 @@ static void describe_addr(uintptr_t addr, char* out) {
         wsprintfA(out, "%s+0x%X", base, (unsigned)(addr - (uintptr_t)mod));
     } else {
         wsprintfA(out, "0x%08X <no module>", (unsigned)addr);
+    }
+}
+
+// Scan `ndw` dwords upward from `sp` for th155 code addresses and log them.
+// Used for the CRASHED stack (VEH) and the fast-fail issuer's caller stack:
+// th155 is FPO'd, so the ebp chain hides every game frame; the raw scan is
+// the only way to see which th155 function actually issued the abort/fault.
+static void scan_rets(const uint32_t* sp, int ndw, int maxshow, const char* indent) {
+    char loc[MAX_PATH + 32];
+    for (int k = 0, shown = 0; k < ndw && shown < maxshow; ++k) {
+        MEMORY_BASIC_INFORMATION m;
+        if (VirtualQuery((const void*)&sp[k], &m, sizeof m) != sizeof m ||
+            m.State != MEM_COMMIT || (m.Protect & PAGE_GUARD) || m.Protect == PAGE_NOACCESS)
+            break;
+        const uint32_t v = sp[k];
+        const uint32_t rva = v - (uint32_t)::base_address;
+        if (rva >= 0x1000 && rva < 0x300000) {
+            describe_addr(v, loc);
+            crash_logf("%ssp[+0x%03X] rva=%08X  %s\r\n", indent, k * 4, rva, loc);
+            ++shown;
+        }
     }
 }
 
@@ -237,6 +260,8 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
                                "eip=%08X esp=%08X (popping return addr). "
                                "(hit #%u)\r\n",
                                gc->Eip, gc->Esp, hits);
+                    crash_logf("  f=%d rb=%d\r\n", gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb);
+                    scan_rets((const uint32_t*)(uintptr_t)gc->Esp, 24, 8, "    ");
                 }
                 if (!IsBadReadPtr((void*)(uintptr_t)gc->Esp, 4)) {
                     uintptr_t ret_addr = *(uintptr_t*)(uintptr_t)gc->Esp;
@@ -271,6 +296,10 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
                                    "(hit #%u)\r\n",
                                    gc->Eip, rva, (unsigned)fault_addr,
                                    (unsigned)insn.length, hits);
+                        crash_logf("  f=%d rb=%d ecx=%08X edi=%08X esi=%08X\r\n",
+                                   gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
+                                   gc->Ecx, gc->Edi, gc->Esi);
+                        scan_rets((const uint32_t*)(uintptr_t)gc->Esp, 32, 8, "    ");
                     }
                     ep->ContextRecord->Eip += insn.length;
                     return EXCEPTION_CONTINUE_EXECUTION;
@@ -358,6 +387,7 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
     crash_logf(watched ? "\r\n==== FIRST-CHANCE EXCEPTION (re-sim) ====\r\n"
                        : "\r\n==== CRASH (squiroll VEH) ====\r\n");
     crash_logf("code=0x%08X  at %s  eip=0x%08X\r\n", code, loc, c->Eip);
+    crash_logf("  f=%d rb=%d\r\n", gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb);
     if (code == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2) {
         const ULONG_PTR kind = r->ExceptionInformation[0];
         const char* op = kind == 0 ? "READ" : kind == 1 ? "WRITE" : "EXEC";
@@ -437,6 +467,8 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
                        c->Edi, c->Ebx);
         }
     }
+    crash_logf("  --- raw stack scan (th155 ret addrs, crashed esp) ---\r\n");
+    scan_rets((const uint32_t*)(uintptr_t)c->Esp, 160, 24, "    ");
     crash_logf("==== END CRASH ====\r\n");
 
     // Drain the async log queue AFTER the crash dump is safely on disk: if
@@ -464,9 +496,16 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
 // the process cleanly.
 static SafetyHookInline g_ff[5];
 
-static void log_fastfail_stack(const char* via) {
+static void log_fastfail_stack(const char* via, const uint32_t* sp0 = nullptr) {
     log_crash_drain();
     crash_logf("\r\n==== FASTFAIL via %s ====\r\n", via);
+    crash_logf("  f=%d rb=%d\r\n", gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb);
+    if (sp0) {
+        // sp0 = the hooked issuer's return-address slot: sp0[0] is the exact
+        // th155 call site of abort()/fastfail, sp0[1..] its caller's stack.
+        crash_logf("  --- issuer call site + caller stack ---\r\n");
+        scan_rets(sp0, 40, 12, "    ");
+    }
     // NB: do NOT probe with IsBadReadPtr here — it works by raising a real AV
     // and swallowing it in SEH, but our VEH runs FIRST and logs it as a
     // "CRASH at KERNEL32+..." (polluting exit-path logs and misclassifying
@@ -512,7 +551,7 @@ static void log_fastfail_stack(const char* via) {
 
 #define FF_HOOK(idx, nm)                              \
     static void __cdecl ff_hook_##idx() {             \
-        log_fastfail_stack(nm);                       \
+        log_fastfail_stack(nm, (const uint32_t*)_AddressOfReturnAddress()); \
         TerminateProcess(GetCurrentProcess(), 0xC0000409u); \
     }
 FF_HOOK(0, "__report_gsfailure")
@@ -520,6 +559,50 @@ FF_HOOK(1, "__report_securityfailure")
 FF_HOOK(2, "__scrt_fastfail")
 FF_HOOK(3, "__invoke_watson")
 FF_HOOK(4, "abort")
+
+// __purecall (th155 0x2F9041) -> abort. A pure-virtual call = a virtual on an
+// object whose vtable is (back to) an abstract base's: mid-destruction, or a
+// rewound/stale object. abort()'s own frame can't tell us which object; hook
+// __purecall itself with a naked shim so ECX (`this` of the virtual call) and
+// the exact vtable call site are captured before the abort path runs.
+static void* g_purecall_orig = nullptr;
+static void __cdecl purecall_log(uint32_t ecx, uint32_t ret) {
+    crash_logf("\r\n==== __purecall: this=%08X vtable=%08X region=%s ret=%08X f=%d rb=%d ====\r\n",
+               ecx, (ecx >= 0x10000 && !IsBadReadPtr((void*)(uintptr_t)ecx, 4)) ? *(uint32_t*)(uintptr_t)ecx : 0,
+               cpp_arena::region_of((const void*)(uintptr_t)ecx),
+               ret, gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb);
+    char loc[MAX_PATH + 32];
+    describe_addr(ret, loc);
+    crash_logf("  call site: %s\r\n", loc);
+    if (ecx >= 0x10000) {
+        const uint32_t* o = (const uint32_t*)(uintptr_t)ecx;
+        if (!IsBadReadPtr(o, 32)) {
+            crash_logf("  obj[0..7]: %08X %08X %08X %08X %08X %08X %08X %08X\r\n",
+                       o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]);
+            uint32_t rva = 0, sz = 0, pay = 0;
+            if (cpp_arena::describe_block(ecx, &rva, &sz, &pay))
+                crash_logf("  arena block payload=%08X size=%u alloc_rva=%08X\r\n", pay, sz, rva);
+        }
+    }
+}
+static naked void purecall_hook_entry() {
+    __asm {
+        push ecx                    // preserve `this` for the original path
+        push dword ptr [esp+4]      // ret (the vtable call site)
+        push ecx                    // this
+        call purecall_log
+        add  esp, 8
+        pop  ecx
+        jmp  dword ptr [g_purecall_orig]
+    }
+}
+static SafetyHookInline g_h_purecall{}, g_h_terminate{};
+static void __cdecl terminate_hook() {
+    crash_logf("\r\n==== std::terminate f=%d rb=%d ====\r\n",
+               gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb);
+    scan_rets((const uint32_t*)_AddressOfReturnAddress(), 40, 12, "    ");
+    g_h_terminate.unsafe_ccall<void>();
+}
 
 // --- process-exit interception ----------------------------------------------
 // If the crash is not an exception at all — a clean ExitProcess / Terminate-
@@ -769,6 +852,11 @@ void install() {
         ffok += g_ff[i].enabled() ? 1 : 0;
     }
     log_printf("crash_handler: fastfail hooks %d/5\n", ffok);
+    g_h_purecall = safetyhook::create_inline(base + 0x2f9041, (void*)purecall_hook_entry);
+    g_purecall_orig = g_h_purecall ? (void*)g_h_purecall.trampoline().address() : nullptr;
+    g_h_terminate = safetyhook::create_inline(base + 0x306738, (void*)terminate_hook);
+    log_printf("crash_handler: __purecall hook %s, terminate hook %s\n",
+               g_h_purecall.enabled() ? "OK" : "FAIL", g_h_terminate.enabled() ? "OK" : "FAIL");
 
     HMODULE k32 = GetModuleHandleA("kernel32.dll");
     if (k32) {

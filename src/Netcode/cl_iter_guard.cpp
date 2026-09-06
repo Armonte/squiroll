@@ -90,6 +90,18 @@ namespace cl_iter_guard {
 // x_crash_1). Guard: NULL linked particle -> return 0 ("effect terminated"),
 // which is semantically what a detached effect is.
 #define UPDATE_EFFECT_STATE (0x10B810_R)
+// Ew_cEftParticleIns::vftable_1 (0xEE560) / Ew_cEftSpiralIns::vftable_1 (0x10B940):
+// the per-instance world-matrix update jobs. Both pass the instance's LINKED PRIM
+// (this+4) as `this` into Ew_compute_effect_world_matrix, which dereferences it
+// unconditionally (mov eax,[edi+10h] at 0x109631). Same shape as UPDATE_EFFECT_STATE:
+// vanilla ordering keeps the job from running after DetachFromOwnerGroup NULLs the
+// link; a rollback re-sim breaks that ordering -> NULL-deref -> the crash_handler's
+// universal skip then continued with garbage (EXEC-at-NULL, wild writes: run 52's
+// corrupted cEftGroup). Guard: NULL link -> skip the job (the matrix stays as-is; the
+// instance is detached/dying). __usercall (ecx=this, xmm/st0 args, no stack args), so
+// the guard is a naked shim: on the pass path every register reaches the original.
+#define PARTICLE_INS_UPDATE (0xEE560_R)
+#define SPIRAL_INS_UPDATE   (0x10B940_R)
 // Healthy boost::signals2 grouped_list connection counts are O(100).
 // Set the cap well above any realistic count but well below "infinite"
 // so a corrupted-cycle walk bails in milliseconds.
@@ -103,6 +115,10 @@ static SafetyHookInline g_h_callfn{};
 static SafetyHookInline g_h_sndslot{};
 static SafetyHookInline g_h_removeid{};
 static SafetyHookInline g_h_updeff{};
+static SafetyHookInline g_h_pins{}, g_h_sins{};
+static void* g_pins_orig = nullptr;
+static void* g_sins_orig = nullptr;
+static std::atomic<uint64_t> g_ins_skips{0};
 static std::atomic<uint64_t> g_updeff_skips{0};
 static std::atomic<uint64_t> g_walk_bailouts{0};
 static std::atomic<uint64_t> g_walk_total{0};
@@ -224,6 +240,48 @@ static char thiscall updeff_hook(int self) {
     return g_h_updeff.unsafe_thiscall<char>(self);
 }
 
+// See PARTICLE_INS_UPDATE / SPIRAL_INS_UPDATE above.
+static void __cdecl ins_null_log(uint32_t self, uint32_t which) {
+    uint64_t n = g_ins_skips.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n & 0x3F) == 0)
+        log_printf("[insguard] %s instance %08X has NULL linked prim f=%d rb=%d -> job skipped (#%llu)\n",
+                   which ? "spiral" : "particle", self,
+                   gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
+                   (unsigned long long)n);
+}
+static naked void pins_hook_entry() {
+    __asm {
+        cmp  ecx, 0x10000
+        jb   pins_pass
+        cmp  dword ptr [ecx+4], 0
+        jne  pins_pass
+        push 0
+        push ecx
+        call ins_null_log
+        add  esp, 8
+        xor  eax, eax
+        ret
+    pins_pass:
+        jmp  dword ptr [g_pins_orig]
+    }
+}
+static naked void sins_hook_entry() {
+    __asm {
+        cmp  ecx, 0x10000
+        jb   sins_pass
+        cmp  dword ptr [ecx+4], 0
+        jne  sins_pass
+        push 1
+        push ecx
+        call ins_null_log
+        add  esp, 8
+        xor  eax, eax
+        ret
+    sins_pass:
+        jmp  dword ptr [g_sins_orig]
+    }
+}
+
 // __thiscall(this, target_id) -> BOOL. See REMOVE_ID_FROM_BUFFER above.
 static int thiscall removeid_hook(int self, int target_id) {
     if (gekko_bridge::g_trace_rb && self >= 0x10000) {
@@ -266,6 +324,13 @@ void install() {
                                              (void*)removeid_hook);
     g_h_updeff = safetyhook::create_inline((void*)UPDATE_EFFECT_STATE,
                                            (void*)updeff_hook);
+    g_h_pins = safetyhook::create_inline((void*)PARTICLE_INS_UPDATE, (void*)pins_hook_entry);
+    g_pins_orig = g_h_pins ? (void*)g_h_pins.trampoline().address() : nullptr;
+    g_h_sins = safetyhook::create_inline((void*)SPIRAL_INS_UPDATE, (void*)sins_hook_entry);
+    g_sins_orig = g_h_sins ? (void*)g_h_sins.trampoline().address() : nullptr;
+    log_printf("[clguard] particle_ins_update @ 0x%X %s, spiral_ins_update @ 0x%X %s\n",
+               (uint32_t)PARTICLE_INS_UPDATE, g_h_pins.enabled() ? "OK" : "FAIL",
+               (uint32_t)SPIRAL_INS_UPDATE, g_h_sins.enabled() ? "OK" : "FAIL");
     log_printf("[clguard] hook concurrent_list_iter_step @ 0x%X %s, "
                "concurrent_list_walk_visit @ 0x%X %s (cap=%u), "
                "call_boost__function_3 @ 0x%X %s, "
