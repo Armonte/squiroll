@@ -118,7 +118,39 @@ Save was 7.3 ms at the start of this work. What is left, measured:
 | GetWriteWatch (capture+restore) | ~800 | 106 MB queried; cpp arena's bump is 70 MB |
 | boost pools | ~250 save / ~450 load | |
 
-**The next real win is incremental pool tracking.** The pools hold ~46,400 slots
+**Incremental pool tracking was attempted and REVERTED — read this before retrying.**
+The idea is right: the pools hold ~46,400 slots of which ~3,000 are live, so both
+save and load spend their time rediscovering a free list that changed by a
+handful of entries. The free list is LIFO (allocation pops the head, free pushes
+at the head, and `TPoolAllocator::Grow` at th155 0x37C30 links a fresh block and
+sets the head), so between saves it differs only in a prefix near the head. Cache
+it reversed (tail at index 0) so pushes and pops both land at the end of the
+array and every stable entry keeps its index.
+
+Three things went wrong, all worth knowing:
+
+1. **`g_freebits` is shared scratch reused across pools.** The full-walk code got
+   away with that because it rebuilt the bitmap per pool; an incremental cache
+   carries state between frames, so pool N reads pool N+1's bits. This did not
+   show up as a wrong bitmap — it showed up as a NULL dereference inside the game
+   a few frames later. The bitmap has to live in the per-pool cache.
+2. **The slot to position map goes stale within a single frame.** A slot that is
+   allocated and then freed again comes back at the head still carrying its old
+   index, and that index can still hold it, so the prefix walk stops early and
+   the cache silently loses the middle of the list. Confirm a join for real: the
+   list is tail-first, so the node following the candidate must be `rev[k-1]`.
+3. **Not every pool is LIFO.** `SqFunctionHolder` (slot lifetimes driven by
+   Squirrel closures) disagreed with the validator repeatedly. Any retry needs
+   per-pool fallback to the full walk, not a global assumption.
+
+Even with all three addressed the result still executed pool memory as code
+during a re-simulation (`eip` inside the 0x44M pool region) — the signature of a
+wrong live/free set. A wrong state-serialisation path is the worst class of bug
+here, so it was reverted rather than shipped. **Retry it against the SOLO rig
+with `SQUIROLL_BPVALIDATE=1` first**, where a mistake is a validator line rather
+than a cross-peer desync, and only then bring it to the dual rig.
+
+**The next real win is still incremental pool tracking.** The pools hold ~46,400 slots
 (~13.6 MB) of which only ~3,000 are live, so both save and load spend most of
 their time rediscovering a free list that changed by a handful of entries.
 Hooking the pool allocate/free to maintain the live set and free-list order as
