@@ -175,6 +175,13 @@ typedef struct GekkoNetworkStats {
     unsigned short last_ping;
     float avg_ping;
     float jitter;
+    // [squiroll] ack progress: the newest frame of OUR inputs this peer has
+    // acknowledged, and the newest local input frame we have queued. Equal ->
+    // the peer has everything we sent (used for the round-end drain).
+    int last_acked_frame;
+    int last_sent_frame;
+    // [squiroll] newest input frame RECEIVED from this peer (its own progress).
+    int remote_last_input_frame;
 } GekkoNetworkStats;
 
 // Public Facing API

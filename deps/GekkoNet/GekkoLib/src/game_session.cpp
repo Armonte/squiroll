@@ -209,6 +209,9 @@ void Gekko::GameSession::NetworkStats(i32 player, GekkoNetworkStats* stats)
                 stats->kb_received = actor->stats.kb_received_per_sec;
                 stats->last_ping = actor->stats.LastRTT();
                 stats->jitter = actor->stats.CalculateJitter();
+                stats->last_acked_frame = (int)actor->stats.last_acked_frame;
+                stats->last_sent_frame  = (int)_msg.GetLastAddedInput(false);
+                stats->remote_last_input_frame = (int)_sync.GetLastReceivedFrom(actor->handle);
                 stats->avg_ping = actor->stats.CalculateAvgRTT();
                 return;
             }

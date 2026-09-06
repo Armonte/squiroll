@@ -150,7 +150,7 @@ SQ_INCLUDES="/Isrc/shared /Isrc/Netcode/include"
 # input otherwise.
 DEP_C_FLAGS=($WARNINGS $DEFINES $SH_DEFINES $GK_DEFINES $INCLUDES $SH_INCLUDES $GK_INCLUDES $GK_FORCE_INCLUDE $FLAGS_BASE $OPT_FLAGS)
 DEP_CPP_FLAGS=("${DEP_C_FLAGS[@]}" /std:c++latest)
-SQ_FLAGS=($WARNINGS $DEFINES $SH_DEFINES $GK_DEFINES $INCLUDES $SH_INCLUDES $GK_INCLUDES $GK_FORCE_INCLUDE $FLAGS_BASE $OPT_FLAGS $SQ_INCLUDES /std:c++latest)
+SQ_FLAGS=($WARNINGS $DEFINES $SH_DEFINES $GK_DEFINES $INCLUDES $SH_INCLUDES $GK_INCLUDES $GK_FORCE_INCLUDE $FLAGS_BASE $OPT_FLAGS $SQ_INCLUDES /std:c++latest /Z7)
 
 # --- Helpers ----------------------------------------------------------------
 # obj_path src.cpp → build/{deps|obj}/<flattened-relpath>.obj
@@ -262,7 +262,7 @@ fi
 
 if [ "$need_link" = "1" ]; then
   echo "=== Stage 4: link ==="
-  clang-cl-19 -m32 -fuse-ld=lld "${SQ_OBJS[@]}" "${DEP_OBJS[@]}" /link /DLL $LIBPATHS user32.lib WS2_32.lib dbghelp.lib winmm.lib -exclude-all-symbols -kill-at /DEF:Netcode.def /OUT:Netcode.dll
+  clang-cl-19 -m32 -fuse-ld=lld "${SQ_OBJS[@]}" "${DEP_OBJS[@]}" /link /DLL /DEBUG /PDB:Netcode.pdb $LIBPATHS user32.lib WS2_32.lib dbghelp.lib winmm.lib -exclude-all-symbols -kill-at /DEF:Netcode.def /OUT:Netcode.dll
 else
   echo "=== Stage 4: link skipped (up to date) ==="
 fi
