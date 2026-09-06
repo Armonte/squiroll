@@ -29,6 +29,13 @@ for ((r=first; r<first+count; r++)); do
   g1=$(grep -c "insguard\|updeff\]" $p1); g2=$(grep -c "insguard\|updeff\]" $p2)
   cl=$(grep -c "CRASH (squiroll VEH)\|__purecall\|FASTFAIL via abort\|std::terminate\|RtlReportException\|FASTFAIL via __" aocf_crash.log 2>/dev/null)
   hk=$(grep -ch "heapchk\] !!\|\[ivec\] !!" $p1 $p2 | paste -sd+ | bc)
+  if [ -z "$f1" ] && [ -z "$f2" ] && [ "${cl:-0}" = 0 ]; then
+    if [ "${retried:-}" != "$r" ]; then
+      echo "## run $r: never connected (rig startup flake) — retrying once"
+      retried=$r; taskkill.exe /F /IM th155r.exe >/dev/null 2>&1; sleep 5
+      r=$((r-1)); continue
+    fi
+  fi
   echo "## run $r: p1 f=$f1 exit=$e1 desync=$d1 guard=$g1 | p2 f=$f2 exit=$e2 desync=$d2 guard=$g2 | rollbacks=$rb1 crashlog_hits=$cl heapbad=$hk hung=$hung"
   mkdir -p runs/stall_$r; cp -f $p1 $p2 runs/stall_$r/ 2>/dev/null; cp -f aocf_crash.log runs/stall_$r/ 2>/dev/null
   if [ "$hung" = 1 ] || [ "$e1" = 0 ] || [ "$e2" = 0 ] || [ "${cl:-0}" != 0 ] || [ "${hk:-0}" != 0 ]; then
