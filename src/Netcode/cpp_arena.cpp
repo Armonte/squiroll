@@ -1035,13 +1035,15 @@ static void* cdecl hook_op_new(size_t size) {
 // stale write into freed heap memory). Off-sim-thread frees pass straight
 // through (not sim state). SQUIROLL_FREE_JOURNAL=0 restores the old behaviour.
 static constexpr int     FJ_CAP        = 32768;
-static constexpr int32_t FJ_QUARANTINE = 180;    // frames; > any rollback depth
+static constexpr int32_t FJ_QUARANTINE = 90;     // frames; 9x the 10-frame prediction window,
+                                                 // and matches the arena block quarantine
 struct FjEnt { void* p; int32_t frame; };
 static FjEnt    g_fj[FJ_CAP];
 static int      g_fj_n = 0;
 static bool     g_fj_on = true;
 static uint32_t g_fj_push = 0, g_fj_dup = 0, g_fj_dropped = 0, g_fj_freed = 0,
                 g_fj_overflow = 0, g_fj_max = 0;
+static uint64_t g_fj_bytes = 0, g_fj_bytes_max = 0;   // currently-deferred payload bytes
 static int      g_fj_log = 48;                  // first-N free-site log quota
 static void fj_journal(void* p, uint32_t caller_rva) {
     void* evict = nullptr;
@@ -1056,6 +1058,8 @@ static void fj_journal(void* p, uint32_t caller_rva) {
     g_fj[g_fj_n++] = FjEnt{ p, (int32_t)g_meta->frame };
     ++g_fj_push;
     if ((uint32_t)g_fj_n > g_fj_max) g_fj_max = (uint32_t)g_fj_n;
+    g_fj_bytes += (uint64_t)HeapSize(GetProcessHeap(), 0, p);
+    if (g_fj_bytes > g_fj_bytes_max) g_fj_bytes_max = g_fj_bytes;
     LeaveCriticalSection(&g_lock);
     if (g_fj_log > 0) {
         --g_fj_log;
@@ -1072,7 +1076,10 @@ static void fj_release_expired() {
     EnterCriticalSection(&g_lock);
     const int32_t cur = (int32_t)g_meta->frame;
     for (int i = 0; i < g_fj_n && nb < 512; ) {
-        if (cur - g_fj[i].frame >= FJ_QUARANTINE) { batch[nb++] = g_fj[i].p; g_fj[i] = g_fj[--g_fj_n]; }
+        if (cur - g_fj[i].frame >= FJ_QUARANTINE) {
+            g_fj_bytes -= (uint64_t)HeapSize(GetProcessHeap(), 0, g_fj[i].p);
+            batch[nb++] = g_fj[i].p; g_fj[i] = g_fj[--g_fj_n];
+        }
         else ++i;
     }
     g_fj_freed += (uint32_t)nb;
@@ -1084,7 +1091,7 @@ static void fj_flush_all() {
     static void* batch[FJ_CAP]; int nb = 0;
     EnterCriticalSection(&g_lock);
     for (int i = 0; i < g_fj_n; ++i) batch[nb++] = g_fj[i].p;
-    g_fj_n = 0; g_fj_freed += (uint32_t)nb;
+    g_fj_n = 0; g_fj_bytes = 0; g_fj_freed += (uint32_t)nb;
     LeaveCriticalSection(&g_lock);
     for (int i = 0; i < nb; ++i) g_h_free.unsafe_ccall<void>(batch[i]);
     if (nb) log_printf("[fj] disarm: %d deferred real-heap frees released\n", nb);
@@ -1095,7 +1102,10 @@ static void fj_rollback_to(int32_t frame) {
     int dropped = 0;
     EnterCriticalSection(&g_lock);
     for (int i = 0; i < g_fj_n; ) {
-        if (g_fj[i].frame > frame) { g_fj[i] = g_fj[--g_fj_n]; ++dropped; }
+        if (g_fj[i].frame > frame) {
+            g_fj_bytes -= (uint64_t)HeapSize(GetProcessHeap(), 0, g_fj[i].p);
+            g_fj[i] = g_fj[--g_fj_n]; ++dropped;
+        }
         else ++i;
     }
     g_fj_dropped += (uint32_t)dropped;
@@ -1776,8 +1786,11 @@ void advance_frame() {
     if (g_fj_on) {
         fj_release_expired();
         if ((g_meta->frame % 1800u) == 0 && (g_fj_push || g_fj_dropped))
-            log_printf("[fj] f=%d live=%d max=%u pushed=%u dup=%u undone=%u released=%u overflow=%u\n",
-                       (int)g_meta->frame, g_fj_n, g_fj_max, g_fj_push, g_fj_dup,
+            log_printf("[fj] f=%d live=%d (%u KB, peak %u KB) max=%u pushed=%u dup=%u "
+                       "undone=%u released=%u overflow=%u\n",
+                       (int)g_meta->frame, g_fj_n,
+                       (unsigned)(g_fj_bytes >> 10), (unsigned)(g_fj_bytes_max >> 10),
+                       g_fj_max, g_fj_push, g_fj_dup,
                        g_fj_dropped, g_fj_freed, g_fj_overflow);
     }
 }

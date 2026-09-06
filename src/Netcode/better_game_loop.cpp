@@ -171,7 +171,9 @@ void stdcall better_game_loop() {
             for (int i = 0, n = gekko_bridge::turbo_ticks(); i < n; ++i) {
                 gekko_bridge::tick();
             }
+            gekko_bridge::heap_scan_phase("pre-render");
             frames_this_sec += window_render();
+            gekko_bridge::heap_scan_phase("post-render");
         } else if (gekko_bridge::is_active()) {
             // Dual handshake hold: the GekkoGameSession was created at
             // Round_Fight and its UDP handshake is in flight. Pump
@@ -184,14 +186,18 @@ void stdcall better_game_loop() {
             // branch above.)
             gekko_bridge::hold_vanilla_feed();   // keep feeding the peer's delay netcode
             gekko_bridge::tick();
+            gekko_bridge::heap_scan_phase("pre-render");
             frames_this_sec += window_render();
+            gekko_bridge::heap_scan_phase("post-render");
         } else if (gekko_bridge::is_holding_transition()) {
             // Round-end TRANSITION HOLD: we latched first. Do NOT run the
             // vanilla update (its delay-netcode traffic derails the still-armed
             // peer); keep polling the gekko session (retransmits + acks) and
             // rendering until the remote has reached the latch frame too.
             gekko_bridge::hold_poll();
+            gekko_bridge::heap_scan_phase("pre-render");
             frames_this_sec += window_render();
+            gekko_bridge::heap_scan_phase("post-render");
         } else {
             // Pre-arm: the menu and the round-start intro run here under
             // the vanilla loop. pre_arm_poll() arms the gekko session
@@ -201,7 +207,9 @@ void stdcall better_game_loop() {
             window_update_frame();
             gekko_bridge::pre_arm_poll();
             // NOTE: Not handling "SkipRender" because that doesn't seem to be used in AoCF
+            gekko_bridge::heap_scan_phase("pre-render");
             frames_this_sec += window_render();
+            gekko_bridge::heap_scan_phase("post-render");
         }
 
 #if PROFILING

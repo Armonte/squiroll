@@ -114,6 +114,13 @@ void render_one_frame();
 
 // Bind ::__gekko_skip_key on the root table (root must be on the stack top).
 void register_skip_key_native(void* vm);   // HSQUIRRELVM; root table on stack top
+
+// Diagnostic (SQUIROLL_HEAPCHECK=2): validate every process heap at a named
+// phase boundary. Used by better_game_loop to bracket heap damage to the
+// RENDER pass vs the sim advance — the 0xC0000374 the D3D driver reports is
+// raised inside the render pass, after the per-advance check has already
+// passed. No-op unless the heap check is enabled.
+void heap_scan_phase(const char* when);
 } // namespace gekko_bridge
 
 #endif // GEKKO_BRIDGE_H

@@ -574,12 +574,16 @@ static uint32_t g_tap_orig   = 0;
 // Save every overwritten slot at conversion time; reader_unbind() restores
 // them at soft disarm / shutdown and lets the next arm re-resolve.
 struct RdrSave { void** obj; void* v0; void* v1; };
-static RdrSave  g_rdr_saved[4]; static int g_rdr_nsaved = 0;
+// 6 slots: readers at +0xBC (x2), merge handlers at +0xCC (x2), secondary
+// decoders at +0xE4 (x2). ALL of them are stamped with the tapped vtable, so
+// all of them must be restored at disarm — otherwise a th155 object outlives
+// the armed window still pointing at squiroll's vtable.
+static RdrSave  g_rdr_saved[6]; static int g_rdr_nsaved = 0;
 static uint8_t* g_rdr_ig[2] = {nullptr, nullptr};
 static void*    g_rdr_ig_orig188[2] = {nullptr, nullptr};
 static bool     g_rdr_resolved = false;
 static void rdr_save(void** obj) {
-    if (!obj || g_rdr_nsaved >= 4) return;
+    if (!obj || g_rdr_nsaved >= 6) return;
     g_rdr_saved[g_rdr_nsaved++] = RdrSave{ obj, obj[0], obj[1] };
 }
 // At soft disarm the recorder rings still hold inputs gekko injected but the
@@ -2518,6 +2522,10 @@ static void heap_scan_all(const char* when) {
         }
     }
 }
+void heap_scan_phase(const char* when) {
+    if (heapchk_level() >= 2) heap_scan_all(when);
+}
+
 // Integrity of the two structures squiroll hand-builds into GAME heap memory:
 // the rebased input_vec ({first,last,end} + the aligned-alloc raw pointer at
 // payload[-1]) and the fabricated reader objects. A rollback that restores a
@@ -2707,8 +2715,9 @@ void advance_one_frame() {
                 if (anchor_obj && fix_obj) {
                     void* other_dev = (anchor_dev == dev0) ? dev1 : dev0;
                     typedef void* (__cdecl* gm_t)(size_t);
-                    // Build the tapped vtable copy once: original
-                    // entries 0..3, invoke slot (index 2) -> pop_tap.
+                    // Build the tapped vtable copy once: ALL original
+                    // entries (see g_tap_vt — slot 4 _Delete_this is the one
+                    // th155 calls at teardown), invoke slot (2) -> pop_tap.
                     if (!g_tap_vt[2] && anchor_reader[0]) {
                         void** ovt = (void**)anchor_reader[0];
                         for (int vi = 0; vi < 8; ++vi) g_tap_vt[vi] = ovt[vi];
