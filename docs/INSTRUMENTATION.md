@@ -48,6 +48,16 @@ These are not style preferences; each one cost real debugging time.
    `dump: 0 frames`. It is kept by default now and dumps the canonical text of the
    diverging frame on both peers, which a plain `diff` turns into a field name.
 
+6. **A validator must not be able to kill the run.** `HeapValidate` locks a
+   *serialized* heap, so walking the process heap while the game runs is safe.
+   Walking every heap `GetProcessHeaps` returns is not: some are created
+   `HEAP_NO_SERIALIZE` and the graphics driver mutates its own from another
+   thread, so the walk races the owner and faults inside ntdll. Level 1 briefly
+   did that and killed a run at f=450 with an access violation that reads exactly
+   like a game crash until you symbolize it and find our own scanner on the stack.
+   Levels 1 and 2 now walk only the process heap; level 3 opts into the full sweep
+   and may fault.
+
 ## Switch reference
 
 ### Always safe to leave on
@@ -63,7 +73,8 @@ These are not style preferences; each one cost real debugging time.
 | `SQUIROLL_TRACE=1` | ~1.4 log lines/frame | Per-frame `[netstat] [save] [load] [igx] [runone]` traces. Needed to reconstruct a desync. |
 | `SQUIROLL_DIAG=1` | ~3x slower | Full structural text dumps per save. |
 | `SQUIROLL_HEAPCHECK=1` | full heap walk every 30 frames | Gross heap damage. |
-| `SQUIROLL_HEAPCHECK=2` | **starves the sim to ~10 fps and causes false peer timeouts** | Brackets a corruptor to one frame and phase. Bracketing only — never a soak. |
+| `SQUIROLL_HEAPCHECK=2` | **starves the sim to ~10 fps and causes false peer timeouts** | Process heap, every advance and around the render pass. Brackets a corruptor to one frame and phase. Bracketing only — never a soak. |
+| `SQUIROLL_HEAPCHECK=3` | as level 2, **and can fault** | Every heap in the process, including ones another thread owns. See rule 6. |
 | `SQUIROLL_ISDTOR=1` | blocking flush per InputSingle destruction | InputSingle lifetime. |
 | `SQUIROLL_FREE_JOURNAL=1` | holds ~16 MB | Defers real-heap frees so a rollback cannot re-enter one. Has never fired; kept for a suspected rollback use-after-free. |
 | `SQUIROLL_CLGUARD_RECOVER=1` | corrupts stacks, see rule 1 | Only when surviving a known fault is genuinely the point. |

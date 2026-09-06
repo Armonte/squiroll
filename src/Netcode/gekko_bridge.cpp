@@ -2592,11 +2592,25 @@ static int  heapchk_level() {
     }
     return g_heapchk_lvl;
 }
+// SAFETY: validate ONLY the process heap unless explicitly asked for more.
+// HeapValidate takes the heap's lock for a serialized heap, so the process heap
+// — where th155's CRT allocations live, and the one we actually care about — is
+// safe to walk while the game runs. Other heaps in the process are not: some are
+// created HEAP_NO_SERIALIZE, and the graphics driver mutates its own from another
+// thread, so walking them races the owner and faults inside ntdll's walker. That
+// is not hypothetical: level 1 briefly walked every heap and killed a run at
+// f=450 with an access violation inside ntdll, which reads exactly like a game
+// crash until you symbolize it and find our own scanner on the stack.
+// Level 3 opts into the full sweep and may fault; only use it deliberately.
 static void heap_scan_all(const char* when) {
     if (g_heap_bad) return;
     HANDLE hs[64];
-    DWORD n = GetProcessHeaps(64, hs);
-    if (n > 64) n = 64;
+    DWORD n = 1;
+    hs[0] = GetProcessHeap();
+    if (heapchk_level() >= 3) {
+        n = GetProcessHeaps(64, hs);
+        if (n > 64) n = 64;
+    }
     for (DWORD i = 0; i < n; ++i) {
         if (!HeapValidate(hs[i], 0, nullptr)) {
             g_heap_bad = true;
