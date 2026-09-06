@@ -1079,6 +1079,16 @@ static void fj_release_expired() {
     LeaveCriticalSection(&g_lock);
     for (int i = 0; i < nb; ++i) g_h_free.unsafe_ccall<void>(batch[i]);
 }
+// Disarm: execute every deferred free now (no older snapshot can be restored).
+static void fj_flush_all() {
+    static void* batch[FJ_CAP]; int nb = 0;
+    EnterCriticalSection(&g_lock);
+    for (int i = 0; i < g_fj_n; ++i) batch[nb++] = g_fj[i].p;
+    g_fj_n = 0; g_fj_freed += (uint32_t)nb;
+    LeaveCriticalSection(&g_lock);
+    for (int i = 0; i < nb; ++i) g_h_free.unsafe_ccall<void>(batch[i]);
+    if (nb) log_printf("[fj] disarm: %d deferred real-heap frees released\n", nb);
+}
 // Snapshot restored to g_meta->frame: frees journaled AFTER it never happened.
 static void fj_rollback_to(int32_t frame) {
     if (!g_fj_n) return;
@@ -1123,7 +1133,7 @@ static void cdecl hook_free(void* block) {
         arena_free(block);
         return;
     }
-    if (block && g_fj_on && g_sim_tid != 0 && GetCurrentThreadId() == g_sim_tid) {
+    if (block && g_fj_on && g_armed && g_sim_tid != 0 && GetCurrentThreadId() == g_sim_tid) {
         // Armed sim thread, real-heap block: defer (see the journal note).
         fj_journal(block, (uint32_t)(uintptr_t)_ReturnAddress() - (uint32_t)base_address);
         return;
@@ -1478,7 +1488,12 @@ void trace_alloc(uint32_t addr) {
 
 void     set_armed(bool on) {
     if (on && !g_armed) g_dispatch_sig_n = 0;   // fresh battle -> fresh registry
+    bool was = g_armed;
     g_armed = on;
+    // Disarm = no snapshot older than now can ever be restored again, so every
+    // journaled real-heap free is safe to execute; un-armed frees pass straight
+    // through in hook_free (menus/lobby free assets by the megabyte — never defer).
+    if (was && !on && g_fj_on) fj_flush_all();
 }
 
 // Render-region dispatch-signal payload offsets (see g_dispatch_sig). Returns
