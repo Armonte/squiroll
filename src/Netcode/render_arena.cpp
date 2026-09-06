@@ -212,7 +212,13 @@ static thread_local bool g_route_vbpool = false;
 
 // String glyph-vertex CPU buffer (operator new) -> render_arena.
 static void* thiscall glyph_reserve_hook(int self, unsigned int new_capacity) {
-    Scope s;
+    // [2026-09-05] NO LONGER routes to render_arena. A String that lives in the
+    // snapshot must keep its glyph vector IN the snapshot: routing the vector
+    // off-snapshot while the String's +276/+280 pointers are rewound left a
+    // rewound String pointing at a freed render_arena buffer after any rollback
+    // spanning a text growth. Strings created inside the plugin scope are
+    // already routed wholesale by in_scope(); this hook is now a passthrough
+    // (kept installed for the diagnostic hook-count line).
     return g_h_glyph_reserve.unsafe_thiscall<void*>(self, new_capacity);
 }
 // Manbow::NetworkNode::BeginStreaming (0x37C30) grows a pool by one slab. For a

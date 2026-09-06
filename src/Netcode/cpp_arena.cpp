@@ -17,7 +17,8 @@
 #include "snapshot_ring.h" // snapshot_ring::gl_capture (game-loop render-dispatch pin)
 #include "sync_pin.h"      // forget freed locks (never re-apply stale lock bytes)
 #include "bullet_arena.h"  // bullet_arena::base/capacity
-#include "render_arena.h"  // NON-snapshotted region for plugin UI (unsnapshotted scope)
+#include "render_arena.h"
+#include "text_vb_heal.h"  // NON-snapshotted region for plugin UI (unsnapshotted scope)
 
 namespace actor2d_log { void watch_arm(uint32_t addr); }  // Dr0 write-watch (VEH logs writer rva)
 
@@ -1142,6 +1143,7 @@ void install() {
 
     render_arena::init();          // NON-snapshotted region for plugin UI (see render_arena.h)
     render_arena::install_ui_hooks();  // route th155 UI glyph/BFR allocs off the snapshot
+    text_vb_heal::install();           // rollback-safe String vertex streams (plugins)
 
     {   // SQUIROLL_FLATTEN_JOBS=1 -> run cJobThread jobs inline (deterministic order)
         char fb[8] = {0};
