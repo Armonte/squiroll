@@ -1018,6 +1018,83 @@ static void* cdecl hook_op_new(size_t size) {
 // free issued from inside a re-sim advance is suppressed (the block stays
 // freed from the forward pass; the bounded leak is the transient buffers a
 // growing std::vector sheds — they stop once capacity settles).
+// REAL-HEAP FREE JOURNAL (rollback-safe deferred free). [2026-09-06]
+// th155 keeps some buffers on the REAL heap (malloc chokepoint 0x306FBC: vector
+// backing stores of InputSingle/InputRecorder u16 rings, string/file buffers)
+// while the OBJECTS that point at them live in the cpp_arena snapshot. A forward
+// frame that reallocates such a buffer frees the old block for real; a rollback
+// then restores the arena object's pointer to that FREED block and the re-sim
+// writes through it -> heap metadata corruption -> ntdll 0xC0000374 reported by
+// whichever thread next touches the heap (run 53: an nvwgf2um driver thread at
+// f=727; run 36/52: the InputSingle dtor's free). The input_vec 65536-rebase
+// pinned ONE such vector; this closes the class: every real-heap free issued by
+// the sim thread while armed is JOURNALED instead of executed, released only
+// once FJ_QUARANTINE frames have passed (older than any restorable snapshot),
+// and a snapshot load DROPS every journal entry newer than the restored frame —
+// those blocks are live again in the restored timeline (a leak at worst, never a
+// stale write into freed heap memory). Off-sim-thread frees pass straight
+// through (not sim state). SQUIROLL_FREE_JOURNAL=0 restores the old behaviour.
+static constexpr int     FJ_CAP        = 32768;
+static constexpr int32_t FJ_QUARANTINE = 180;    // frames; > any rollback depth
+struct FjEnt { void* p; int32_t frame; };
+static FjEnt    g_fj[FJ_CAP];
+static int      g_fj_n = 0;
+static bool     g_fj_on = true;
+static uint32_t g_fj_push = 0, g_fj_dup = 0, g_fj_dropped = 0, g_fj_freed = 0,
+                g_fj_overflow = 0, g_fj_max = 0;
+static int      g_fj_log = 48;                  // first-N free-site log quota
+static void fj_journal(void* p, uint32_t caller_rva) {
+    void* evict = nullptr;
+    EnterCriticalSection(&g_lock);
+    for (int i = 0; i < g_fj_n; ++i)
+        if (g_fj[i].p == p) { ++g_fj_dup; LeaveCriticalSection(&g_lock); return; }
+    if (g_fj_n >= FJ_CAP) {                       // overflow: release the oldest now
+        int oi = 0;
+        for (int i = 1; i < g_fj_n; ++i) if (g_fj[i].frame < g_fj[oi].frame) oi = i;
+        evict = g_fj[oi].p; g_fj[oi] = g_fj[--g_fj_n]; ++g_fj_overflow;
+    }
+    g_fj[g_fj_n++] = FjEnt{ p, (int32_t)g_meta->frame };
+    ++g_fj_push;
+    if ((uint32_t)g_fj_n > g_fj_max) g_fj_max = (uint32_t)g_fj_n;
+    LeaveCriticalSection(&g_lock);
+    if (g_fj_log > 0) {
+        --g_fj_log;
+        SIZE_T sz = HeapSize(GetProcessHeap(), 0, p);
+        log_printf("[fj] journaled real-heap free p=%p size=%u f=%d rb=%d caller=%05X\n",
+                   p, (unsigned)sz, g_meta ? (int)g_meta->frame : -1, (int)g_resim, caller_rva);
+    }
+    if (evict) g_h_free.unsafe_ccall<void>(evict);
+}
+// Release every entry older than the quarantine. Sim thread, once per frame.
+static void fj_release_expired() {
+    if (!g_fj_n) return;
+    static void* batch[512]; int nb = 0;
+    EnterCriticalSection(&g_lock);
+    const int32_t cur = (int32_t)g_meta->frame;
+    for (int i = 0; i < g_fj_n && nb < 512; ) {
+        if (cur - g_fj[i].frame >= FJ_QUARANTINE) { batch[nb++] = g_fj[i].p; g_fj[i] = g_fj[--g_fj_n]; }
+        else ++i;
+    }
+    g_fj_freed += (uint32_t)nb;
+    LeaveCriticalSection(&g_lock);
+    for (int i = 0; i < nb; ++i) g_h_free.unsafe_ccall<void>(batch[i]);
+}
+// Snapshot restored to g_meta->frame: frees journaled AFTER it never happened.
+static void fj_rollback_to(int32_t frame) {
+    if (!g_fj_n) return;
+    int dropped = 0;
+    EnterCriticalSection(&g_lock);
+    for (int i = 0; i < g_fj_n; ) {
+        if (g_fj[i].frame > frame) { g_fj[i] = g_fj[--g_fj_n]; ++dropped; }
+        else ++i;
+    }
+    g_fj_dropped += (uint32_t)dropped;
+    LeaveCriticalSection(&g_lock);
+    static int q = 24;
+    if (dropped && q > 0) { --q;
+        log_printf("[fj] rollback to f=%d: %d journaled frees un-done (blocks live again)\n", frame, dropped); }
+}
+
 static void cdecl hook_free(void* block) {
     // render_arena pointers (plugin UI, unsnapshotted) route to its own free —
     // range-checked, so it's exact and cheap. Never rolled back, so freeing
@@ -1044,6 +1121,11 @@ static void cdecl hook_free(void* block) {
             return;
         }
         arena_free(block);
+        return;
+    }
+    if (block && g_fj_on && g_sim_tid != 0 && GetCurrentThreadId() == g_sim_tid) {
+        // Armed sim thread, real-heap block: defer (see the journal note).
+        fj_journal(block, (uint32_t)(uintptr_t)_ReturnAddress() - (uint32_t)base_address);
         return;
     }
     if (g_resim) {
@@ -1230,6 +1312,11 @@ void install() {
         g_sync_workers = (sn > 0 && sn < sizeof sb && atoi(sb) != 0);
         if (g_sync_workers)
             log_printf("[cpp_arena] SQUIROLL_SYNC_WORKERS=1 — worker queue drained INLINE (force-sync)\n");
+        char jb[8] = {0};
+        DWORD jn = GetEnvironmentVariableA("SQUIROLL_FREE_JOURNAL", jb, sizeof jb);
+        g_fj_on = !(jn > 0 && jb[0] == '0');
+        log_printf("[cpp_arena] real-heap free journal %s (quarantine=%d frames, cap=%d)\n",
+                   g_fj_on ? "ON" : "OFF", (int)FJ_QUARANTINE, FJ_CAP);
     }
 
     // Serialises arena_alloc/arena_free across th155's threads. Created
@@ -1668,7 +1755,17 @@ const char* region_of(const void* p) {
 // Quarantine clock: once per sim advance (forward AND re-sim — Meta is rewound
 // with the snapshot, so the re-sim replays the same values) and once per vanilla
 // frame during the round transition (pre_arm_poll).
-void advance_frame() { if (g_meta) ++g_meta->frame; }
+void advance_frame() {
+    if (!g_meta) return;
+    ++g_meta->frame;
+    if (g_fj_on) {
+        fj_release_expired();
+        if ((g_meta->frame % 1800u) == 0 && (g_fj_push || g_fj_dropped))
+            log_printf("[fj] f=%d live=%d max=%u pushed=%u dup=%u undone=%u released=%u overflow=%u\n",
+                       (int)g_meta->frame, g_fj_n, g_fj_max, g_fj_push, g_fj_dup,
+                       g_fj_dropped, g_fj_freed, g_fj_overflow);
+    }
+}
 
 // CHURN REPORT: walk every SIM block [first, bump) and rank by allocation site.
 // A freed block keeps its Hdr.link = caller RVA (recycle off never rewrites
@@ -1741,6 +1838,7 @@ void load(const uint8_t* blob, uint32_t len) {
         return;
     }
     memcpy(g_base, blob, len);
+    if (g_fj_on) fj_rollback_to((int32_t)g_meta->frame);
 }
 
 } // namespace cpp_arena
