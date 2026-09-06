@@ -197,9 +197,19 @@ function _BracketModifier(r) {
 }
 
 function _SetupModifiers(param) {
+	// [plugin test rig] SQUIROLL_PLUGIN_FORCE="frame_bar,oki_dummy" forces the
+	// listed plugins ON regardless of their Enabled() (e.g. a practice-only
+	// plugin under a netplay rollback match). Per-instance via the launch env.
+	local force = {};
+	try {
+		local fe = ::__squiroll_env("SQUIROLL_PLUGIN_FORCE");
+		if (fe != null) foreach (n in ::split(fe, ",")) force[::strip(n)] <- true;
+	} catch (e) {}
 	foreach(name,modifier in modifiers) {
 		::print(::format("[mod] trying %s\n",name));
-		if (!modifier.enabled.call(this,param)) { ::print(::format("[mod] %s disabled\n",name)); continue; }
+		local on = (name in force) || modifier.enabled.call(this,param);
+		if (name in force) ::print(::format("[mod] %s FORCED on (SQUIROLL_PLUGIN_FORCE)\n",name));
+		if (!on) { ::print(::format("[mod] %s disabled\n",name)); continue; }
 		::print(::format("[mod] %s constructing\n",name));
 		if (modifier.async) {
 			// [M3] ASYNC plugins (e.g. ping_display) dispatch from loop.task_async

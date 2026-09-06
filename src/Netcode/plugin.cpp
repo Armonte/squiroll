@@ -1191,6 +1191,10 @@ extern "C" {
             // side read per-instance SQUIROLL_* launch overrides (used by the
             // plugin-config override in plugin/core/cfg.nut) without adding a
             // config.cpp getter per key.
+            // [plugins] ::__gekko_skip_key early binding (before scripts load) so
+            // ::plugin.ExemptKey works at plugin load time.
+            gekko_bridge::register_skip_key_native(v);
+
             sq_setfunc(v, _SC("__squiroll_env"), [](HSQUIRRELVM v) -> SQInteger {
                 const SQChar* name = nullptr;
                 if (sq_gettop(v) < 2 || SQ_FAILED(sq_getstring(v, 2, &name)) || !name)

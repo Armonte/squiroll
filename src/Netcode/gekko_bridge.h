@@ -108,6 +108,9 @@ void advance_one_frame();
 // Drive one render (only called after all rollback resim is done).
 void render_one_frame();
 
+
+// Bind ::__gekko_skip_key on the root table (root must be on the stack top).
+void register_skip_key_native(void* vm);   // HSQUIRRELVM; root table on stack top
 } // namespace gekko_bridge
 
 #endif // GEKKO_BRIDGE_H

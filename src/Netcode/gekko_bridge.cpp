@@ -410,10 +410,19 @@ static inline bool raw_str_eq(const SqString* s, const char* lit, size_t len) {
     return s && (size_t)s->len == len && memcmp(s->val, lit, len) == 0;
 }
 
+// [plugins] Runtime skip keys registered from Squirrel via ::__gekko_skip_key
+// (::plugin.ExemptKey): per-object fields a plugin injects into sim objects
+// (frame_bar's `_tid` on the player actor class) that are plugin-owned, may
+// differ per peer, and must never enter the cross-peer checksum. Tiny list,
+// length-gated memcmp -> negligible per member.
+static std::vector<std::string> g_plugin_skip_keys;
+
 static bool raw_is_skip_key(const SqString* s) {
     if (!s || s->len <= 0) return false;
     int32_t n = s->len;
     const char* k = s->val;
+    for (const std::string& pk : g_plugin_skip_keys)
+        if ((size_t)n == pk.size() && memcmp(k, pk.data(), pk.size()) == 0) return true;
     return (n == 9 && memcmp(k, "device_id", 9) == 0)
         || (n == 5 && memcmp(k, "input", 5) == 0)
         || (n == 9 && memcmp(k, "last_snap", 9) == 0)
@@ -888,6 +897,26 @@ static SQInteger gekko_netstats(HSQUIRRELVM vm) {
     return 1;  // table left on top
 }
 
+// ::__gekko_skip_key(name): plugin-declared checksum-exempt member key (see
+// raw_is_skip_key / ::plugin.ExemptKey). Bound EARLY on the root table from
+// plugin.cpp (before any script runs) so plugins can call it at load time.
+static SQInteger gekko_skip_key(HSQUIRRELVM vm) {
+    const SQChar* name = nullptr;
+    if (sq_gettop(vm) < 2 || SQ_FAILED(sq_getstring(vm, 2, &name)) || !name || !*name)
+        return sq_throwerror(vm, _SC("__gekko_skip_key: expected <string>"));
+    for (const std::string& pk : g_plugin_skip_keys) if (pk == name) return 0;
+    g_plugin_skip_keys.emplace_back(name);
+    log_printf("[gekko_bridge] plugin checksum-exempt key registered: '%s'\n", name);
+    return 0;
+}
+
+void register_skip_key_native(void* vm_) {
+    // Caller has the ROOT table on top of the stack (plugin.cpp init site).
+    HSQUIRRELVM vm = (HSQUIRRELVM)vm_;
+    sq_setfunc(vm, _SC("__gekko_skip_key"), &gekko_skip_key);
+    log_printf("[gekko_bridge] __gekko_skip_key bound early\n");
+}
+
 // Register ::__gekko_cpp_ser on the root table. Idempotent; called from
 // init()/init_solo() once the Squirrel VM is up.
 static void register_cpp_ser() {
@@ -899,7 +928,26 @@ static void register_cpp_ser() {
     sq_setfunc(v, _SC("__gekko_cpp_ser"), &gekko_cpp_ser);
     sq_setfunc(v, _SC("__gekko_vec3_register"), &gekko_vec3_register);
     sq_setfunc(v, _SC("__gekko_netstats"), &gekko_netstats);
+    sq_setfunc(v, _SC("__gekko_skip_key"), &gekko_skip_key);   // (also bound early, see register_skip_key_native)
     sq_settop(v, top);
+    // Drain keys plugins declared via ::plugin.ExemptKey BEFORE this native
+    // existed (plugins load at boot; we register at gekko init).
+    {
+        static const SQChar* drain =
+            "if (\"plugin\" in ::getroottable() && \"exempt_keys\" in ::plugin) "
+            "foreach (k,_ in ::plugin.exempt_keys) ::__gekko_skip_key(k);";
+        SQInteger t2 = sq_gettop(v);
+        if (SQ_SUCCEEDED(sq_compilebuffer(v, drain, -1, _SC("exempt_drain"), SQFalse))) {
+            sq_pushroottable(v);
+            if (SQ_FAILED(sq_call(v, 1, SQFalse, SQTrue)))
+                log_printf("[gekko_bridge] exempt-key drain failed\n");
+        } else {
+            log_printf("[gekko_bridge] exempt-key drain: compile failed\n");
+        }
+        log_printf("[gekko_bridge] plugin checksum-exempt keys after drain: %u\n",
+                   (unsigned)g_plugin_skip_keys.size());
+        sq_settop(v, t2);
+    }
     log_printf("[gekko_bridge] registered __gekko_cpp_ser (native walker)\n");
 }
 

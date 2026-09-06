@@ -24,6 +24,21 @@ class Modifier {
 	}
 }
 
+// [rollback] Declare a per-object field a plugin INJECTS into sim objects
+// (e.g. a member added to the player actor class) as checksum-exempt. Such a
+// field is plugin-owned, cosmetic and may differ per peer (plugin on one side
+// only) -- it must never enter the cross-peer checksum or it desyncs the match.
+// Call once at load time, before any battle: ::plugin.ExemptKey("_my_field").
+exempt_keys <- {};
+function ExemptKey(name) {
+	exempt_keys[name] <- true;
+	::print("[plugin] exempt key queued: " + name + " (native=" + ("__gekko_skip_key" in ::getroottable()) + ")\n");
+	// The native side (gekko_bridge) may register ::__gekko_skip_key AFTER the
+	// plugins load; it drains ::plugin.exempt_keys at registration time, so a
+	// missing native here is fine.
+	if ("__gekko_skip_key" in ::getroottable()) ::__gekko_skip_key(name);
+}
+
 function LoadCFG(label,Default) {
 	cfg[label] <- CFG(label+".ini",Default);
     return cfg[label];

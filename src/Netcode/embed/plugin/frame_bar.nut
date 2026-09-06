@@ -20,6 +20,9 @@ config = {
 };
 
 // Patches
+// [rollback] `_tid` is injected into the player actor class below and resolved
+// only where this plugin is active -> per-peer; keep it out of the checksum.
+::plugin.ExemptKey("_tid");
 ::plugin.Patch("data/script/actor.nut",function() {
     local createplayer = CreatePlayer;
     function CreatePlayer(...) {
