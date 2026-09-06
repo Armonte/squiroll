@@ -248,6 +248,11 @@ void stdcall better_game_loop() {
             set_fullscreen(dxgi_swapchain_desc->Windowed);
         }
     }
+    // [r2diag] a silent process exit (no crash, no watchdog) = the frame loop
+    // returned; name why so a window close / quit message is distinguishable.
+    log_printf("[loop] frame loop exited: exit_requested=%d real_frame=%u\n", (int)exit_requested, (unsigned)g_real_frame);
+    log_flush();
+
 
     _controlfp_s(&fpu_state, _CW_DEFAULT, 0xFFFFFFFF);
     timeEndPeriod(1);
