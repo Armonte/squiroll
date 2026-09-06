@@ -80,6 +80,16 @@ These are not style preferences; each one cost real debugging time.
 | `SQUIROLL_CLGUARD_RECOVER=1` | corrupts stacks, see rule 1 | Only when surviving a known fault is genuinely the point. |
 | `SQUIROLL_DESYNC_INJECT=<frame>` | one frame | Proves the desync detector end to end. Set on ONE peer. Never in a real match. |
 
+7. **A test hook that forges simulation state must be driven by a frame number
+   both peers agree on.** `SQUIROLL_ROUND_FRAMES` wrote `::battle.time` from each
+   peer's local state machine. The peers forged the timer on different simulated
+   frames, timed out on different frames, and one entered the round-end demo
+   while the other did not — 3 of 4 runs "desynced" with no netcode fault. Worse,
+   exempting `time` from the checksum made the divergence grow to 96% of the
+   state, because the timer drives the transition. It is now keyed on the gekko
+   frame inside `advance_one_frame`, which both peers agree on and a re-sim
+   reproduces.
+
 ## Reading the numbers
 
 `[perf] per-call us:` prints the average microseconds for advance, save (split
@@ -87,17 +97,36 @@ into the small-blob serialization and the page capture) and load, per 240 saves.
 `[perf-sect]` splits the small blob by section. `[perf] save_battle` is the
 structural checksum walk.
 
-Current cost per frame on the dual rig at 55 ms delay / 20 ms jitter / 6% loss:
+Current cost per frame on the dual rig at 55 ms delay / 20 ms jitter / 6% loss,
+ship config (no HEAPCHECK, no TRACE), medians over 10+ measurement windows:
 
-| Phase | Cost |
-|---|---|
-| advance | ~1.3 ms |
-| save | ~4.4 ms (small blob ~1.8, capture ~2.7) |
-| load (rollback only) | ~4.4 ms |
+| Phase | Cost | Largest component |
+|---|---|---|
+| advance | ~1.3 ms | the game's own tick |
+| save | ~2.3 ms | `battle_pools::save` ~1.4 ms |
+| load (rollback only) | ~3.1 ms | reverse-apply ~1.1 ms, `battle_pools::load` ~1.0 ms |
 
-Before this pass the save was ~7.3 ms because the structural checksum ran on
-every one. The remaining save cost is dominated by `battle_pools::save` and the
-dirty-page capture, which are the next things to attack.
+Save was 7.3 ms at the start of this work. What is left, measured:
+
+| item | µs | why it is hard |
+|---|---|---|
+| `battle_pools::save` free-list walk | ~700 | dependent pointer chase over ~43,000 free nodes |
+| `battle_pools::save` slot copy | ~315 | 3,000 live slots, already cheap |
+| reverse-apply on load | ~1140 | real restore work, scales with rollback distance |
+| `battle_pools::load` | ~1040 | relinks the free list |
+| dirty page copy | ~400 | ~450 pages, two memcpys each |
+| GetWriteWatch (capture+restore) | ~800 | 106 MB queried; cpp arena's bump is 70 MB |
+| boost pools | ~250 save / ~450 load | |
+
+**The next real win is incremental pool tracking.** The pools hold ~46,400 slots
+(~13.6 MB) of which only ~3,000 are live, so both save and load spend most of
+their time rediscovering a free list that changed by a handful of entries.
+Hooking the pool allocate/free to maintain the live set and free-list order as
+they change removes the ~700 µs walk, the ~1 ms relink, and ~172 KB of the
+~400 KB blob. Two alternatives are already ruled out by measurement: copying
+whole blocks would make the blob 13.6 MB per save, and collapsing the two
+free-list chases into one made it *worse* because the second chase rides warm
+cache.
 
 ## The rig
 
