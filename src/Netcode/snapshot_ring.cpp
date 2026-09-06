@@ -678,7 +678,11 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
     // NB: gate on !re_capture_diag (the reliable "first save of this frame = forward"
     // signal), NOT is_resim() — set_resim(false) runs BEFORE the save (gekko:1603),
     // so is_resim() is already false here and would let the re-sim clobber the latch.
-    if (!re_capture_diag) {
+    // DIAG ONLY. These six page numbers are hard-coded leftovers from a specific
+    // divergence hunt (the combo/FPS digit geometry era); they are meaningless
+    // against any other arena layout, and the only consumer is the [divword]
+    // report. Latching them copied 24 KB on EVERY forward save forever.
+    if (g_diag && !re_capture_diag) {
         for (int i = 0; i < N_TRACKED; ++i) {
             TrackedPage& t = g_tracked[i];
             if (t.pg < g_ar[CPP_ARENA].npages) {
@@ -689,7 +693,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
         // One-shot dump of page 23404 header + the diverging array context, to ID the
         // object (vtable ptr at the block start, struct stride around dw 103).
         static bool dumped = false;
-        if (!dumped && frame >= 5) {
+        if (g_diag && !dumped && frame >= 5) {
             dumped = true;
             const uint32_t* p = (const uint32_t*)(g_ar[CPP_ARENA].base + (size_t)23404 * PAGE);
             for (int i = 0; i < 16; ++i)
