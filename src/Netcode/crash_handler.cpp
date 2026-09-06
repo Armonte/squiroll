@@ -632,6 +632,24 @@ void dump_all_thread_stacks(const char* why) {
                     if (next <= ebp) break;
                     ebp = next;
                 }
+                // th155 is FPO (no EBP chain) -> the walk above is usually empty.
+                // Raw ESP scan: print every stack slot that looks like a return
+                // address into th155.exe or Netcode.dll (symbolizable with the
+                // PDB). Order = innermost first.
+                {
+                    uintptr_t sp = c.Esp; int shown = 0;
+                    for (int k = 0; k < 512 && shown < 28; ++k) {
+                        uintptr_t slot = sp + (uintptr_t)k * 4;
+                        if (!readable(slot, 4)) break;
+                        uintptr_t v = *(uintptr_t*)slot;
+                        if (v < 0x10000) continue;
+                        describe_addr(v, loc);
+                        if (strstr(loc, "th155.exe+") || strstr(loc, "Netcode.dll+")) {
+                            log_printf("[hangdump]   sp[+0x%03X] %s\n", k * 4, loc);
+                            ++shown;
+                        }
+                    }
+                }
             }
             ResumeThread(h);
         }

@@ -3035,6 +3035,15 @@ void advance_one_frame() {
     // late — the burst ran while still armed and fastfailed on both peers.
     // Rollback across the latch clears it (load_state_from_buf).
     if (!g_solo && g_session_started && (g_in_lockstep || g_lockstep_req || g_restore_req)) {
+        // ONLY once lockstep is actually on: before that, rollbacks still
+        // re-sim frames around the latch and this machine would observe a
+        // rewound state (no-recycle run 1: "left 8" on the forward f=899, then
+        // "re-entered 8" on the re-simmed f=894 -> the round-length hook applied
+        // on one peer only -> desync at 902). Under window 0 every advance is
+        // forward, so the observations and the hook are deterministic.
+        if (!g_in_lockstep) {
+            // still waiting for the prediction window to clear; nothing to observe yet
+        } else {
         // Transition under lockstep. The pre-burst latch fires while state is
         // STILL 8 (time<=20), so first wait for the state to LEAVE 8 (the round
         // really ended), then the next state-8 frame is the new round's
@@ -3060,6 +3069,7 @@ void advance_one_frame() {
             g_restore_req = false;
             g_in_lockstep = false;
             log_printf("[gekko_bridge] prediction window %u restored at f=%d\n", (unsigned)PREDICTION_WINDOW, g_trace_frame);
+        }
         }
     } else
     if (!g_solo && g_session_started && g_roundend_latch < 0) {
