@@ -233,6 +233,36 @@ static int collect(Region* r) {
             // still roll back -- do NOT widen this to a range.
             { (uintptr_t)(0x49B310_R), (uintptr_t)(0x49B310_R) + 0x20  }, // D3D11VertexBuffer pool (render, forward-only)
             { (uintptr_t)(0x4DAD10_R), (uintptr_t)(0x4DAD10_R) + 4    }, // _Wndproc window/input state
+            // LOWER D3D PIPELINE-STATE SHADOW BLOCK (2026-09-06). The
+            // begin-frame reset render_reset_state_and_set_target (0x36AC0)
+            // clears these together with the already-excluded [0x4DAE00,
+            // 0x4DAEB8) block: they are th155's "what is currently bound to the
+            // D3D context" caches, each compared before a bind and updated after
+            //   0x4DAD38  last filter/sampler        (manbow::SetFilter 0x56FF0)
+            //   0x4DAD48  render-cache slot          (render_release_d3d_resource_cache)
+            //   0x4DAD6C  last blend-state index     (manbow::SetBlend 0x56FA0)
+            //   0x4DADBC  last shader-resource bound (TF4_Sprite::vftable_1 0x153EE0)
+            //   0x4DADDC..0x4DADFF  last blend/sampler pair + last texture
+            // EVERY xref is a render function (render_draw_rect, render_entity_
+            // if_dirty, 0x55980, apply_render_configuration, RenderFrontPass,
+            // update_renderable_mesh_and_transform, drawing_related) — no sim
+            // code reads them. The D3D CONTEXT is forward-only and is never
+            // rolled back, so restoring these shadows makes th155 believe a
+            // resource is bound that is not: the redundancy check then SKIPS the
+            // bind and the next draw runs against a stale resource. That is the
+            // driver-side corruption class (nvwgf2um/d3d11 reaching ntdll
+            // RtlFreeHeap on a bad block -> 0xC0000374) which HeapValidate over
+            // every process heap never sees at a frame boundary, because the
+            // damage happens inside the render pass. Same reasoning that already
+            // carved out 0x4DAE00-0x4DAEB8 (whose 0x4DAE44 dynamic-VB ring offset
+            // was the 0x8BAD desync); these are the rest of the same block.
+            // Kept as EXACT dwords, not one span: the gaps between them hold
+            // unclassified globals that may be sim state.
+            { (uintptr_t)(0x4DAD38_R), (uintptr_t)(0x4DAD38_R) + 4    }, // last filter/sampler shadow
+            { (uintptr_t)(0x4DAD48_R), (uintptr_t)(0x4DAD48_R) + 4    }, // render cache slot
+            { (uintptr_t)(0x4DAD6C_R), (uintptr_t)(0x4DAD6C_R) + 4    }, // last blend-state index
+            { (uintptr_t)(0x4DADBC_R), (uintptr_t)(0x4DADBC_R) + 4    }, // last shader resource bound
+            { (uintptr_t)(0x4DADDC_R), (uintptr_t)(0x4DADDC_R) + 0x24 }, // last blend/sampler pair + last texture
             // D3D / render / window state block [0x4DAE00, 0x4DAEB8): a render-
             // state cache (0x4DAE00-0x4DAE74, written only by render funcs
             // render_reset_state_and_set_target / render_map_dynamic_vertex_buffer
