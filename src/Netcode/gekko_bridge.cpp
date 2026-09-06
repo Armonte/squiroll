@@ -2475,18 +2475,79 @@ static uint32_t input_rec_save(uint8_t* out, uint32_t cap) {
     return (uint32_t)(p - out);
 }
 
-static void input_rec_load(const uint8_t* blob, uint32_t len) {
-    ++g_irec_load_gen;   // legit cursor rewind — anomaly detector skips one
-    {   // [heapchk] also validate right after every restore
-        static int on = -1;
-        if (on < 0) { char b[4] = {0}; on = (GetEnvironmentVariableA("SQUIROLL_HEAPCHECK", b, sizeof b) > 0 && b[0] == '1') ? 1 : 0; }
-        static bool bad = false;
-        if (on && !bad && !HeapValidate(GetProcessHeap(), 0, nullptr)) {
-            bad = true;
-            log_printf("[heapchk] !! process heap INVALID right after restore (load f=%d)\n", g_trace_frame);
+// HEAP BRACKETING (SQUIROLL_HEAPCHECK=2). The 0xC0000374 corruption is reported
+// by whichever thread next touches the heap (an nvwgf2um worker inside the render
+// pass, or th155's own free), never by the corruptor. HeapValidate over EVERY
+// process heap, every forward frame and after every restore, brackets it to one
+// frame and one phase; the first failure names heap + frame + rb.
+static int  g_heapchk_lvl = -1;
+static bool g_heap_bad    = false;
+static int  heapchk_level() {
+    if (g_heapchk_lvl < 0) {
+        char b[8] = {0};
+        DWORD n = GetEnvironmentVariableA("SQUIROLL_HEAPCHECK", b, sizeof b);
+        g_heapchk_lvl = (n > 0) ? atoi(b) : 0;
+    }
+    return g_heapchk_lvl;
+}
+static void heap_scan_all(const char* when) {
+    if (g_heap_bad) return;
+    HANDLE hs[64];
+    DWORD n = GetProcessHeaps(64, hs);
+    if (n > 64) n = 64;
+    for (DWORD i = 0; i < n; ++i) {
+        if (!HeapValidate(hs[i], 0, nullptr)) {
+            g_heap_bad = true;
+            log_printf("[heapchk] !! heap %u/%u handle=%p INVALID at %s f=%d rb=%d depth=%d\n",
+                       (unsigned)i, (unsigned)n, hs[i], when,
+                       g_trace_frame, g_trace_rb, g_trace_depth);
             log_flush();
+            return;
         }
     }
+}
+// Integrity of the two structures squiroll hand-builds into GAME heap memory:
+// the rebased input_vec ({first,last,end} + the aligned-alloc raw pointer at
+// payload[-1]) and the fabricated reader objects. A rollback that restores a
+// PRE-REBASE header, or a stray write, turns the next input write into a heap
+// overrun — exactly the 0xC0000374 signature. Checked per advance; logged once.
+static uint16_t* g_ivec_pin[2]   = {nullptr, nullptr};
+static uint32_t  g_ivec_raw[2]   = {0, 0};
+static void ivec_guard(const char* when) {
+    if (!g_active_input_session) return;
+    auto* rec = g_active_input_session->input_recorder.get();
+    if (!rec) return;
+    for (size_t i = 0; i < rec->devices.size() && i < 2; ++i) {
+        auto* d = rec->devices[i].get();
+        if (!d || !g_ivec_pin[i]) continue;
+        uint16_t** hdr = (uint16_t**)&d->input_vec;
+        static int q = 12;
+        if (hdr[0] != g_ivec_pin[i] || hdr[2] != g_ivec_pin[i] + 65536) {
+            if (q > 0) { --q;
+                log_printf("[ivec] !! device %zu header MOVED at %s f=%d rb=%d: "
+                           "first=%p end=%p (pinned %p..%p) — the next input write "
+                           "is a heap overrun\n", i, when, g_trace_frame, g_trace_rb,
+                           (void*)hdr[0], (void*)hdr[2], (void*)g_ivec_pin[i],
+                           (void*)(g_ivec_pin[i] + 65536));
+                log_flush(); }
+            // Re-pin: the pinned buffer is still alive and correctly sized.
+            hdr[0] = g_ivec_pin[i];
+            if (hdr[1] < hdr[0] || hdr[1] > g_ivec_pin[i] + 65536) hdr[1] = g_ivec_pin[i];
+            hdr[2] = g_ivec_pin[i] + 65536;
+        }
+        uint32_t raw = ((uint32_t*)g_ivec_pin[i])[-1];
+        if (raw != g_ivec_raw[i] && q > 0) { --q;
+            log_printf("[ivec] !! device %zu aligned-alloc back-pointer CLOBBERED at %s "
+                       "f=%d: %08X (expected %08X) — free_u16_buffer would free garbage\n",
+                       i, when, g_trace_frame, raw, g_ivec_raw[i]);
+            ((uint32_t*)g_ivec_pin[i])[-1] = g_ivec_raw[i];
+            log_flush(); }
+    }
+}
+
+static void input_rec_load(const uint8_t* blob, uint32_t len) {
+    ++g_irec_load_gen;   // legit cursor rewind — anomaly detector skips one
+    if (heapchk_level() >= 1) heap_scan_all("restore");
     const uint8_t* p = blob;
     const uint8_t* e = blob + len;
     auto get = [&](void* d, uint32_t n) -> bool {
@@ -2997,15 +3058,12 @@ void advance_one_frame() {
     // [heapchk] SQUIROLL_HEAPCHECK=1: validate the process heap every 30 forward
     // frames (and log the first failure) to bracket the 0xC0000374 corruption.
     {
-        static int on = -1;
-        if (on < 0) { char b[4] = {0}; on = (GetEnvironmentVariableA("SQUIROLL_HEAPCHECK", b, sizeof b) > 0 && b[0] == '1') ? 1 : 0; }
-        if (on && !g_trace_rb && (g_trace_frame % 30) == 0) {
-            static bool bad = false;
-            if (!bad && !HeapValidate(GetProcessHeap(), 0, nullptr)) {
-                bad = true;
-                log_printf("[heapchk] !! process heap INVALID at f=%d (first detection)\n", g_trace_frame);
-                log_flush();
-            }
+        int lvl = heapchk_level();
+        // lvl 1: every 30 forward frames (cheap). lvl 2: EVERY advance, forward
+        // and re-sim, over every process heap (slow; brackets the corruptor).
+        if (lvl >= 2 || (lvl == 1 && !g_trace_rb && (g_trace_frame % 30) == 0)) {
+            ivec_guard("advance");
+            heap_scan_all(g_trace_rb ? "advance(resim)" : "advance(fwd)");
         }
     }
     // FRAME-0 INPUT BASELINE (dual): the first forward advance of gekko frame 0
@@ -3559,6 +3617,7 @@ bool init(uint16_t local_port, uint16_t remote_port,
                 hdr[0] = nb;
                 hdr[1] = nb + n;
                 hdr[2] = nb + 65536;
+                if (i < 2) { g_ivec_pin[i] = nb; g_ivec_raw[i] = (uint32_t)(uintptr_t)raw; }
                 log_printf("[gekko_bridge] input_vec[%zu] rebased onto game-heap "
                            "buffer %p (cap %u -> 65536, size %u)\n",
                            i, (void*)nb, old_cap, n);
