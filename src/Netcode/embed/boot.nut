@@ -31,7 +31,17 @@ function InstallLoopEndGuard() {
 // both peers in the exception trap. `<-` creates-or-overwrites the slot.
 function StubMenuNetworkSuspend() {
     if (!("network" in ::menu)) return;
-    ::menu.network.Suspend = function () {
+    local n = ::menu.network;
+    // Daze's network.nut creates these slots in Initialize() (menu init), which
+    // auto_connect skips; Terminate() at round end / disconnect then threw
+    // "the index 'timeout' does not exist". Pre-create what Initialize would.
+    if (!("is_suspend" in n))       n.is_suspend <- false;
+    if (!("timeout" in n))          n.timeout <- 0;
+    if (!("upnp_timeout" in n))     n.upnp_timeout <- 0;
+    if (!("lobby_time_stamp" in n)) n.lobby_time_stamp <- 0;
+    if (!("state" in n))            n.state <- 0;
+    if (!("update" in n) && ("UpdateMain" in n)) n.update <- n.UpdateMain;
+    n.Suspend = function () {
         is_suspend <- true;
     };
 }
