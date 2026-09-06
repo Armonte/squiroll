@@ -419,6 +419,25 @@ void thisfastcall packet_parser_hook(
 
     recvfrom_log(packet_raw, packet_size, &self->recv_addr.addr_any(), self->recv_addr.length());
 
+    // [vhb] vanilla heartbeat visibility: per-second histogram of received
+    // packet types on this UDP socket (5 = parent ping, 6 = child ping, 0/1 =
+    // pongs, 0x12/0x13 = data). The engine's UDP thread disconnects after 10
+    // unanswered pings (~10 s, TF4::UDP 0x179820); this shows whether the
+    // heartbeat exchange survives a rollback-owned round.
+    {
+        static uint32_t cnt[32] = {0}; static DWORD t0 = 0;
+        uint8_t ty = packet_raw->type;
+        if (ty < 32) ++cnt[ty];
+        DWORD now = GetTickCount();
+        if (t0 == 0) t0 = now;
+        if (now - t0 >= 2000) {
+            char line[256]; int n = 0;
+            for (int i = 0; i < 32; ++i) if (cnt[i]) n += snprintf(line + n, sizeof(line) - n, " %d:%u", i, cnt[i]);
+            log_printf("[vhb] recv/2s:%s\n", n ? line : " (none)");
+            memset(cnt, 0, sizeof cnt); t0 = now;
+        }
+    }
+
     switch (packet_raw->type) {
         default:
             break;

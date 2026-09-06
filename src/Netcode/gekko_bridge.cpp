@@ -552,6 +552,58 @@ static void*    g_rdr_e4_dev[2] = {nullptr, nullptr};
 // v=stale => something rewrote the slot after inject.
 static void*    g_tap_vt[4]  = {nullptr, nullptr, nullptr, nullptr};
 static uint32_t g_tap_orig   = 0;
+// REBIND UNDO (2026-09-05). The in-place conversion below rewrote the game's
+// reader objects to tapped recorder lambdas and forced InputGlobal+188 to our
+// fabricated ones — and never restored them. With pop_tap returning 0 while no
+// session is live, the transition/vanilla frames could not update the sim's
+// InputGlobal at all: inputs FROZE at the last forced value ("holding up/down"
+// after the round) and the two peers entered round 2 with different input
+// command-buffer state (sqtext f0: rsv_x 0 vs -1 -> DESYNC at round-2 f0).
+// Save every overwritten slot at conversion time; reader_unbind() restores
+// them at soft disarm / shutdown and lets the next arm re-resolve.
+struct RdrSave { void** obj; void* v0; void* v1; };
+static RdrSave  g_rdr_saved[4]; static int g_rdr_nsaved = 0;
+static uint8_t* g_rdr_ig[2] = {nullptr, nullptr};
+static void*    g_rdr_ig_orig188[2] = {nullptr, nullptr};
+static bool     g_rdr_resolved = false;
+static void rdr_save(void** obj) {
+    if (!obj || g_rdr_nsaved >= 4) return;
+    g_rdr_saved[g_rdr_nsaved++] = RdrSave{ obj, obj[0], obj[1] };
+}
+// At soft disarm the recorder rings still hold inputs gekko injected but the
+// sim never consumed (and after a rollback re-sim those leftovers differ per
+// peer). The vanilla loop would pop them as real input during the transition
+// -> asymmetric held-direction counters entering round 2 (sqtext f0: rsv_x
+// -16 vs 0). Drop them: read = write, so vanilla starts from an empty ring
+// and the delay protocol refills it symmetrically.
+static void flush_recorder_rings() {
+    if (!g_active_input_session) return;
+    auto* rec = g_active_input_session->input_recorder.get();
+    if (!rec) return;
+    for (size_t i = 0; i < rec->devices.size(); ++i) {
+        auto* d = rec->devices[i].get();
+        if (!d) continue;
+        log_printf("[gekko_bridge] recorder ring %zu flushed: ri %u -> wi %u\n",
+                   i, (unsigned)d->input_read_idx, (unsigned)d->input_write_idx);
+        d->input_read_idx = d->input_write_idx;
+    }
+}
+
+static void reader_unbind() {
+    if (!g_rdr_resolved) return;
+    for (int i = 0; i < g_rdr_nsaved; ++i) {
+        g_rdr_saved[i].obj[0] = g_rdr_saved[i].v0;
+        g_rdr_saved[i].obj[1] = g_rdr_saved[i].v1;
+    }
+    for (int i = 0; i < 2; ++i)
+        if (g_rdr_ig[i]) *(void**)(g_rdr_ig[i] + 188) = g_rdr_ig_orig188[i];
+    log_printf("[gekko_bridge] input readers UNBOUND (%d objects restored, +188 x2) -> vanilla input flows again\n",
+               g_rdr_nsaved);
+    g_rdr_nsaved = 0; g_rdr_ig[0] = g_rdr_ig[1] = nullptr;
+    g_rdr_resolved = false;
+    g_reader_fab = nullptr; g_reader_fix_obj = nullptr;
+    g_reader_fab2 = nullptr; g_reader_fix_obj2 = nullptr;
+}
 typedef unsigned int (__thiscall* pop_fn_t)(void* self, int** state_ptr_ptr);
 static unsigned int __fastcall pop_tap(void* self, void* /*edx*/,
                                        int** state_ptr_ptr) {
@@ -1165,6 +1217,9 @@ static void     input_rec_load(const uint8_t* blob, uint32_t len);
 // Bumped by input_rec_load so the cursor-anomaly detector can tell a legit
 // rollback rewind from an EXTERNAL (vanilla netcode) cursor touch.
 static uint32_t g_irec_load_gen = 0;
+static void refresh_vanilla_input_timeouts();   // defined with the round-end drain below
+static bool g_f0_input_reset_done = false;       // per-session frame-0 input baseline (see advance_one_frame)
+static void reset_input_command_reserves();
 
 // Per-advance consume record ring (see the CONSUME RING block in advance()).
 struct IcRec { int f; uint8_t rb; uint32_t ri0, ri1;
@@ -2532,7 +2587,7 @@ void advance_one_frame() {
             // LoadEvent handler can re-force immediately after restore.)
             void**&  fab      = g_reader_fab;
             uint8_t*& fix_obj = g_reader_fix_obj;
-            static bool     resolved = false;
+            bool& resolved = g_rdr_resolved;
             if (!resolved) {
                 uint8_t* a = (uint8_t*)(uintptr_t)g_ig_probe;
                 uint8_t* b = (uint8_t*)(uintptr_t)g_ig_probe2;
@@ -2592,6 +2647,12 @@ void advance_one_frame() {
                     // any second pop hit the empty-guard (no double-apply).
                     {
                         void** orig_fix = *(void***)(fix_obj + 188);
+                        // save originals for reader_unbind()
+                        g_rdr_ig[0] = fix_obj;    g_rdr_ig_orig188[0] = (void*)orig_fix;
+                        g_rdr_ig[1] = anchor_obj; g_rdr_ig_orig188[1] = (void*)anchor_reader;
+                        g_rdr_nsaved = 0;
+                        rdr_save(orig_fix); rdr_save(anchor_reader);
+                        rdr_save(*(void***)(fix_obj + 204)); rdr_save(*(void***)(anchor_obj + 204));
                         if (orig_fix) {
                             orig_fix[0] = (void*)g_tap_vt;
                             orig_fix[1] = other_dev;
@@ -2904,6 +2965,23 @@ void advance_one_frame() {
                    g_ig_probe2 ? g_ig_probe2[1] : -1,
                    g_ig_probe2 ? g_ig_probe2[2] : -1,
                    g_ig_probe2 ? g_ig_probe2[3] : -1);
+    cpp_arena::advance_frame();                             // arena quarantine clock
+    if (!g_solo) refresh_vanilla_input_timeouts();          // keep the 8 s vanilla input timeout at bay
+    // FRAME-0 INPUT BASELINE (dual): the first forward advance of gekko frame 0
+    // is the identical sim point on both peers. Zero the two InputGlobal
+    // natives (stale held direction from the transition — the client entered
+    // round 2 still "holding up": rsv_y 12 vs 0) and reset the InputCommand
+    // reserves, so frame 0 starts from neutral, identical input state.
+    if (!g_solo && g_trace_frame == 0 && !g_trace_rb && !g_f0_input_reset_done) {
+        g_f0_input_reset_done = true;
+        for (const int32_t* probe : { g_ig_probe, g_ig_probe2 }) {
+            if (!probe) continue;
+            int32_t* w = const_cast<int32_t*>(probe);
+            for (int k = 1; k <= 13; ++k) w[k] = 0;   // x, y, b0..b11
+        }
+        reset_input_command_reserves();
+        log_printf("[gekko_bridge] frame-0 input baseline applied (InputGlobals zeroed + command reserves reset)\n");
+    }
     update_related(*MAIN_SCRIPTAPI_PTR);                    // RunOneFrame(g_main), once
     if (igx_on)
         log_printf("[igx] f=%d rb=%d POST-run  p0(x=%d y=%d b1=%d b2=%d b3=%d) p1(x=%d y=%d b1=%d)\n",
@@ -3152,6 +3230,37 @@ void render_one_frame() {
 // ---------------------------------------------------------------- session --
 
 static void apply_test_round_frames();  // defined below; used by init/init_solo
+// ROUND-2 BASELINE PARITY: the transition runs on the vanilla loop, whose
+// input pipeline is not frame-exact across peers, so the players' InputCommand
+// reserve counters (rsv_x/rsv_y/rsv_k*: held-direction / buffered-command
+// history) differ at the next Round_Fight (sqtext f0: rsv_x -7 vs 0 -> DESYNC
+// at round-2 f0). They are pure input history; reset them on BOTH peers at the
+// arm (same sim frame by construction) so gekko frame 0 starts identical.
+static void reset_input_command_reserves() {
+    if (!v) return;
+    static const SQChar* code =
+        "if (\"battle\" in ::getroottable() && ::battle != null && \"team\" in ::battle) {"
+        "  foreach (t in ::battle.team) {"
+        "    try {"
+        "      local a = (\"current\" in t) ? t.current : null;"
+        "      if (a != null && \"command\" in a && a.command != null) {"
+        "        a.command.ResetAllReserve(); a.command.Clear();"
+        "      }"
+        "    } catch (e) {}"
+        "  }"
+        "}";
+    SQInteger top = sq_gettop(v);
+    if (SQ_SUCCEEDED(sq_compilebuffer(v, code, -1, _SC("rsv_reset"), SQFalse))) {
+        sq_pushroottable(v);
+        if (SQ_SUCCEEDED(sq_call(v, 1, SQFalse, SQTrue)))
+            log_printf("[gekko_bridge] input command reserves reset for both players (round baseline parity)\n");
+        else
+            log_printf("[gekko_bridge] input command reserve reset FAILED (call)\n");
+    } else {
+        log_printf("[gekko_bridge] input command reserve reset FAILED (compile)\n");
+    }
+    sq_settop(v, top);
+}
 static void install_menu_mash_hook();   // defined below; installs the kbd-poll hook
 
 // ============================================================================
@@ -3327,7 +3436,19 @@ bool init(uint16_t local_port, uint16_t remote_port,
                 if (!d || d->input_vec.capacity() >= 65536) continue;
                 uint32_t old_cap = (uint32_t)d->input_vec.capacity();
                 uint32_t n = (uint32_t)d->input_vec.size();
-                uint16_t* nb = (uint16_t*)game_malloc(65536 * sizeof(uint16_t));
+                // The game frees this buffer through free_u16_buffer (0x3A150),
+                // which for >= 0x1000-byte buffers demands the ALIGNED-ALLOC
+                // layout: payload 32-byte aligned, and the raw malloc pointer
+                // stored at payload-4 with 4..0x23 bytes of slack — otherwise
+                // _invalid_parameter -> abort at sq_close/exit (seen on every
+                // process exit while armed). Build that layout by hand.
+                uint8_t* raw = (uint8_t*)game_malloc(65536 * sizeof(uint16_t) + 64);
+                uint16_t* nb = nullptr;
+                if (raw) {
+                    uintptr_t pay = ((uintptr_t)raw + 4 + 31) & ~(uintptr_t)31;
+                    ((uint32_t*)pay)[-1] = (uint32_t)(uintptr_t)raw;
+                    nb = (uint16_t*)pay;
+                }
                 if (!nb) {
                     log_printf("[gekko_bridge] !! input_vec[%zu] game_malloc "
                                "failed — realloc hazard remains\n", i);
@@ -3868,7 +3989,149 @@ static void install_menu_mash_hook() {
                g_h_condrange.enabled() ? "OK" : "FAIL");
 }
 
+// ROUND-END DRAIN (dual). Destroying the gekko session the instant WE latch
+// starved the other peer: under loss it was still waiting for our last few
+// inputs (its own latch frame is identical, but it may be a few frames
+// behind), the destroyed session never retransmitted them, and 5 s later it
+// got PlayerDisconnected and shut down (baseline 240 s run: p2 latched
+// f=6698, p1 stalled at f=6690-6697, then died). GekkoNet resends unacked
+// inputs from gekko_network_poll alone (SendInputsToPeer, INPUT_RETRY_INTERVAL),
+// so after the latch we keep the session alive, POLL-ONLY (no local inputs,
+// no update_session), until the remote has acked every input we queued
+// (stats.last_acked_frame >= last_sent_frame) or a timeout elapses; then
+// destroy it. Runs from pre_arm_poll (the vanilla-loop branch), so the
+// transition renders normally meanwhile. Round-2 re-arm force-finishes it.
+static bool  g_draining     = false;
+// TRANSITION HOLD: the peer that latches FIRST must not run the vanilla loop
+// (its delay-netcode packets moved the still-armed peer's input cursor —
+// [icanom] "external cursor movement" from f=875 — so that peer never consumed
+// its last frames, never latched, and timed out). Hold the engine (render only,
+// poll the session) until the remote's own inputs reach the latch frame (it
+// advanced there, so it latched too) or the drain times out.
+static bool  g_hold_transition = false;
+// After a round-end disarm, battle.state may STILL be 8 (the pre-burst latch
+// fires at time<=20 while the fight state is live) -> pre_arm_poll would see
+// "Round_Fight" and re-arm the SAME round instantly (r2 rig: re-armed 0 ms
+// after the latch, second session mid-round, both peers died). Require the
+// state to LEAVE 8 (the KO/time-up transition) before the next arm.
+static bool  g_rearm_wait_leave = false;
+static DWORD g_drain_t0     = 0;
+static int   g_drain_latch  = -1;
+static const DWORD DRAIN_TIMEOUT_MS = 3000;
+
+static void finish_drain(const char* why) {
+    g_hold_transition = false;
+    if (g_session) {
+        if (!g_solo) gekko_default_adapter_destroy();
+        gekko_destroy(&g_session);
+        g_session = nullptr;
+    }
+    if (g_draining)
+        log_printf("[gekko_bridge] round-end drain finished (%s) after %ums\n",
+                   why, GetTickCount() - g_drain_t0);
+    g_draining = false;
+}
+
+// VANILLA INPUT-SESSION TIMEOUT KEEPALIVE. Manbow::NetworkInputSession::SyncInput
+// (0xE3340) checks every remote slot's last_input_packet_time and fires the
+// slot's disconnect handler when it is > 8000 ms old. No vanilla input packets
+// flow while gekko owns the loop, so the FIRST SyncInput after a round saw an
+// age of the whole round -> host disconnected the child (packet 0x0F) ->
+// DisconnectParent/DisconnectChild -> network Terminate -> gekko_shutdown ->
+// round 2 never re-armed. The UDP heartbeat (packets 5/6, 0x179820) was never
+// the problem — it kept flowing. Refresh the timestamps while we own the loop.
+static void refresh_vanilla_input_timeouts() {
+    if (!g_active_input_session) return;
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    uint64_t sec = (uint64_t)c.QuadPart / (uint64_t)f.QuadPart;
+    uint64_t rem = (uint64_t)c.QuadPart % (uint64_t)f.QuadPart;
+    uint64_t now_ns = sec * 1000000000ull + (rem * 1000000000ull) / (uint64_t)f.QuadPart;
+    for (auto& r : g_active_input_session->remote_vec) r.last_input_packet_time = now_ns;
+}
+
+static void drain_poll() {
+    if (!g_draining) return;
+    refresh_vanilla_input_timeouts();
+    if (!g_session) { g_draining = false; return; }
+    gekko_network_poll(g_session);
+    int count = 0;
+    GekkoSessionEvent** sevents = gekko_session_events(g_session, &count);
+    for (int i = 0; i < count; ++i) {
+        if (sevents[i]->type == GekkoPlayerDisconnected) {
+            finish_drain("peer disconnected");
+            return;
+        }
+    }
+    GekkoNetworkStats ns = {};
+    gekko_network_stats(g_session, (uint8_t)(1 - g_local_idx), &ns);
+    if (g_hold_transition && ns.remote_last_input_frame >= g_drain_latch) {
+        g_hold_transition = false;
+        log_printf("[gekko_bridge] transition hold released: remote inputs reached f=%d (latch f=%d) after %ums\n",
+                   ns.remote_last_input_frame, g_drain_latch, GetTickCount() - g_drain_t0);
+    }
+    // Inputs queued AFTER the latch frame are never consumed by anyone, so the
+    // drain is complete once the remote has acked up to the latch (waiting for
+    // last_sent made a peer whose partner had already torn down sit out the
+    // full timeout).
+    if (ns.last_acked_frame >= g_drain_latch && !g_hold_transition) {
+        // LINGER: keep polling (acking the remote's last inputs) for a moment
+        // after we are satisfied, so the peer's own drain doesn't time out
+        // because we tore down first and its lost ack never got re-sent.
+        static DWORD done_t = 0;
+        if (!done_t) { done_t = GetTickCount(); return; }
+        if (GetTickCount() - done_t < 400) return;
+        done_t = 0;
+        char why[96];
+        snprintf(why, sizeof why, "remote acked f=%d/%d, latch f=%d (+400ms linger)",
+                 ns.last_acked_frame, ns.last_sent_frame, g_drain_latch);
+        finish_drain(why);
+        return;
+    }
+    if (GetTickCount() - g_drain_t0 > DRAIN_TIMEOUT_MS) {
+        char why[96];
+        snprintf(why, sizeof why, "TIMEOUT, remote acked f=%d/%d",
+                 ns.last_acked_frame, ns.last_sent_frame);
+        finish_drain(why);
+    }
+}
+
 void pre_arm_poll() {
+    cpp_arena::advance_frame();   // quarantine clock keeps ticking through the transition
+    {   // [r2diag] sample the re-arm gate every 5 s (first call logs too)
+        static uint32_t n = 0;
+        if ((++n % 300) == 1) {
+            int st = -1; bool ok = read_battle_state(&st);
+            log_printf("[r2diag] pre_arm_poll: watch=%d dual=%d session=%p draining=%d wait_leave=%d "
+                       "state_ok=%d state=%d f=%d\n", (int)g_watch_for_fight, (int)g_watch_dual,
+                       (void*)g_session, (int)g_draining, (int)g_rearm_wait_leave, (int)ok, st, g_trace_frame);
+        }
+    }
+    if (g_rearm_wait_leave) {
+        int st = 0;
+        bool ok = read_battle_state(&st);
+        // A failed read (battle table mid-rebuild during the transition) counts
+        // as "left 8" too — otherwise a read that only succeeds while a fight
+        // is live (8 in round 1, 8 again in round 2) never clears the gate.
+        if (!ok || st != 8) {
+            g_rearm_wait_leave = false;
+            log_printf("[gekko_bridge] round transition observed (state_ok=%d state=%d) -> re-arm allowed at next Round_Fight\n", (int)ok, st);
+        } else {
+            if (g_draining) drain_poll();   // keep the drain alive meanwhile
+            return;
+        }
+    }
+    if (g_draining) {
+        drain_poll();
+        if (g_draining) {
+            // Still draining when the next round's fight starts: force-finish so
+            // the re-arm below can build a fresh session.
+            int st = 0;
+            if (read_battle_state(&st) && st == 8) finish_drain("round-2 re-arm");
+            else return;
+        }
+    }
     if (!g_watch_for_fight || g_session) return;
     int st = 0;
     if (read_battle_state(&st) && st == 8 /* Round_Fight */) {
@@ -3885,6 +4148,11 @@ void pre_arm_poll() {
 }
 
 void shutdown() {
+    reader_unbind();
+    g_f0_input_reset_done = false;
+    g_draining = false;
+    g_hold_transition = false;
+    g_rearm_wait_leave = false;
     if (g_session) {
         if (!g_solo) gekko_default_adapter_destroy();
         gekko_destroy(&g_session);
@@ -3906,6 +4174,8 @@ void shutdown() {
 
 bool is_active()         { return g_active; }
 bool is_session_started(){ return g_session_started; }
+bool is_holding_transition() { return g_hold_transition; }
+void hold_poll() { cpp_arena::advance_frame(); drain_poll(); }
 bool dual_input_owned()  { return g_active && !g_solo; }
 
 // Round-end disarm. The interactive fight is exactly battle.state == 8
@@ -3944,13 +4214,28 @@ static void disarm_for_round_end() {
     log_printf("[gekko_bridge] round ended (battle.state left 8) -> soft disarm "
                "(gekko session only; arena stays armed to keep the resource tree whole)\n");
     if (g_session) {
-        if (!g_solo) gekko_default_adapter_destroy();
-        gekko_destroy(&g_session);
-        g_session = nullptr;
+        if (g_solo) {
+            gekko_destroy(&g_session);
+            g_session = nullptr;
+        } else {
+            // dual: keep the session for the poll-only drain (see drain_poll)
+            g_draining    = true;
+            g_hold_transition = true;
+            g_drain_t0    = GetTickCount();
+            g_drain_latch = g_trace_frame;
+            log_printf("[gekko_bridge] round-end drain started (f=%d): polling until "
+                       "the remote acks our last inputs (<= %ums)\n",
+                       g_trace_frame, DRAIN_TIMEOUT_MS);
+        }
     }
+    if (!g_solo) refresh_vanilla_input_timeouts();   // the vanilla SyncInput resumes next
+    if (!g_solo) reader_unbind();                     // give the sim its vanilla input readers back
+    if (!g_solo) flush_recorder_rings();              // no leftover injected inputs for the vanilla loop
+    g_f0_input_reset_done = false;                    // next session re-applies the frame-0 baseline
     g_active = false;
     g_session_started = false;
     g_watch_for_fight = true;    // pre_arm_poll re-arms at the next Round_Fight
+    g_rearm_wait_leave = true;   // ...but only after the state has left 8 (see pre_arm_poll)
 }
 
 // Solo fast-forward. While a solo stress session owns the frame loop and
@@ -3998,6 +4283,7 @@ bool tick() {
                        cpp_arena::used() / 1024,
                        (uint32_t)(cpp_arena::live_bytes() / 1024),
                        cpp_arena::capacity() / (1024 * 1024));
+            if ((arena_log % 1800) == 1) cpp_arena::churn_report(24);   // who churns the arena
         }
         // DIAGNOSTIC: is the remote peer's traffic actually arriving?
         // kb_received ~0 on a peer => its socket gets no packets from the

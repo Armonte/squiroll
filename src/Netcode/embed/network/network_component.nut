@@ -175,6 +175,7 @@ function StartupServer(port,mode) {
 	}.bindenv(this);
 
 	mb_server.DisconnectChild = function (id) {
+		::print("[vdisc] native DisconnectChild id=" + id + "\n");
 		if (id == 0) Disconnect();
 	}.bindenv(this);
 
@@ -297,6 +298,7 @@ function StartupClient(addr,port,mode) {
 		}
 	}.bindenv(this);
 	mb_client.DisconnectParent = function () {
+		::print("[vdisc] native DisconnectParent is_parent_vs=" + is_parent_vs + "\n");
 		if (is_parent_vs) {
 			local t = {message = "end_vs"};
 			for (local i = 0; i < client_num; ++i) {
@@ -312,6 +314,7 @@ function StartupClient(addr,port,mode) {
 			if ("message" in table) {
 				switch (table.message) {
 					case "end_vs":
+						::print("[vdisc] received end_vs from parent\n");
 						for (local i = 0; i < ::network_client_num; ++i) {
 							::network_inst.SendToChild(i, table);
 						}
@@ -357,6 +360,7 @@ function StartupClient(addr,port,mode) {
 }
 
 function Disconnect( scene = true ) {
+	::print("[vdisc] Disconnect(scene=" + scene + ") is_disconnect=" + is_disconnect + " active=" + IsActive() + "\n");
 	if (is_disconnect || !IsActive())return;
 	is_disconnect = true;
 

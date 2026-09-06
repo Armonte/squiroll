@@ -778,6 +778,12 @@ extern "C" {
                         return 0;
                     });
                     sq_setfunc(v, _SC("gekko_shutdown"), [](HSQUIRRELVM v) -> SQInteger {
+                        // [r2diag] who tears gekko down mid-match? dump the Squirrel call stack.
+                        log_printf("[gekko_shutdown] called from Squirrel:\n");
+                        SQStackInfos si;
+                        for (SQInteger lvl = 1; lvl < 8 && SQ_SUCCEEDED(sq_stackinfos(v, lvl, &si)); ++lvl)
+                            log_printf("[gekko_shutdown]   #%d %s (%s:%d)\n", (int)lvl,
+                                       si.funcname ? si.funcname : "?", si.source ? si.source : "?", (int)si.line);
                         gekko_bridge::shutdown();
                         return 0;
                     });
