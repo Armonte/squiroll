@@ -281,6 +281,15 @@ void Gekko::GameSession::SendSessionHealthCheck()
 
     assert(sav->frame == confirmed);
 
+    // The game declined to checksum this frame (see GEKKO_CHECKSUM_UNAVAILABLE).
+    // Skip the exchange entirely rather than compare a meaningless value, and do
+    // NOT advance _last_sent_healthcheck, so the next confirmed frame is still
+    // eligible. Both peers sample on the same frame numbers, so the frames that
+    // do carry a checksum still line up and SessionIntegrityCheck compares them.
+    if (sav->checksum == GEKKO_CHECKSUM_UNAVAILABLE) {
+        return;
+    }
+
     _last_sent_healthcheck = confirmed;
 
     _msg.local_health[confirmed] = sav->checksum;

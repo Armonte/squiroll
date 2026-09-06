@@ -1625,7 +1625,35 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
         // The raw snapshot still drives RESTORE — exact-byte restore keeps the
         // local re-sim deterministic; the checksum only needs cross-peer validity.
         uint32_t final_cs = cs;
-        if (!g_solo) {
+        // SAMPLED CROSS-PEER CHECKSUM (2026-09-06). The structural walk below is
+        // ~3 ms of a ~7 ms save — the single largest instrumented cost in the
+        // frame, and it runs on EVERY save. GDC "8 Frames in 16ms" §7 lists desync
+        // detection among the systems to stop running inside the rollback window;
+        // §13 makes offline replay, not per-frame hashing, the primary desync tool.
+        // So compute it every Nth frame instead. The decision keys ONLY on the
+        // frame number, so both peers pick the same frames with no coordination;
+        // on the other frames we hand GekkoNet GEKKO_CHECKSUM_UNAVAILABLE and it
+        // skips that frame's health exchange (deps/GekkoNet game_session.cpp).
+        // Detection latency becomes N frames instead of 1, which is irrelevant for
+        // a desync that is permanent once it happens.
+        //   SQUIROLL_CHECKSUM_EVERY=1  every frame (soak / desync hunts)
+        //   =N  every Nth frame (default 4)
+        //   =0  never — desync detection off (perf/profiling runs)
+        static int cs_every = -1;
+        if (cs_every < 0) {
+            char b[8] = {0};
+            DWORD n_ = GetEnvironmentVariableA("SQUIROLL_CHECKSUM_EVERY", b, sizeof b);
+            cs_every = (n_ > 0) ? atoi(b) : 4;
+            if (cs_every < 0) cs_every = 0;
+            log_printf("[gekko_bridge] structural cross-peer checksum: %s\n",
+                       cs_every == 0 ? "OFF"
+                                     : (cs_every == 1 ? "every frame"
+                                                      : "sampled"));
+        }
+        const bool cs_due = !g_solo && cs_every > 0 &&
+                            (cs_every == 1 || (frame % (uint32_t)cs_every) == 0);
+        if (!g_solo && !cs_due) final_cs = GEKKO_CHECKSUM_UNAVAILABLE;
+        if (!g_solo && cs_due) {
             static uint8_t* sqscratch = nullptr;
             static const uint32_t SQSCRATCH = 1u << 20;
             if (!sqscratch)
@@ -1659,7 +1687,19 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                 // into a std::string slot (+ read_battle_int) EVERY save is a
                 // real per-save cost with no bearing on the checksum GekkoNet
                 // compares (final_cs, already set). Skip it in the perf build.
-                if (snapshot_ring::diag_on()) {
+                // KEEP THE TEXT BY DEFAULT (2026-09-06). This ring is the only
+                // thing that makes a reported desync ACTIONABLE: on
+                // GekkoDesyncDetected both peers dump the diverging frame's
+                // canonical text and a plain `diff` names the field that split
+                // (GDC "8 Frames in 16ms" §13 — capture enough to diagnose after
+                // the fact instead of predicting where to look). It used to be
+                // gated behind diag, so every desync in a normal run reported
+                // "dump: 0 frames" and told us nothing. Now that the checksum is
+                // SAMPLED the copy happens once every N frames, and the ring
+                // holds SQTEXT_RING sampled frames of history. The Squirrel
+                // read_battle_int below is the only expensive part, so that
+                // stays under diag.
+                {
                     uint32_t ri = frame % SQTEXT_RING;
                     // Save-count per frame: >1 means the frame was RE-SAVED after
                     // a rollback correction; 1 at a corrected frame means gekko
@@ -1672,11 +1712,39 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                     g_sqtext_frame[ri] = frame;
                     g_sqtext_cs[ri]    = final_cs;
                     g_sqtext_rb[ri]    = (uint8_t)(g_trace_rb ? 1 : 0);
-                    { int bc = -1; read_battle_int(_SC("count"), &bc);
-                      g_sqtext_bcount[ri] = bc; }
+                    if (snapshot_ring::diag_on()) {
+                        int bc = -1; read_battle_int(_SC("count"), &bc);
+                        g_sqtext_bcount[ri] = bc;
+                    } else {
+                        g_sqtext_bcount[ri] = -1;
+                    }
                     g_sqtext_in[ri][0] = forced_inputs[0];
                     g_sqtext_in[ri][1] = forced_inputs[1];
                 }
+            }
+        }
+        // DETECTOR SELF-TEST (SQUIROLL_DESYNC_INJECT=<frame>). Set on ONE peer, it
+        // flips bits in that frame's checksum only — the simulation itself stays
+        // identical, so this exercises exactly the detection path: checksum
+        // computed -> exchanged -> compared -> GekkoDesyncDetected raised -> both
+        // peers dump. A desync detector you have never seen fire is not a
+        // detector, and this matters more now that the checksum is SAMPLED:
+        // injecting at a sampled frame must report, at a non-sampled frame must
+        // not. Never set it in a real match.
+        {
+            static int inject_f = -2;
+            if (inject_f == -2) {
+                char b[16] = {0};
+                DWORD n_ = GetEnvironmentVariableA("SQUIROLL_DESYNC_INJECT", b, sizeof b);
+                inject_f = (n_ > 0) ? atoi(b) : -1;
+                if (inject_f >= 0)
+                    log_printf("[desync-test] will corrupt the checksum at frame %d\n", inject_f);
+            }
+            if (inject_f >= 0 && (int)frame == inject_f &&
+                final_cs != GEKKO_CHECKSUM_UNAVAILABLE) {
+                final_cs ^= 0xA5A5A5A5u;
+                log_printf("[desync-test] frame %u checksum CORRUPTED on purpose "
+                           "(cs now 0x%08x) — detection should fire\n", frame, final_cs);
             }
         }
         LARGE_INTEGER _c2; QueryPerformanceCounter(&_c2);
@@ -4485,7 +4553,7 @@ bool tick() {
         // DIAGNOSTIC: is the remote peer's traffic actually arriving?
         // kb_received ~0 on a peer => its socket gets no packets from the
         // other side (one-directional delivery). Logged every 30 ticks.
-        if (!g_solo && (arena_log % 3) == 1) {
+        if (!g_solo && (arena_log % (log_trace_on() ? 3u : 30u)) == 1) {
             GekkoNetworkStats ns = {};
             uint8_t remote = (uint8_t)(1 - g_local_idx);
             gekko_network_stats(g_session, remote, &ns);
@@ -4847,7 +4915,7 @@ bool tick() {
                         int bcount = -1; read_battle_int(_SC("count"), &bcount);
                         uint32_t s_sq = 0, s_bt = 0, s_sb = 0;
                         snapshot_ring::last_subchecksums(&s_sq, &s_bt, &s_sb);
-                        log_printf("[save] f=%d bcount=%d cs=0x%08x len=%u "
+                        if (log_trace_on()) log_printf("[save] f=%d bcount=%d cs=0x%08x len=%u "
                                    "blobcs=0x%08x sq=0x%08x bt=0x%08x sb=0x%08x\n",
                                    (int)e->data.save.frame, bcount, cs, n, blobcs,
                                    s_sq, s_bt, s_sb);
@@ -4920,7 +4988,7 @@ bool tick() {
                         uint32_t blobcs = fletcher32(
                             (const uint8_t*)e->data.load.state,
                             e->data.load.state_len);
-                        log_printf("[load] f=%d len=%u blobcs=0x%08x\n",
+                        if (log_trace_on()) log_printf("[load] f=%d len=%u blobcs=0x%08x\n",
                                    (int)e->data.load.frame,
                                    e->data.load.state_len, blobcs);
                     }
@@ -4941,7 +5009,7 @@ bool tick() {
                 // [igx] post-restore counter value — pairs with PRE/POST-run
                 // probes on the subsequent rb=1 advances.
                 if (!g_solo && g_ig_probe)
-                    log_printf("[igx] LOAD f=%d p0(x=%d y=%d b1=%d b2=%d b3=%d) p1(x=%d y=%d b1=%d)\n",
+                    if (log_trace_on()) log_printf("[igx] LOAD f=%d p0(x=%d y=%d b1=%d b2=%d b3=%d) p1(x=%d y=%d b1=%d)\n",
                                (int)e->data.load.frame, g_ig_probe[1],
                                g_ig_probe[2], g_ig_probe[3],
                                g_ig_probe[4], g_ig_probe[5],

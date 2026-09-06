@@ -185,6 +185,13 @@ typedef struct GekkoNetworkStats {
 } GekkoNetworkStats;
 
 // Public Facing API
+// Sentinel a game may write into GekkoSaveEvent::checksum to say "no checksum for
+// this frame". GekkoNet then skips the session-health send for that frame instead
+// of exchanging a meaningless value. Lets a game SAMPLE an expensive cross-peer
+// checksum (compute it every Nth frame) while keeping desync detection: both peers
+// key the decision on the frame number, so they sample the same frames.
+#define GEKKO_CHECKSUM_UNAVAILABLE 0xFFFFFFFFu
+
 GEKKONET_API bool gekko_create(GekkoSession** session, GekkoSessionType session_type);
 
 GEKKONET_API bool gekko_destroy(GekkoSession** session);

@@ -86,6 +86,15 @@ extern FILE* g_log_file;
 void open_log_file(const char* path);
 // Drain the buffered log + console sinks. Call once per frame, never
 // per log line — per-line flushing is what stalled the game.
+// TRACE VERBOSITY. squiroll's per-frame traces ([netstat], [adv], [ic], [addin],
+// [runone], [igx] ...) are how a desync gets reconstructed after the fact, but at
+// ~1.4 lines per frame they format and queue work in the hot path forever. Gate
+// them: log_trace_on() is false by default and true with SQUIROLL_TRACE=1, which
+// the soak/desync rigs set. Anything that fires ONCE (install banners, state
+// transitions, warnings, desyncs, crashes) stays unconditional — that is the log
+// you always want and it costs nothing.
+bool log_trace_on();
+
 void log_flush();
 // Synchronously flush the async log queue from the faulting thread —
 // called by the VEH crash handler so a crash does not lose the last

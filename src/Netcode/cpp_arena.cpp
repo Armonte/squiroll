@@ -388,7 +388,7 @@ static void thiscall runone_hook(int self) {
     static int nf = 0, nr = 0;
     int rb = gekko_bridge::g_trace_rb;
     if (rb == 0 ? (nf < 40 && ++nf) : (nr < 200 && ++nr)) {
-        log_printf("[runone] this=%08X rb=%d f=%d\n", (uint32_t)self, rb,
+        if (log_trace_on()) log_printf("[runone] this=%08X rb=%d f=%d\n", (uint32_t)self, rb,
                    gekko_bridge::g_trace_frame);
     }
     (void)n;

@@ -89,6 +89,33 @@ static void describe_addr(uintptr_t addr, char* out) {
 // Used for the CRASHED stack (VEH) and the fast-fail issuer's caller stack:
 // th155 is FPO'd, so the ebp chain hides every game frame; the raw scan is
 // the only way to see which th155 function actually issued the abort/fault.
+// clguard RECOVERY GATE (default OFF as of 2026-09-06).
+//
+// The two "recoveries" below (skip a NULL-deref instruction; return from an
+// EXEC-at-NULL by popping the return address) were added to keep a run alive past
+// a fault so a later symptom could be observed. They are ACTIVELY HARMFUL as a
+// default:
+//   * EXEC-at-NULL pops ONLY the return address. Every th155 vtable slot it fires
+//     on is __stdcall/__thiscall — the callee is supposed to clean its arguments —
+//     so the caller resumes with a shifted stack. That is exactly how the missing
+//     _Delete_this vtable slot (fixed in 7d77cc3) turned into "0xC0000374 heap
+//     corruption" three frames later instead of a clean fault at the real site.
+//   * The universal NULL-deref skip leaves the destination register holding a
+//     stale value and lets the game run on with garbage.
+// Both convert a precise, attributable crash into a corrupted process that dies
+// somewhere unrelated. Default: log the fault in full and let it be fatal, which
+// is what makes a bug findable. SQUIROLL_CLGUARD_RECOVER=1 restores the old
+// keep-running behaviour for the rare case where surviving the fault is the point.
+static bool clguard_recover_enabled() {
+    static int on = -1;
+    if (on < 0) {
+        char b[8] = {0};
+        DWORD n = GetEnvironmentVariableA("SQUIROLL_CLGUARD_RECOVER", b, sizeof b);
+        on = (n > 0 && b[0] == '1') ? 1 : 0;
+    }
+    return on != 0;
+}
+
 static void scan_rets(const uint32_t* sp, int ndw, int maxshow, const char* indent) {
     char loc[MAX_PATH + 32];
     for (int k = 0, shown = 0; k < ndw && shown < maxshow; ++k) {
@@ -263,13 +290,17 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
                     crash_logf("  f=%d rb=%d\r\n", gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb);
                     scan_rets((const uint32_t*)(uintptr_t)gc->Esp, 24, 8, "    ");
                 }
-                if (!IsBadReadPtr((void*)(uintptr_t)gc->Esp, 4)) {
+                if (clguard_recover_enabled() &&
+                    !IsBadReadPtr((void*)(uintptr_t)gc->Esp, 4)) {
                     uintptr_t ret_addr = *(uintptr_t*)(uintptr_t)gc->Esp;
                     ep->ContextRecord->Eip = (DWORD)ret_addr;
                     ep->ContextRecord->Esp += 4;
                     ep->ContextRecord->Eax = 0;  // dtor-style "void"
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
+                // Not recovering: fall through to the full crash dump. A call
+                // through a NULL vtable slot is a REAL bug at a KNOWN site —
+                // the stack scan above already named the caller.
             }
         }
         if (ep->ExceptionRecord->NumberParameters >= 2) {
@@ -301,8 +332,11 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
                                    gc->Ecx, gc->Edi, gc->Esi);
                         scan_rets((const uint32_t*)(uintptr_t)gc->Esp, 32, 8, "    ");
                     }
-                    ep->ContextRecord->Eip += insn.length;
-                    return EXCEPTION_CONTINUE_EXECUTION;
+                    if (clguard_recover_enabled()) {
+                        ep->ContextRecord->Eip += insn.length;
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                    // else: fall through and report the fault where it happened.
                 }
             }
         }

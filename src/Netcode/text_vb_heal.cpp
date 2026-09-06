@@ -149,8 +149,23 @@ static int thiscall release_hook(void* node) {
 // tail. Log every call (rare) with the pointer, delete flag, arena membership,
 // frame/re-sim and caller, so the fatal one is attributable (repeat pointer =
 // double delete across a rollback; foreign pointer = not a heap block).
+// DIAGNOSTIC ONLY (SQUIROLL_ISDTOR=1). Written to hunt the InputSingle-destructor
+// death that turned out to be the partial tapped-vtable copy (fixed in 7d77cc3).
+// It logs AND log_flush()es — a BLOCKING disk write — on every InputSingle
+// destruction, so it must never be on in a normal or perf run.
+static bool isdtor_log_enabled() {
+    static int on = -1;
+    if (on < 0) {
+        char b[8] = {0};
+        DWORD n = GetEnvironmentVariableA("SQUIROLL_ISDTOR", b, sizeof b);
+        on = (n > 0 && b[0] == '1') ? 1 : 0;
+    }
+    return on != 0;
+}
 static SafetyHookInline g_h_isdtor{};
 static void* thiscall inputsingle_dtor_hook(void* self, int flags) {
+    if (!isdtor_log_enabled())
+        return g_h_isdtor.unsafe_thiscall<void*>(self, flags);
     static void* seen[256]; static int nseen = 0;
     bool repeat = false;
     for (int i = 0; i < nseen; ++i) if (seen[i] == self) { repeat = true; break; }
@@ -168,8 +183,11 @@ void install() {
     static bool done = false;
     if (done) return;
     done = true;
-    g_h_isdtor = safetyhook::create_inline((void*)(0x6D9E0_R), (void*)inputsingle_dtor_hook);
-    log_printf("[heapdiag] InputSingle dtor hook %s\n", g_h_isdtor ? "OK" : "FAIL");
+    if (isdtor_log_enabled()) {
+        g_h_isdtor = safetyhook::create_inline((void*)(0x6D9E0_R), (void*)inputsingle_dtor_hook);
+        log_printf("[heapdiag] InputSingle dtor hook %s (SQUIROLL_ISDTOR=1)\n",
+                   g_h_isdtor ? "OK" : "FAIL");
+    }
     InitializeCriticalSection(&g_reg_lock);
     g_h_update  = safetyhook::create_inline((void*)(0x66580_R), (void*)update_hook);
     g_h_store   = safetyhook::create_inline((void*)(0x3A7B0_R), (void*)store_hook_entry);

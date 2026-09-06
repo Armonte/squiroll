@@ -100,6 +100,31 @@ namespace cl_iter_guard {
 // corrupted cEftGroup). Guard: NULL link -> skip the job (the matrix stays as-is; the
 // instance is detached/dying). __usercall (ecx=this, xmm/st0 args, no stack args), so
 // the guard is a naked shim: on the pass path every register reaches the original.
+// D3D RESOURCE VALIDITY CHECK (class-B hunt, 2026-09-06).
+//
+// resource_write_data (0x36EE0) and render_map_dynamic_vertex_buffer (0x36DA0)
+// both Map() a D3D11 resource and memcpy into the mapped pointer. Every crash of
+// the remaining death class lands INSIDE the driver on a later heap operation,
+// with every process heap still valid at the frame boundary — the shape of a draw
+// issued against a resource that is no longer what th155 thinks it is.
+//
+// These two checks are ~4 compares each and run only on the forward render pass:
+// before the Map, confirm the resource pointer is a live COM object, i.e. it is
+// readable and its vtable pointer lands inside a loaded module rather than in the
+// heap or in freed memory. A stale/released resource fails this at the CALL SITE,
+// naming the draw, instead of corrupting the driver and dying somewhere else.
+#define RESOURCE_WRITE_DATA   (0x36EE0_R)
+#define RENDER_MAP_DYNAMIC_VB (0x36DA0_R)
+// Verified against the disassembly, NOT the decompiler's MEMORY[] rendering:
+//   resource_write_data 0x36EF4:  mov eax, [eax*8 + 0x4DB4C0]   <- STATIC ARRAY,
+//     8-byte entries indexed by the resource id; the ID3D11Resource* is at +4.
+//     (Hex-Rays showed this as MEMORY[0x4DB0D0][2*id+252]: same address, but the
+//     base is the array itself, NOT a pointer to be dereferenced.)
+//   render_map_dynamic_vertex_buffer 0x36DA3:  mov eax, ds:4DC0B4h  <- a POINTER
+//     to the dyn-VB descriptor; the ID3D11Buffer* is at +4, the stride at +8.
+#define RENDER_RESOURCE_ARRAY ((void**)(0x4DB4C0_R))   // entry = [id*2], res = entry[1]
+#define RENDER_DYNVB_DESC_PTR ((void**)(0x4DC0B4_R))   // *ptr -> desc; desc[1] = buffer
+
 #define PARTICLE_INS_UPDATE (0xEE560_R)
 #define SPIRAL_INS_UPDATE   (0x10B940_R)
 // Healthy boost::signals2 grouped_list connection counts are O(100).
@@ -115,6 +140,98 @@ static SafetyHookInline g_h_callfn{};
 static SafetyHookInline g_h_sndslot{};
 static SafetyHookInline g_h_removeid{};
 static SafetyHookInline g_h_updeff{};
+static SafetyHookInline g_h_rwd{}, g_h_mapvb{};
+static void*    g_rwd_orig   = nullptr;
+static void*    g_mapvb_orig = nullptr;
+static std::atomic<uint64_t> g_d3dres_bad{0};
+// True if p looks like a live COM object: readable, and its first dword (the
+// vtable) points into a committed IMAGE mapping (a loaded module's .rdata).
+// A released object typically keeps a heap or freed-page vtable, which fails here.
+static bool readable(const void* p, size_t n) {
+    if ((uintptr_t)p < 0x10000) return false;
+    MEMORY_BASIC_INFORMATION m;
+    if (VirtualQuery(p, &m, sizeof m) != sizeof m) return false;
+    if (m.State != MEM_COMMIT || (m.Protect & PAGE_GUARD) || m.Protect == PAGE_NOACCESS)
+        return false;
+    return (uintptr_t)p + n <= (uintptr_t)m.BaseAddress + m.RegionSize;
+}
+static bool com_object_live(const void* p) {
+    if (!readable(p, 4)) return false;
+    const void* vt = *(void* const*)p;
+    if (!readable(vt, 4)) return false;
+    MEMORY_BASIC_INFORMATION m;
+    if (VirtualQuery(vt, &m, sizeof m) != sizeof m) return false;
+    return m.State == MEM_COMMIT && m.Type == MEM_IMAGE;
+}
+static void d3dres_report(const char* who, const void* res, uint32_t id) {
+    uint64_t n = g_d3dres_bad.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n & 0x3F) == 0)
+        log_printf("[d3dres] !! %s: resource %p (id=%u) is NOT a live COM object "
+                   "f=%d rb=%d (#%llu) — the draw about to Map it would corrupt "
+                   "the driver\n", who, res, id,
+                   gekko_bridge::g_trace_frame, gekko_bridge::g_trace_rb,
+                   (unsigned long long)n);
+}
+// CONVENTION (verified in the disassembly): both functions take ecx/edx plus a
+// CALLER-cleaned stack argument and end in a plain `retn` — they are __usercall,
+// NOT __fastcall. Declaring the hook __fastcall makes the compiler emit `ret 4`,
+// double-cleaning the stack; that is what the 0x3A7B0 StoreStreamWithStride hook
+// hit before, and it lands as an execute-at-NULL a few returns later.
+//
+// These checks are pure observers, so sidestep the convention entirely: a naked
+// shim saves every register, calls a plain __cdecl checker, restores, and TAIL-
+// JUMPS to the trampoline. The original then returns straight to the game and
+// cleans its stack exactly as it always did.
+// CHANGE-TRIGGERED, not per-draw. resource_write_data runs for EVERY sprite, so
+// the full validation (VirtualQuery is a syscall) cannot live on that path — a
+// first cut cost ~20% of the frame rate. But the failure we are hunting is a
+// resource pointer that BECOMES something else; while it is the same pointer as
+// last time it was already validated. So: remember the last pointer seen per id
+// and revalidate only when it changes. Steady state is two compares.
+static void* g_res_last[8]  = {nullptr};
+static void* g_dynvb_last   = nullptr;
+static void cdecl rwd_check(int id) {
+    if ((uint32_t)id >= 8) return;                 // ids used by the draw paths
+    void** slot = RENDER_RESOURCE_ARRAY + 2 * (uint32_t)id;
+    void* entry = *slot;                           // static array, always mapped
+    if (!entry) return;
+    void* res = ((void**)entry)[1];
+    if (res == g_res_last[id]) return;             // unchanged -> already checked
+    g_res_last[id] = res;
+    if (!com_object_live(res))
+        d3dres_report("resource_write_data", res, (uint32_t)id);
+}
+static naked void rwd_hook_entry() {
+    __asm {
+        pushad
+        pushfd
+        push ecx                 // the resource id
+        call rwd_check
+        add  esp, 4
+        popfd
+        popad
+        jmp  dword ptr [g_rwd_orig]
+    }
+}
+static void cdecl mapvb_check() {
+    void* desc = *RENDER_DYNVB_DESC_PTR;
+    if (!desc) return;
+    void* buf = ((void**)desc)[1];
+    if (buf == g_dynvb_last) return;               // unchanged -> already checked
+    g_dynvb_last = buf;
+    if (!com_object_live(buf)) d3dres_report("dynamic_vb", buf, 0);
+}
+static naked void mapvb_hook_entry() {
+    __asm {
+        pushad
+        pushfd
+        call mapvb_check
+        popfd
+        popad
+        jmp  dword ptr [g_mapvb_orig]
+    }
+}
+
 static SafetyHookInline g_h_pins{}, g_h_sins{};
 static void* g_pins_orig = nullptr;
 static void* g_sins_orig = nullptr;
@@ -324,6 +441,25 @@ void install() {
                                              (void*)removeid_hook);
     g_h_updeff = safetyhook::create_inline((void*)UPDATE_EFFECT_STATE,
                                            (void*)updeff_hook);
+    // D3D resource validity (SQUIROLL_D3DRES=0 disables; cheap enough to leave on)
+    {
+        char b[8] = {0};
+        DWORD n = GetEnvironmentVariableA("SQUIROLL_D3DRES", b, sizeof b);
+        if (!(n > 0 && b[0] == '0')) {
+            g_h_rwd = safetyhook::create_inline((void*)RESOURCE_WRITE_DATA, (void*)rwd_hook_entry);
+            g_rwd_orig = g_h_rwd ? (void*)g_h_rwd.trampoline().address() : nullptr;
+            g_h_mapvb = safetyhook::create_inline((void*)RENDER_MAP_DYNAMIC_VB, (void*)mapvb_hook_entry);
+            g_mapvb_orig = g_h_mapvb ? (void*)g_h_mapvb.trampoline().address() : nullptr;
+            if (!g_rwd_orig || !g_mapvb_orig) {   // never jmp through a null trampoline
+                g_h_rwd = {}; g_h_mapvb = {};
+                log_printf("[d3dres] trampoline unavailable — checks DISABLED\n");
+            } else
+            log_printf("[d3dres] resource validity checks: write_data @0x%X %s, "
+                       "map_dynamic_vb @0x%X %s\n",
+                       (uint32_t)RESOURCE_WRITE_DATA, g_h_rwd.enabled() ? "OK" : "FAIL",
+                       (uint32_t)RENDER_MAP_DYNAMIC_VB, g_h_mapvb.enabled() ? "OK" : "FAIL");
+        }
+    }
     g_h_pins = safetyhook::create_inline((void*)PARTICLE_INS_UPDATE, (void*)pins_hook_entry);
     g_pins_orig = g_h_pins ? (void*)g_h_pins.trampoline().address() : nullptr;
     g_h_sins = safetyhook::create_inline((void*)SPIRAL_INS_UPDATE, (void*)sins_hook_entry);

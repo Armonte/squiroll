@@ -163,6 +163,16 @@ void log_flush() {
 // Crash-path drain. On a fatal fault the worker may not run again; best-effort
 // drain whatever is published from the faulting thread. Lock-free (racy with the
 // worker, but the worst case at a crash is a torn tail line — acceptable).
+bool log_trace_on() {
+    static int on = -1;
+    if (on < 0) {
+        char b[8] = {0};
+        DWORD n = GetEnvironmentVariableA("SQUIROLL_TRACE", b, sizeof b);
+        on = (n > 0 && b[0] == '1') ? 1 : 0;
+    }
+    return on != 0;
+}
+
 void log_crash_drain() {
     if (!g_ring) return;
     uint64_t pos = g_read.load(std::memory_order_relaxed);
