@@ -531,10 +531,11 @@ static void __stdcall hook_exitprocess(UINT code) {
     // A clean exit(0) — the harness's CSS idle-exit and normal shutdown — is
     // not a crash; logging a FASTFAIL stack for it makes a non-empty crash log
     // that reads as a failure in a sweep. Only dump for a non-zero (error) code.
-    if (code != 0) {
-        log_fastfail_stack("ExitProcess");
-        crash_logf("  exit code = 0x%08X\r\n", code);
-    }
+    // Log EVERY exit (code 0 included): a silent process death with no WER
+    // event and no crash-log entry can only be ExitProcess(0) — the window's
+    // close button, th155's own quit paths, or ours. The stack tells which.
+    log_fastfail_stack(code ? "ExitProcess" : "ExitProcess(0) [clean exit / window close]");
+    crash_logf("  exit code = 0x%08X\r\n", code);
     // Skip the orderly ExitProcess teardown (DLL detach, CRT statics, thread
     // rundown): the rig left a zombie th155 whose one remaining thread never
     // finished (HasExited=true, thread Running) and which pinned the log file.

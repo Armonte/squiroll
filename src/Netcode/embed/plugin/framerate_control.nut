@@ -114,7 +114,9 @@ class modifier extends modifier {
     }
 
 	function Enabled(param) {
-		local enabled = (::network.IsPlaying != true);
+		// (was `::network.IsPlaying != true` -- compared the FUNCTION, always true ->
+		// the framerate hotkeys were live during netplay = a desync vector)
+		local enabled = (::network.IsPlaying() != true);
 		return enabled;
 	}
 };
