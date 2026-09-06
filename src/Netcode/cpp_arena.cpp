@@ -1033,14 +1033,21 @@ static void* cdecl hook_op_new(size_t size) {
 // and a snapshot load DROPS every journal entry newer than the restored frame —
 // those blocks are live again in the restored timeline (a leak at worst, never a
 // stale write into freed heap memory). Off-sim-thread frees pass straight
-// through (not sim state). SQUIROLL_FREE_JOURNAL=0 restores the old behaviour.
+// through (not sim state).
+// DEFAULT OFF (SQUIROLL_FREE_JOURNAL=1 enables). Measured over many dual runs it
+// never once fired: `dup=0 undone=0` every time, i.e. no rollback ever spanned a
+// real-heap free, because those frees cluster in asset/stream bursts rather than
+// per-frame gameplay. It does hold ~16 MB at peak (the 64 KB stream buffers), and
+// the 0xC0000374 deaths it was written for turned out to be the tapped-vtable bug
+// (gekko_bridge g_tap_vt) instead. Kept as a diagnostic for a suspected rollback
+// use-after-free on the real heap; not worth the memory by default.
 static constexpr int     FJ_CAP        = 32768;
 static constexpr int32_t FJ_QUARANTINE = 90;     // frames; 9x the 10-frame prediction window,
                                                  // and matches the arena block quarantine
 struct FjEnt { void* p; int32_t frame; };
 static FjEnt    g_fj[FJ_CAP];
 static int      g_fj_n = 0;
-static bool     g_fj_on = true;
+static bool     g_fj_on = false;  // OPT-IN: SQUIROLL_FREE_JOURNAL=1 (see the note above)
 static uint32_t g_fj_push = 0, g_fj_dup = 0, g_fj_dropped = 0, g_fj_freed = 0,
                 g_fj_overflow = 0, g_fj_max = 0;
 static uint64_t g_fj_bytes = 0, g_fj_bytes_max = 0;   // currently-deferred payload bytes
@@ -1334,7 +1341,7 @@ void install() {
             log_printf("[cpp_arena] SQUIROLL_SYNC_WORKERS=1 — worker queue drained INLINE (force-sync)\n");
         char jb[8] = {0};
         DWORD jn = GetEnvironmentVariableA("SQUIROLL_FREE_JOURNAL", jb, sizeof jb);
-        g_fj_on = !(jn > 0 && jb[0] == '0');
+        g_fj_on = (jn > 0 && jb[0] == '1');
         log_printf("[cpp_arena] real-heap free journal %s (quarantine=%d frames, cap=%d)\n",
                    g_fj_on ? "ON" : "OFF", (int)FJ_QUARANTINE, FJ_CAP);
     }
