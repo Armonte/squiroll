@@ -54,6 +54,11 @@ int gekko_add_actor(GekkoSession* session, GekkoPlayerType player_type, GekkoNet
     return session->AddActor(player_type, !addr ? nullptr : addr);
 }
 
+bool gekko_set_prediction_window(GekkoSession* session, unsigned char window)
+{
+    return session->SetPredictionWindow(window);
+}
+
 void gekko_set_local_delay(GekkoSession* session, int player, unsigned char delay)
 {
     session->SetLocalDelay(player, delay);

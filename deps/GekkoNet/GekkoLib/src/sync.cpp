@@ -108,6 +108,13 @@ void Gekko::SyncSystem::SetInputPredictionWindow(Handle player, u8 input_window)
 	_input_buffers[player].SetInputPredictionWindow(input_window);
 }
 
+bool Gekko::SyncSystem::AnyPendingPrediction(u8 num_players)
+{
+	for (u8 i = 0; i < num_players; i++)
+		if (_input_buffers[i].HasPendingPrediction()) return true;
+	return false;
+}
+
 Frame Gekko::SyncSystem::GetCurrentFrame() const
 {
 	return _current_frame;

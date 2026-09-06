@@ -520,6 +520,18 @@ bool Gekko::GameSession::IsPlayingLocally()
 	return _msg.remotes.empty() && !_msg.locals.empty();
 }
 
+bool Gekko::GameSession::SetPredictionWindow(u8 window)
+{
+    if (window == 0 && _sync.AnyPendingPrediction(_config.num_players)) {
+        return false;   // a misprediction would go uncorrected (AddInput skips the check at window 0)
+    }
+    _config.input_prediction_window = window;
+    for (u8 i = 0; i < _config.num_players; i++) {
+        _sync.SetInputPredictionWindow(i, window);
+    }
+    return true;
+}
+
 bool Gekko::GameSession::IsLockstepActive() const
 {
     return _config.input_prediction_window == 0;

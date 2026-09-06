@@ -1219,6 +1219,23 @@ static void     input_rec_load(const uint8_t* blob, uint32_t len);
 static uint32_t g_irec_load_gen = 0;
 static void refresh_vanilla_input_timeouts();   // defined with the round-end drain below
 static bool g_f0_input_reset_done = false;       // per-session frame-0 input baseline (see advance_one_frame)
+static void apply_test_round_frames();
+// LOCKSTEP TRANSITION (2026-09-06, the design that replaces the dual soft
+// disarm): at the round-end latch the gekko session is NOT torn down; it is
+// switched to lockstep (prediction window 0 -> GekkoNet waits for real inputs,
+// never rolls back) so the KO/time-up demo, win pose and next-round intro run
+// under the same session with no rollback ever crossing the round-end teardown
+// and no vanilla delay-netcode resync (which raced: host free-ran, client
+// starved in the intro, frame-0 baselines drifted). At the next Round_Fight
+// the prediction window is restored. Requested at the latch, applied on the
+// first tick with no prediction outstanding (GekkoNet refuses otherwise).
+static const bool DUAL_TRANSITION_LOCKSTEP = true;
+static bool  g_lockstep_req = false;      // switch to lockstep requested
+static bool  g_in_lockstep  = false;      // transition running under lockstep
+static bool  g_lockstep_seen_leave = false; // state left 8 since the latch (the round really ended)
+static bool  g_restore_req  = false;      // prediction restore requested (next Round_Fight seen)
+static const unsigned char PREDICTION_WINDOW = 10;
+
 static void reset_input_command_reserves();
 
 // Per-advance consume record ring (see the CONSUME RING block in advance()).
@@ -3017,6 +3034,34 @@ void advance_one_frame() {
     // Latching at time<=0 (the old condition) was several churn-frames too
     // late — the burst ran while still armed and fastfailed on both peers.
     // Rollback across the latch clears it (load_state_from_buf).
+    if (!g_solo && g_session_started && (g_in_lockstep || g_lockstep_req || g_restore_req)) {
+        // Transition under lockstep. The pre-burst latch fires while state is
+        // STILL 8 (time<=20), so first wait for the state to LEAVE 8 (the round
+        // really ended), then the next state-8 frame is the new round's
+        // Round_Fight. Both checks are sim-driven -> identical frame on both
+        // peers, so the test round-length hook applied here is deterministic.
+        // The prediction-window restore itself is netcode-local and may land on
+        // a later tick.
+        int st = 0;
+        if (read_battle_state(&st)) {
+            if (!g_lockstep_seen_leave && st != 8) {
+                g_lockstep_seen_leave = true;
+                log_printf("[gekko_bridge] lockstep transition: round left state 8 at f=%d (state=%d)\n", g_trace_frame, st);
+            } else if (g_lockstep_seen_leave && st == 8 && !g_restore_req) {
+                g_restore_req = true;
+                g_lockstep_seen_leave = false;
+                apply_test_round_frames();
+                log_printf("[gekko_bridge] Round_Fight re-entered at f=%d (round %d) -> prediction restore requested\n",
+                           g_trace_frame, g_disarm_count + 1);
+            }
+        }
+        if (g_restore_req && !g_lockstep_req && g_session &&
+            gekko_set_prediction_window(g_session, PREDICTION_WINDOW)) {
+            g_restore_req = false;
+            g_in_lockstep = false;
+            log_printf("[gekko_bridge] prediction window %u restored at f=%d\n", (unsigned)PREDICTION_WINDOW, g_trace_frame);
+        }
+    } else
     if (!g_solo && g_session_started && g_roundend_latch < 0) {
         int st = 0, bt = 0;
         if (read_battle_state(&st) &&
@@ -3238,28 +3283,49 @@ static void apply_test_round_frames();  // defined below; used by init/init_solo
 // arm (same sim frame by construction) so gekko frame 0 starts identical.
 static void reset_input_command_reserves() {
     if (!v) return;
-    static const SQChar* code =
-        "if (\"battle\" in ::getroottable() && ::battle != null && \"team\" in ::battle) {"
-        "  foreach (t in ::battle.team) {"
-        "    try {"
-        "      local a = (\"current\" in t) ? t.current : null;"
-        "      if (a != null && \"command\" in a && a.command != null) {"
-        "        a.command.ResetAllReserve(); a.command.Clear();"
-        "      }"
-        "    } catch (e) {}"
-        "  }"
-        "}";
     SQInteger top = sq_gettop(v);
-    if (SQ_SUCCEEDED(sq_compilebuffer(v, code, -1, _SC("rsv_reset"), SQFalse))) {
-        sq_pushroottable(v);
-        if (SQ_SUCCEEDED(sq_call(v, 1, SQFalse, SQTrue)))
-            log_printf("[gekko_bridge] input command reserves reset for both players (round baseline parity)\n");
-        else
-            log_printf("[gekko_bridge] input command reserve reset FAILED (call)\n");
-    } else {
-        log_printf("[gekko_bridge] input command reserve reset FAILED (compile)\n");
-    }
+    int n = 0, seen = 0; char pre[160] = {0}; size_t pl = 0;
+    sq_pushroottable(v);
+    sq_pushstring(v, _SC("battle"), -1);
+    if (SQ_SUCCEEDED(sq_get(v, -2)) && sq_gettype(v, -1) == OT_TABLE) {          // root battle
+        sq_pushstring(v, _SC("team"), -1);
+        if (SQ_SUCCEEDED(sq_get(v, -2)) && sq_gettype(v, -1) == OT_ARRAY) {      // root battle team
+            SQInteger cnt = sq_getsize(v, -1);
+            for (SQInteger i = 0; i < cnt; ++i) {
+                SQInteger base = sq_gettop(v);                                    // team on top
+                sq_pushinteger(v, i);
+                if (SQ_SUCCEEDED(sq_get(v, -2))) {                                // team t
+                    ++seen;
+                    sq_pushstring(v, _SC("current"), -1);
+                    if (SQ_SUCCEEDED(sq_get(v, -2)) && sq_gettype(v, -1) == OT_INSTANCE) {   // t current
+                        sq_pushstring(v, _SC("command"), -1);
+                        if (SQ_SUCCEEDED(sq_get(v, -2)) && sq_gettype(v, -1) == OT_INSTANCE) { // current command
+                            SQInteger ry = -99, rx = -99;
+                            sq_pushstring(v, _SC("rsv_y"), -1);
+                            if (SQ_SUCCEEDED(sq_get(v, -2))) { sq_getinteger(v, -1, &ry); sq_pop(v, 1); }
+                            sq_pushstring(v, _SC("rsv_x"), -1);
+                            if (SQ_SUCCEEDED(sq_get(v, -2))) { sq_getinteger(v, -1, &rx); sq_pop(v, 1); }
+                            static const SQChar* methods[2] = { _SC("ResetAllReserve"), _SC("Clear") };
+                            for (int m = 0; m < 2; ++m) {
+                                sq_pushstring(v, methods[m], -1);
+                                if (SQ_SUCCEEDED(sq_get(v, -2))) {                // command closure
+                                    sq_push(v, -2);                               // this = command
+                                    if (SQ_FAILED(sq_call(v, 1, SQFalse, SQTrue)))
+                                        log_printf("[gekko_bridge] rsv reset: %s call failed\n", methods[m]);
+                                    sq_pop(v, 1);                                 // closure
+                                }
+                            }
+                            ++n;
+                            pl += (size_t)snprintf(pre + pl, sizeof pre - pl, "[x=%d y=%d]", (int)rx, (int)ry);
+                        } else pl += (size_t)snprintf(pre + pl, sizeof pre - pl, "[no command]");
+                    } else pl += (size_t)snprintf(pre + pl, sizeof pre - pl, "[no current]");
+                }
+                sq_settop(v, base);
+            }
+        } else pl += (size_t)snprintf(pre + pl, sizeof pre - pl, "[no team array]");
+    } else pl += (size_t)snprintf(pre + pl, sizeof pre - pl, "[no battle]");
     sq_settop(v, top);
+    log_printf("[gekko_bridge] input command reserves reset: teams=%d reset=%d pre=%s\n", seen, n, pre);
 }
 static void install_menu_mash_hook();   // defined below; installs the kbd-poll hook
 
@@ -4148,6 +4214,7 @@ void pre_arm_poll() {
 }
 
 void shutdown() {
+    g_lockstep_req = false; g_in_lockstep = false; g_lockstep_seen_leave = false; g_restore_req = false;
     reader_unbind();
     g_f0_input_reset_done = false;
     g_draining = false;
@@ -4175,6 +4242,20 @@ void shutdown() {
 bool is_active()         { return g_active; }
 bool is_session_started(){ return g_session_started; }
 bool is_holding_transition() { return g_hold_transition; }
+// ARM-HANDSHAKE HOLD FEED (dual). While we are armed but the session has not
+// started, the engine is held at fight-frame-0 and the vanilla loop no longer
+// runs — so the peer that is still a few frames behind in the round-2 intro
+// stops receiving our delay-netcode inputs, cannot reach its own Round_Fight,
+// and 8 s later its SyncInput disconnects us (r2 run 25: host armed, client
+// stuck in state 4 with no type-18 packets). Keep the vanilla input step
+// (NetworkInputSession core 0xE3340: record local input, send, receive) running
+// once per held frame WITHOUT advancing the sim. The extra frames it queues are
+// discarded by the SessionStarted ring flush on both peers.
+void hold_vanilla_feed() {
+    if (g_solo || !g_active || g_session_started || !g_active_input_session) return;
+    refresh_vanilla_input_timeouts();
+    ((void (thiscall*)(ManbowNetworkInputSession*))(0xE3340_R))(g_active_input_session);
+}
 void hold_poll() { cpp_arena::advance_frame(); drain_poll(); }
 bool dual_input_owned()  { return g_active && !g_solo; }
 
@@ -4333,6 +4414,10 @@ bool tick() {
                 if (!g_solo) { log_flush(); request_shutdown(); }
                 break;
             case GekkoSessionStarted:
+                // Both peers start gekko frame 0 from EMPTY recorder rings: the
+                // hold feed above and the transition may have queued frames the
+                // sim never consumed (and differently per peer).
+                if (!g_solo) flush_recorder_rings();
                 // vs.Initialize already ran under the vanilla loop and
                 // the intro played out before the session was created
                 // at Round_Fight — so there is nothing deferred to run
@@ -4900,11 +4985,26 @@ bool tick() {
     // while(SyncInput()) gate resumes); pre_arm_poll re-arms at the next
     // round's Round_Fight.
     if (g_session_started && !g_solo && !no_disarm && g_roundend_latch >= 0) {
-        log_printf("[gekko_bridge] round-end latch f=%d reached -> dual "
-                   "disarm\n", g_roundend_latch);
-        g_roundend_latch = -1;
-        disarm_for_round_end();
-        return advanced;
+        if (DUAL_TRANSITION_LOCKSTEP) {
+            log_printf("[gekko_bridge] round-end latch f=%d reached -> LOCKSTEP transition requested "
+                       "(session stays up)\n", g_roundend_latch);
+            g_roundend_latch = -1;
+            g_lockstep_req = true;
+            ++g_disarm_count;
+        } else {
+            log_printf("[gekko_bridge] round-end latch f=%d reached -> dual "
+                       "disarm\n", g_roundend_latch);
+            g_roundend_latch = -1;
+            disarm_for_round_end();
+            return advanced;
+        }
+    }
+    if (g_lockstep_req && g_session) {
+        if (gekko_set_prediction_window(g_session, 0)) {
+            g_lockstep_req = false;
+            g_in_lockstep  = true;
+            log_printf("[gekko_bridge] LOCKSTEP ON (prediction window 0) at f=%d\n", g_trace_frame);
+        }
     }
     if (g_session_started && g_solo && !no_disarm) {
         int st = 0;

@@ -24,6 +24,9 @@ struct GekkoSession {
     virtual f32 FramesAhead() = 0;
     virtual void NetworkStats(i32 player, GekkoNetworkStats* stats) = 0;
     virtual void NetworkPoll() = 0;
+    // [squiroll] runtime prediction window (0 = lockstep). Returns false if the
+    // change was refused (dropping to 0 while a prediction is outstanding).
+    virtual bool SetPredictionWindow(u8 window) { (void)window; return false; }
     virtual ~GekkoSession() = default;
 };
 
@@ -38,6 +41,7 @@ namespace Gekko {
         void SetLocalDelay(i32 player, u8 delay) override;
 
         void SetRunahead(u8 runahead) override;
+        bool SetPredictionWindow(u8 window) override;
 
         void SetNetAdapter(GekkoNetAdapter* adapter) override;
 

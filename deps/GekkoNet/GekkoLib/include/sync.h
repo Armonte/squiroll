@@ -30,6 +30,7 @@ namespace Gekko {
 		u8 GetLocalDelay(Handle player);
 
 		void SetInputPredictionWindow(Handle player, u8 input_window);
+		bool AnyPendingPrediction(u8 num_players);   // [squiroll]
 
 		Frame GetCurrentFrame() const;
 

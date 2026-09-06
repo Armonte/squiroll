@@ -182,6 +182,7 @@ void stdcall better_game_loop() {
             // (Solo never reaches here — init_solo() sets is_active and
             // is_session_started together, so it goes straight to the
             // branch above.)
+            gekko_bridge::hold_vanilla_feed();   // keep feeding the peer's delay netcode
             gekko_bridge::tick();
             frames_this_sec += window_render();
         } else if (gekko_bridge::is_holding_transition()) {

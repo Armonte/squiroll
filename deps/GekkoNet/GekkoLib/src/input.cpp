@@ -155,6 +155,11 @@ void Gekko::InputBuffer::SetInputPredictionWindow(u8 input_window)
 	_input_prediction_window = input_window;
 }
 
+bool Gekko::InputBuffer::HasPendingPrediction() const
+{
+	return _first_predicted_input != GameInput::NULL_FRAME;
+}
+
 Frame Gekko::InputBuffer::GetIncorrectPredictionFrame()
 {
 	return _incorrent_predicted_inputs.empty() ? GameInput::NULL_FRAME : _incorrent_predicted_inputs.front();

@@ -198,6 +198,8 @@ GEKKONET_API int gekko_add_actor(GekkoSession* session, GekkoPlayerType player_t
 GEKKONET_API void gekko_set_local_delay(GekkoSession* session, int player, unsigned char delay);
 
 GEKKONET_API void gekko_set_runahead(GekkoSession* session, unsigned char runahead);
+// [squiroll] runtime prediction window; 0 = lockstep. false = refused (prediction outstanding), retry later.
+GEKKONET_API bool gekko_set_prediction_window(GekkoSession* session, unsigned char window);
 
 GEKKONET_API void gekko_add_local_input(GekkoSession* session, int player, void* input);
 

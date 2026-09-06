@@ -45,6 +45,7 @@ namespace Gekko {
 		void SetInputPredictionWindow(u8 input_window);
 
 		Frame GetIncorrectPredictionFrame();
+		bool HasPendingPrediction() const;   // [squiroll] a predicted frame still awaits its real input
 
 		std::unique_ptr<GameInput> GetInput(Frame frame, bool prediction = false, bool running_ahead = false);
 

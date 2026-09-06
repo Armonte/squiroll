@@ -71,6 +71,7 @@ bool menu_mash_active();          // session exists; UDP poll runs in background
 bool is_session_started(); // GekkoSessionStarted fired; tick() owns the frame
 bool is_holding_transition(); // round-end: engine held until the remote reaches the latch
 void hold_poll();             // per-frame pump while holding (render-only frames)
+void hold_vanilla_feed();     // arm-handshake hold: keep the vanilla input step alive for the peer
 // True when a DUAL (2-peer) gekko session owns input replay via the recorder
 // queue + reader rebind. input_global_sync's capture-replay MUST stand down
 // then: on a mispredicted rolling peer it would restore the forward-captured
