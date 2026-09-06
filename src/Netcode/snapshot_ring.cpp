@@ -324,6 +324,45 @@ namespace {
 // bump field and are excluded from every checksum/diagnostic (see NDIAG).
 static const uint32_t BUMP_OFF[NARENA] = { 0, 4, 4, 0, 0 };
 
+static constexpr int CPP_ARENA = 2;
+
+// USED-RANGE QUERY. GetWriteWatch scans the page-table entries of the range it is
+// given, so asking about a 128 MB reservation costs the same whether 4 MB or all
+// of it is in use. We reserve sq 64 MB + bullet 32 MB + cpp 128 MB = 224 MB and
+// query every page of it twice a frame (once in capture, once in restore) to find
+// a few hundred dirty pages — measured ~400 us in capture and ~500 us in restore.
+// The arenas are bump allocators, so everything live is below the bump; the only
+// exception is the cpp arena's forward-only RENDER region up at RENDER_BASE.
+// Ask about the used part only. Ranges are page-aligned and clamped to the arena.
+struct UsedRange { uint8_t* base; uint32_t size; };
+static int arena_used_ranges(int a, UsedRange* out, int maxn) {
+    Arena& A = g_ar[a];
+    if (A.size == 0 || maxn < 1) return 0;
+    // Arenas 3/4 (tf4 mspaces) have no bump field: fall back to the whole region.
+    if (a >= 3) { out[0] = { A.base, A.size }; return 1; }
+    uint32_t bump = (a == CPP_ARENA)
+                        ? ({ uint32_t sb = 0; cpp_arena::used_extents(&sb, nullptr, nullptr); sb; })
+                        : *(const uint32_t*)(A.base + BUMP_OFF[a]);
+    if (bump == 0 || bump > A.size) { out[0] = { A.base, A.size }; return 1; }
+    uint32_t simlen = (bump + PAGE - 1) & ~(PAGE - 1);
+    if (simlen > A.size) simlen = A.size;
+    int n = 0;
+    out[n++] = { A.base, simlen };
+    if (a == CPP_ARENA && maxn > 1) {
+        // Forward-only render region. Ask cpp_arena rather than duplicating its
+        // Meta layout here — that layout depends on NCLS and would rot silently.
+        uint32_t rbase = 0, rused = 0;
+        cpp_arena::used_extents(nullptr, &rbase, &rused);
+        if (rbase < A.size) {
+            uint32_t rlen = rused ? ((rused + PAGE - 1) & ~(PAGE - 1))
+                                  : (A.size - rbase);
+            if (rbase + rlen > A.size) rlen = A.size - rbase;
+            if (rlen) out[n++] = { A.base + rbase, rlen };
+        }
+    }
+    return n;
+}
+
 // Full-state desync checksum: fold every in-use page hash (cheap — maintained
 // incrementally) plus the small blob.
 //
@@ -341,7 +380,7 @@ static const uint32_t BUMP_OFF[NARENA] = { 0, 4, 4, 0, 0 };
 // The simulation is fully covered by arena 0 (sq_arena/Squirrel VM), arena 1
 // (bullet_arena/LiquidFun) and the small blob (battle pools / engine .data /
 // input). See ROLLBACK_NETCODE_PLAN.md "cpp_arena render divergence".
-static constexpr int CPP_ARENA = 2;
+
 
 // Cross-peer diagnosis: the last fold's per-component sub-hashes. Comparing
 // these between two peers at the same gekko frame says WHICH component
@@ -605,17 +644,37 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
     for (int a = 0; a < NARENA; ++a) {
         Arena& A = g_ar[a];
         if (A.size == 0) { S.dn[a] = 0; continue; }   // unregistered arena (tf4 off)
-        ULONG_PTR count = A.npages;
+        // Query only the used extents (see arena_used_ranges): the reservations
+        // are far larger than the live data and GetWriteWatch charges per page of
+        // the range it is asked about.
+        UsedRange ur[4];
+        int nur = arena_used_ranges(a, ur, 4);
+        {   // one-shot: how much of each reservation we actually query
+            static bool shown[NARENA] = {false};
+            if (!shown[a] && frame > 60) {
+                shown[a] = true;
+                uint32_t q = 0;
+                for (int u = 0; u < nur; ++u) q += ur[u].size;
+                log_printf("[wwrange] arena=%d reserved=%uMB queried=%uMB in %d range(s)\n",
+                           a, A.size >> 20, q >> 20, nur);
+            }
+        }
+        ULONG_PTR count = 0;
         ULONG     gran  = 0;
         LARGE_INTEGER w0; QueryPerformanceCounter(&w0);
-        UINT rc = GetWriteWatch(WRITE_WATCH_FLAG_RESET, A.base, A.size,
-                                g_pgbuf, &count, &gran);
+        for (int u = 0; u < nur; ++u) {
+            ULONG_PTR c = A.npages - count;
+            if ((ULONG_PTR)0 == c) break;
+            UINT rc = GetWriteWatch(WRITE_WATCH_FLAG_RESET, ur[u].base, ur[u].size,
+                                    g_pgbuf + count, &c, &gran);
+            if (rc != 0) {
+                log_printf("[snapshot_ring] !! GetWriteWatch failed arena=%d range=%d\n", a, u);
+                c = 0;
+            }
+            count += c;
+        }
         LARGE_INTEGER w1; QueryPerformanceCounter(&w1);
         t_ww += (uint64_t)(w1.QuadPart - w0.QuadPart);
-        if (rc != 0) {
-            log_printf("[snapshot_ring] !! GetWriteWatch failed arena=%d\n", a);
-            count = 0;
-        }
         LARGE_INTEGER d0; QueryPerformanceCounter(&d0);
         uint8_t* dp   = S.delta[a];
         uint8_t* dend = dp + DELTA_CAP[a];
@@ -1295,16 +1354,24 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
     for (int a = 0; a < NARENA; ++a) {
         Arena& A = g_ar[a];
         if (!A.size) continue;
-        ULONG_PTR count = A.npages;
+        // Used extents only — same reason as in capture().
+        UsedRange ur[4];
+        int nur = arena_used_ranges(a, ur, 4);
+        ULONG_PTR count = 0;
         ULONG     gran  = 0;
         LARGE_INTEGER w0; QueryPerformanceCounter(&w0);
-        UINT rc = GetWriteWatch(WRITE_WATCH_FLAG_RESET, A.base, A.size,
-                                g_pgbuf, &count, &gran);
-        LARGE_INTEGER w1; QueryPerformanceCounter(&w1); r_s0ww += w1.QuadPart - w0.QuadPart;
-        if (rc != 0) {
-            log_printf("[snapshot_ring] !! restore GetWriteWatch failed arena=%d\n", a);
-            continue;
+        for (int u = 0; u < nur; ++u) {
+            ULONG_PTR c = A.npages - count;
+            if (c == 0) break;
+            UINT rc = GetWriteWatch(WRITE_WATCH_FLAG_RESET, ur[u].base, ur[u].size,
+                                    g_pgbuf + count, &c, &gran);
+            if (rc != 0) {
+                log_printf("[snapshot_ring] !! restore GetWriteWatch failed arena=%d range=%d\n", a, u);
+                c = 0;
+            }
+            count += c;
         }
+        LARGE_INTEGER w1; QueryPerformanceCounter(&w1); r_s0ww += w1.QuadPart - w0.QuadPart;
         const bool skip_revert = (no_step0 == 2) || (no_step0 == 1 && (a == 3 || a == 4));
         if (!skip_revert) {
             for (ULONG_PTR i = 0; i < count; ++i) {

@@ -1788,6 +1788,13 @@ void trace_check(uint32_t frame, int rb) {
 uint8_t* base()      { return g_base; }
 uint32_t used()      { return g_meta ? g_meta->bump : 0; }
 bool owns(const void* p) { return in_arena(p); }   // public arena-membership query
+void used_extents(uint32_t* sim_used, uint32_t* render_base_off, uint32_t* render_used) {
+    if (sim_used)        *sim_used        = g_meta ? g_meta->bump : 0;
+    if (render_base_off) *render_base_off = RENDER_BASE;
+    if (render_used)     *render_used     = (g_meta && g_meta->render_bump > RENDER_BASE)
+                                                ? (g_meta->render_bump - RENDER_BASE) : 0;
+}
+
 const char* region_of(const void* p) {
     if (!in_arena(p)) return "none";
     return ((const uint8_t*)p - g_base) >= RENDER_BASE ? "render" : "sim";

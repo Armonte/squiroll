@@ -93,6 +93,13 @@ bool is_excluded_page(uint32_t pg);
 // payload base, and return true. Scans backwards for the block header —
 // diagnostic-only cost, safe to call from the VEH/fastfail path.
 // "sim" / "render" / "none": which cpp_arena region (if any) holds p.
+// Byte extents actually in use, for callers that must not pay for the whole
+// 128 MB reservation (GetWriteWatch scans page-table entries across whatever
+// range it is given). Returns the SIM high-water mark and the RENDER region's,
+// both as offsets from the arena base; render_base_off is where the render
+// region starts. Zero means "not initialised, assume everything".
+void used_extents(uint32_t* sim_used, uint32_t* render_base_off, uint32_t* render_used);
+
 const char* region_of(const void* p);
 bool describe_block(uint32_t addr, uint32_t* alloc_rva, uint32_t* reqsize,
                     uint32_t* payload);

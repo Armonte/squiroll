@@ -1294,6 +1294,7 @@ static uint64_t g_perf_sblob = 0, g_perf_cap = 0;
 // frame-by-frame field walk + input correlation that pins WHERE two peers
 // split and whether a rollback re-sim was involved.
 static bool read_battle_int(const SQChar* field, int* out);  // defined below
+static bool set_battle_int(const SQChar* field, int value);   // defined below
 static bool read_battle_state(int* out);                     // defined below
 
 static constexpr uint32_t SQTEXT_RING = 64;
@@ -2675,7 +2676,12 @@ static void ivec_guard(const char* when) {
 
 static void input_rec_load(const uint8_t* blob, uint32_t len) {
     ++g_irec_load_gen;   // legit cursor rewind — anomaly detector skips one
-    if (heapchk_level() >= 1) heap_scan_all("restore");
+    // Level 2+, NOT level 1. A restore happens on ~30% of frames, and a full
+    // HeapValidate is ~560us — at level 1 this alone was the single largest item
+    // in the load path, and it was being charged to the input-recorder section
+    // that merely happens to run first. Level 1 is meant to be the cheap
+    // periodic check; per-restore validation is a bracketing tool.
+    if (heapchk_level() >= 2) heap_scan_all("restore");
     const uint8_t* p = blob;
     const uint8_t* e = blob + len;
     auto get = [&](void* d, uint32_t n) -> bool {
@@ -3211,6 +3217,25 @@ void advance_one_frame() {
         }
         reset_input_command_reserves();
         log_printf("[gekko_bridge] frame-0 input baseline applied (InputGlobals zeroed + command reserves reset)\n");
+    }
+    // FAST-ROUND TEST HOOK, driven by the GEKKO FRAME so both peers do it on the
+    // same simulated frame. The old version wrote ::battle.time from the local
+    // state machine on each peer's own schedule; the peers then timed out on
+    // different frames and one entered the round-end demo while the other did
+    // not (measured: 3 of 4 runs desynced, and with `time` merely exempted from
+    // the checksum the divergence grew to 96% of the state — demoCount 190 vs 0).
+    // Keying on g_trace_frame makes the write reproducible and rollback-safe: a
+    // re-sim of the same frame writes the same value.
+    {
+        static int rf2 = -1;
+        if (rf2 < 0) {
+            char b[16] = {0};
+            DWORD n_ = GetEnvironmentVariableA("SQUIROLL_ROUND_FRAMES", b, sizeof b);
+            rf2 = (n_ > 0 && n_ < sizeof b) ? atoi(b) : 0;
+            if (rf2 < 0) rf2 = 0;
+        }
+        if (rf2 > 0 && g_trace_frame > 0 && (g_trace_frame % rf2) == 0)
+            set_battle_int(_SC("time"), 60);   // 1 s left -> deterministic timeout
     }
     update_related(*MAIN_SCRIPTAPI_PTR);                    // RunOneFrame(g_main), once
     if (igx_on)
@@ -3932,6 +3957,21 @@ static char     g_watch_remote_ip[64] = {0};
 // deterministic and re-sims reproduce it. Shortens round 1 so a harness
 // run reaches the round transition (time-over -> round 2) quickly.
 // Both dual peers read the same env -> same value -> still in sync.
+static bool set_battle_int(const SQChar* field, int value) {
+    if (!v) return false;
+    SQInteger top = sq_gettop(v);
+    bool ok = false;
+    sq_pushroottable(v);
+    sq_pushstring(v, _SC("battle"), -1);
+    if (SQ_SUCCEEDED(sq_get(v, -2))) {
+        sq_pushstring(v, field, -1);
+        sq_pushinteger(v, (SQInteger)value);
+        ok = SQ_SUCCEEDED(sq_set(v, -3));
+    }
+    sq_settop(v, top);
+    return ok;
+}
+
 static void apply_test_round_frames() {
     static int rf = -1;
     if (rf < 0) {
@@ -3940,18 +3980,15 @@ static void apply_test_round_frames() {
         rf = (n > 0 && n < sizeof(buf)) ? atoi(buf) : 0;
         if (rf < 0) rf = 0;
     }
-    if (rf <= 0 || !v) return;
-    SQInteger top = sq_gettop(v);
-    sq_pushroottable(v);
-    sq_pushstring(v, _SC("battle"), -1);
-    if (SQ_SUCCEEDED(sq_get(v, -2))) {
-        sq_pushstring(v, _SC("time"), -1);
-        sq_pushinteger(v, rf);
-        if (SQ_SUCCEEDED(sq_set(v, -3))) {
-            log_printf("[gekko_bridge] TEST: round timer shortened to %d frames\n", rf);
-        }
-    }
-    sq_settop(v, top);
+    // RETIRED. This wrote ::battle.time from the LOCAL state machine, so the two
+    // peers forged the timer on different simulated frames, timed out on
+    // different frames, and one entered the round-end demo while the other did
+    // not — a desync the netcode did not cause (3 of 4 runs; hiding `time` from
+    // the checksum only grew the divergence to 96% of the state). The fast-round
+    // hook now runs inside advance_one_frame keyed on the GEKKO FRAME, which
+    // both peers agree on and which a re-sim reproduces. Kept as a no-op so the
+    // existing call sites stay readable.
+    (void)rf;
 }
 
 void watch_for_fight_solo() {
