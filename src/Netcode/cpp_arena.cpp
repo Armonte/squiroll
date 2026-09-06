@@ -1660,6 +1660,7 @@ void trace_check(uint32_t frame, int rb) {
 }
 uint8_t* base()      { return g_base; }
 uint32_t used()      { return g_meta ? g_meta->bump : 0; }
+bool owns(const void* p) { return in_arena(p); }   // public arena-membership query
 // Quarantine clock: once per sim advance (forward AND re-sim — Meta is rewound
 // with the snapshot, so the re-sim replays the same values) and once per vanilla
 // frame during the round transition (pre_arm_poll).

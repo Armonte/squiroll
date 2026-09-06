@@ -535,7 +535,13 @@ static void __stdcall hook_exitprocess(UINT code) {
         log_fastfail_stack("ExitProcess");
         crash_logf("  exit code = 0x%08X\r\n", code);
     }
-    g_h_exit.unsafe_stdcall<void>(code);
+    // Skip the orderly ExitProcess teardown (DLL detach, CRT statics, thread
+    // rundown): the rig left a zombie th155 whose one remaining thread never
+    // finished (HasExited=true, thread Running) and which pinned the log file.
+    // Nothing in this process needs an orderly shutdown; flush our log and die.
+    log_flush();
+    TerminateProcess(GetCurrentProcess(), code);
+    g_h_exit.unsafe_stdcall<void>(code);   // not reached
 }
 static BOOL __stdcall hook_terminateprocess(HANDLE h, UINT code) {
     if (h == GetCurrentProcess() || h == (HANDLE)(LONG_PTR)-1) {
@@ -543,6 +549,22 @@ static BOOL __stdcall hook_terminateprocess(HANDLE h, UINT code) {
         crash_logf("  exit code = 0x%08X\r\n", code);
     }
     return g_h_term.unsafe_stdcall<BOOL>(h, code);
+}
+// HEAP-CORRUPTION ATTRIBUTION: ntdll's RtlpHeapHandleError -> RtlReportCriticalFailure
+// -> RtlReportException(record, ctx, flags) -> __fastfail. The fast-fail bypasses every
+// hook, but RtlReportException is exported and runs first on the DETECTING thread:
+// dump its stack (the RtlFreeHeap/RtlAllocateHeap caller = the block's owner).
+static SafetyHookInline g_h_rtlreport{};
+static LONG __stdcall hook_rtlreportexception(EXCEPTION_RECORD* rec, void* ctx, DWORD flags) {
+    crash_logf("\r\n==== RtlReportException code=0x%08X (heap corruption path) ====\r\n",
+               rec ? (unsigned)rec->ExceptionCode : 0u);
+    if (rec && rec->NumberParameters) {
+        for (DWORD i = 0; i < rec->NumberParameters && i < 4; ++i)
+            crash_logf("  param[%u]=0x%08X\r\n", i, (unsigned)rec->ExceptionInformation[i]);
+    }
+    log_fastfail_stack("RtlReportException");
+    log_flush();
+    return g_h_rtlreport.unsafe_stdcall<LONG>(rec, ctx, flags);
 }
 static void __stdcall hook_raiseff(void* rec, void* ctx, DWORD flags) {
     log_fastfail_stack("RaiseFailFastException");
@@ -594,6 +616,30 @@ void register_thread(uint32_t tid) {
 // HANG DIAGNOSIS: dump every thread's stack (toolhelp enumeration; suspend ->
 // context -> ebp walk -> resume). Called by the gekko_bridge hang watchdog when
 // the forward frame stops advancing, so a silent stall becomes a named loop.
+// ON-DEMAND HANG DUMP: a dedicated thread (independent of the watchdog, the sim
+// and the game loop) polls for a trigger file next to the exe; when
+// "hangdump.now" appears it deletes it and dumps every thread's stack. Lets a
+// frozen process be attributed from outside without a debugger.
+static DWORD __stdcall ondemand_dump_thread(void*) {
+    for (;;) {
+        Sleep(500);
+        if (GetFileAttributesA("hangdump.now") != INVALID_FILE_ATTRIBUTES) {
+            DeleteFileA("hangdump.now");
+            dump_all_thread_stacks("on-demand (hangdump.now)");
+            log_flush();
+        }
+    }
+    return 0;
+}
+void start_ondemand_dump_thread() {
+    static bool started = false;
+    if (started) return;
+    started = true;
+    HANDLE h = CreateThread(nullptr, 0, ondemand_dump_thread, nullptr, 0, nullptr);
+    if (h) CloseHandle(h);
+    log_printf("crash_handler: on-demand hangdump thread up (touch hangdump.now)\n");
+}
+
 void dump_all_thread_stacks(const char* why) {
     log_printf("[hangdump] === %s ===\n", why);
     auto readable = [](uintptr_t p, size_t len) -> bool {
@@ -731,6 +777,11 @@ void install() {
         if (pe) g_h_exit    = safetyhook::create_inline(pe, (void*)hook_exitprocess);
         if (pt) g_h_term    = safetyhook::create_inline(pt, (void*)hook_terminateprocess);
         if (pr) g_h_raiseff = safetyhook::create_inline(pr, (void*)hook_raiseff);
+        if (HMODULE nt = GetModuleHandleA("ntdll.dll")) {
+            void* rr = (void*)GetProcAddress(nt, "RtlReportException");
+            if (rr) g_h_rtlreport = safetyhook::create_inline(rr, (void*)hook_rtlreportexception);
+            log_printf("crash_handler: RtlReportException hook %s\n", g_h_rtlreport ? "OK" : "FAIL");
+        }
         log_printf("crash_handler: exit hooks exit=%d term=%d raiseff=%d\n",
                    (int)g_h_exit.enabled(), (int)g_h_term.enabled(),
                    (int)g_h_raiseff.enabled());

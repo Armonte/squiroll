@@ -306,6 +306,7 @@ bool common_init(
     // VEH crash logger — install before any of our patches/hooks so a
     // fault anywhere lands a module+RVA report in aocf_crash.log.
     crash_handler::install();
+    crash_handler::start_ondemand_dump_thread();   // touch hangdump.now to dump all thread stacks
 
     // IAT-patch th155's VirtualAlloc so the two engine-private "TF4 mspace"
     // dlmalloc pools (allocated by tf4_mspace_create during engine init) get

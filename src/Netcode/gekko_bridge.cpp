@@ -2477,6 +2477,16 @@ static uint32_t input_rec_save(uint8_t* out, uint32_t cap) {
 
 static void input_rec_load(const uint8_t* blob, uint32_t len) {
     ++g_irec_load_gen;   // legit cursor rewind — anomaly detector skips one
+    {   // [heapchk] also validate right after every restore
+        static int on = -1;
+        if (on < 0) { char b[4] = {0}; on = (GetEnvironmentVariableA("SQUIROLL_HEAPCHECK", b, sizeof b) > 0 && b[0] == '1') ? 1 : 0; }
+        static bool bad = false;
+        if (on && !bad && !HeapValidate(GetProcessHeap(), 0, nullptr)) {
+            bad = true;
+            log_printf("[heapchk] !! process heap INVALID right after restore (load f=%d)\n", g_trace_frame);
+            log_flush();
+        }
+    }
     const uint8_t* p = blob;
     const uint8_t* e = blob + len;
     auto get = [&](void* d, uint32_t n) -> bool {
@@ -2984,6 +2994,20 @@ void advance_one_frame() {
                    g_ig_probe2 ? g_ig_probe2[3] : -1);
     cpp_arena::advance_frame();                             // arena quarantine clock
     if (!g_solo) refresh_vanilla_input_timeouts();          // keep the 8 s vanilla input timeout at bay
+    // [heapchk] SQUIROLL_HEAPCHECK=1: validate the process heap every 30 forward
+    // frames (and log the first failure) to bracket the 0xC0000374 corruption.
+    {
+        static int on = -1;
+        if (on < 0) { char b[4] = {0}; on = (GetEnvironmentVariableA("SQUIROLL_HEAPCHECK", b, sizeof b) > 0 && b[0] == '1') ? 1 : 0; }
+        if (on && !g_trace_rb && (g_trace_frame % 30) == 0) {
+            static bool bad = false;
+            if (!bad && !HeapValidate(GetProcessHeap(), 0, nullptr)) {
+                bad = true;
+                log_printf("[heapchk] !! process heap INVALID at f=%d (first detection)\n", g_trace_frame);
+                log_flush();
+            }
+        }
+    }
     // FRAME-0 INPUT BASELINE (dual): the first forward advance of gekko frame 0
     // is the identical sim point on both peers. Zero the two InputGlobal
     // natives (stale held direction from the transition — the client entered

@@ -39,6 +39,7 @@ void dump_all_thread_stacks(const char* why);
 // the simulation thread — needed to catch a non-sim-thread writer.
 void register_thread(uint32_t tid);
 
+void start_ondemand_dump_thread();
 } // namespace crash_handler
 
 #endif // CRASH_HANDLER_H
