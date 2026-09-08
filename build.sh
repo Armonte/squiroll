@@ -268,8 +268,12 @@ else
 fi
 
 # --- Deploy (skip cp when target is already current) ------------------------
-DEPLOY_DIR="/mnt/c/dev/aocf/th155"
-if [ -d "$DEPLOY_DIR" ]; then
+# BOTH harness directories. th155_alt/ is where the rig runners live
+# (probe_stall.sh / probe_lockstep.sh / probe_solo.sh), so leaving it out means
+# every measurement and every stability run silently exercises a stale DLL --
+# which is exactly what happened on 2026-09-08 and cost a full measurement pass.
+for DEPLOY_DIR in "/mnt/c/dev/aocf/th155" "/mnt/c/dev/aocf/th155_alt"; do
+  [ -d "$DEPLOY_DIR" ] || continue
   deployed=0
   for artifact in Netcode.dll th155r.exe; do
     if [ "$artifact" -nt "$DEPLOY_DIR/$artifact" ]; then
@@ -278,7 +282,7 @@ if [ -d "$DEPLOY_DIR" ]; then
     fi
   done
   [ "$deployed" = "1" ] && echo "Deployed to $DEPLOY_DIR"
-fi
+done
 
 # thcrap/bin is the REAL/normal play chain (th155 (en).lnk -> thcrap loads
 # Netcode.dll from here). Must stay in sync with the th155/ harness copy or

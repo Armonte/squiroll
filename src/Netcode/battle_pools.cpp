@@ -225,7 +225,8 @@ void reserve_anim_vectors() {
 //     [nlive]  then nlive x [slot-addr][slot-bytes (slot_size)]
 //     [nfree]  then nfree x [slot-addr]            (free list, in order)
 //   [ACTOR_MGR_BYTES of the manager region][uint32 id_ctr_b]
-static constexpr uint32_t POOL_MAGIC = 0x4C4F4F50;  // 'POOL'
+static constexpr uint32_t POOL_MAGIC  = 0x4C4F4F50;  // 'POOL' — legacy free-list-as-addresses
+static constexpr uint32_t POOL_MAGIC_C = 0x434F4F50; // 'POOC' — canonical free-set bitmap
 
 // Free-slot bitmap scratch, reused per pool — one bit per slot. A pregrown
 // pool holds a couple thousand slots (SqFunctionHolder peaks ~4064); 64K bits
@@ -250,6 +251,58 @@ static uint8_t g_freebits[MAXSLOT / 8];
 // by the fallback trailer2 walk. Spans are emitted in ascending blob order. On
 // overflow the excess fields stay checksummed (logged once) — safe: worst case
 // is a false desync, never a missed real one.
+// --- save/load phase profiler -------------------------------------------
+// Four QueryPerformanceCounter calls per save is ~100 ns; the phases they
+// separate are hundreds of microseconds each, so this stays on in ship
+// config. It is the only way to tell which half of a change paid off:
+// medians over 240 saves, because run-to-run variance on this machine is
+// larger than most of the wins.
+struct BpProf {
+    uint64_t walk = 0;    // free-list chase that builds the free bitmap
+    uint64_t link = 0;    // canonical relink + free-set emit
+    uint64_t slot = 0;    // live-slot copy (+ registry span matching)
+    uint64_t lload = 0;   // load: live-slot restore
+    uint64_t lfree = 0;   // load: free-list rebuild
+    uint32_t nsave = 0, nload = 0;
+    uint32_t slots = 0, live = 0, freec = 0, blocks = 0;
+};
+static BpProf g_prof;
+static inline uint64_t qpc() {
+    LARGE_INTEGER t; QueryPerformanceCounter(&t); return (uint64_t)t.QuadPart;
+}
+static void log_peaks();
+static void prof_report() {
+    if (g_prof.nsave < 240) return;
+    LARGE_INTEGER fr; QueryPerformanceFrequency(&fr);
+    const uint64_t hz = (uint64_t)fr.QuadPart;
+    auto us = [&](uint64_t t, uint32_t n) {
+        return n ? (uint32_t)(t * 1000000ull / hz / n) : 0u;
+    };
+    log_printf("[perf-bp] save us: walk=%u link=%u slot=%u | load us: slots=%u "
+               "free=%u | slots=%u live=%u free=%u blocks=%u\n",
+               us(g_prof.walk, g_prof.nsave), us(g_prof.link, g_prof.nsave),
+               us(g_prof.slot, g_prof.nsave), us(g_prof.lload, g_prof.nload),
+               us(g_prof.lfree, g_prof.nload),
+               g_prof.slots, g_prof.live, g_prof.freec, g_prof.blocks);
+    static int nrep = 0;
+    if ((nrep++ % 4) == 0) log_peaks();
+    g_prof = BpProf{};
+}
+
+// Per-pool high-water live-slot count. pregrow() sizes EVERY pool to the same
+// ~2016 slots, so the walk, the bitmap and the relink are all paid on ~46,400
+// slots when the match only ever allocates ~3,000. This is the data needed to
+// size each pool individually instead of uniformly; it costs one compare per
+// pool per save.
+static uint32_t g_peak_live[64];
+static uint32_t g_peak_slots[64];
+
+static void log_peaks() {
+    for (int i = 0; i < NPOOL; ++i)
+        log_printf("[bppeak] %-22s peak_live=%u slots=%u\n",
+                   g_pool_rva[i].name, g_peak_live[i], g_peak_slots[i]);
+}
+
 static const int NCS_MAX = 2048;
 static const uint8_t* g_ncs_lo[NCS_MAX];
 static const uint8_t* g_ncs_hi[NCS_MAX];
@@ -272,6 +325,30 @@ static void ncs_push(const uint8_t* lo, const uint8_t* hi) {
     }
 }
 
+// SQUIROLL_BPCANON=0 restores the pre-2026-09-08 format (free list emitted as
+// an address array, in whatever order the allocator left it). Kept only as the
+// A/B arm for the measurement; the canonical path is the default.
+static bool canon_on() {
+    static int v = -1;
+    if (v < 0) { char b[8] = {0};
+        v = (GetEnvironmentVariableA("SQUIROLL_BPCANON", b, sizeof b) > 0 &&
+             b[0] == '0') ? 0 : 1; }
+    return v != 0;
+}
+// SQUIROLL_BPVALIDATE=1 keeps the save/load round-trip self-test running for
+// the whole session instead of the first 24 loads, and cross-checks the
+// canonical rewrite against a second independent walk. Rule from
+// docs/INSTRUMENTATION.md: develop state-serialisation changes against the
+// SOLO rig with this on, where a mistake is a log line and not a cross-peer
+// desync three minutes into a dual run.
+static bool validate_on() {
+    static int v = -1;
+    if (v < 0) { char b[8] = {0};
+        v = (GetEnvironmentVariableA("SQUIROLL_BPVALIDATE", b, sizeof b) > 0 &&
+             b[0] != '0') ? 1 : 0; }
+    return v != 0;
+}
+
 uint32_t save(uint8_t* out, uint32_t cap) {
     uint8_t* p   = out;
     uint8_t* end = out + cap;
@@ -282,47 +359,129 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         return true;
     };
 
-    uint32_t magic = POOL_MAGIC, npool = NPOOL;
+    const bool canon = canon_on();
+    const bool vald  = validate_on();
+    uint32_t magic = canon ? POOL_MAGIC_C : POOL_MAGIC, npool = NPOOL;
     if (!put(&magic, 4) || !put(&npool, 4)) return 0;
 
+    uint32_t st_slots = 0, st_live = 0, st_free = 0, st_blocks = 0;
     g_ncs_n = 0;
     for (int i = 0; i < NPOOL; ++i) {
         const uint8_t* pool_rec_start = p;
         Pool* pl = pool_at(i);
-        if (!put(pl, sizeof(Pool))) return 0;
         uint32_t ss = pl->slot_size;
 
         // Enumerate blocks: base address + cumulative slot index + slot count.
         struct Blk { uint32_t addr, size, base_idx, nslots; };
         Blk blk[32];
-        uint32_t nblk = 0, total = 0;
+        uint32_t nblk = 0, total = 0, nblk_seen = 0;
         for_each_block(pl, [&](uint32_t b, uint32_t s) {
+            ++nblk_seen;
             if (nblk >= 32) return;
             uint32_t ns = ss ? (s - 8) / ss : 0;
             blk[nblk] = { b, s, total, ns };
             total += ns;
             ++nblk;
         });
+        if (nblk_seen > 32) {
+            // Would silently drop the tail of the pool from BOTH the live set
+            // and the free list — the exact shape of a wrong state
+            // serialisation. Fail the save instead.
+            log_printf("[battle_pools] !! %s has %u blocks (>32) — save aborted\n",
+                       g_pool_rva[i].name, nblk_seen);
+            return 0;
+        }
         if (total > MAXSLOT) return 0;
-        // MEASURED 2026-09-06: these pools hold ~46,400 slots totalling ~13.6 MB,
-        // of which only ~3,000 (~400 KB) are live. So the free list this walk
-        // chases has ~43,000 nodes, and emitting it costs ~172 KB of the ~400 KB
-        // blob. That is why the walk below, not the slot copy, is the single
-        // largest item in the frame. It also rules out the obvious "just memcpy
-        // whole blocks" rewrite: that would make the blob 13.6 MB per save.
+        st_slots += total; st_blocks += nblk;
+        if (i < 64) g_peak_slots[i] = total;
 
         // Mark every free slot in the bitmap by walking the free list.
+        //
+        // MEASURED: these pools hold ~46,400 slots totalling ~13.6 MB, of which
+        // only ~3,000 are live, so this chase covers ~43,000 nodes and used to
+        // be the single largest item in the frame. It is a dependent load per
+        // node, so its cost is set by how scrambled the list is — which is why
+        // the canonical rewrite below pays for itself twice: it removes the
+        // second chase AND leaves this one walking in ascending address order,
+        // where the hardware prefetcher can work.
+        const uint64_t t_walk0 = qpc();
         memset(g_freebits, 0, (total + 7) / 8);
+        uint32_t walked = 0, mapped = 0;
         for (uint32_t fa = pl->free_head, guard = 0; fa && guard <= total; ++guard) {
+            ++walked;
             for (uint32_t b = 0; b < nblk; ++b) {
                 if (fa >= blk[b].addr && fa < blk[b].addr + blk[b].nslots * ss) {
                     uint32_t idx = blk[b].base_idx + (fa - blk[b].addr) / ss;
                     g_freebits[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+                    ++mapped;
                     break;
                 }
             }
             fa = *(const uint32_t*)(uintptr_t)fa;
         }
+        g_prof.walk += qpc() - t_walk0;
+        if (walked != mapped) {
+            // A node outside every block: the canonical rewrite would drop it,
+            // which changes what the allocator hands out. Refuse rather than
+            // quietly repair.
+            log_printf("[battle_pools] !! %s free list has %u node(s) outside its "
+                       "blocks (walked=%u) — save aborted\n",
+                       g_pool_rva[i].name, walked - mapped, walked);
+            return 0;
+        }
+
+        // Canonical rewrite. The free list's ORDER is real state — it decides
+        // which slot the next allocation returns, and a re-simulation has to
+        // hand out the same ones — but it is order we are free to CHOOSE, as
+        // long as both peers and both timelines choose identically. Rewriting
+        // it into ascending slot-index order at every save makes it a pure
+        // function of the free SET, so the blob carries a 1-bit-per-slot
+        // bitmap (~5.8 KB) instead of ~43,000 addresses (~172 KB), the load
+        // relinks with one ascending pass instead of a pointer chase, and the
+        // next save's walk above runs in address order.
+        //
+        // Ascending SLOT INDEX, not ascending address: the index is
+        // (block position in the chain, slot within block), which is identical
+        // on both peers by construction, whereas addresses need not be.
+        // Writes are elided when the link is already correct — after the first
+        // save most of the list already is.
+        const uint64_t t_link0 = qpc();
+        uint32_t freec = 0;
+        if (canon) {
+            uint32_t prev = 0, head = 0;
+            for (uint32_t b = 0; b < nblk; ++b) {
+                const uint32_t a0 = blk[b].addr, n0 = blk[b].nslots;
+                uint32_t idx = blk[b].base_idx;
+                for (uint32_t k = 0; k < n0; ++k, ++idx) {
+                    if (!(g_freebits[idx >> 3] & (1u << (idx & 7)))) continue;
+                    const uint32_t sa = a0 + k * ss;
+                    if (prev) {
+                        uint32_t* lnk = (uint32_t*)(uintptr_t)prev;
+                        if (*lnk != sa) *lnk = sa;
+                    } else {
+                        head = sa;
+                    }
+                    prev = sa;
+                    ++freec;
+                }
+            }
+            if (prev) {
+                uint32_t* lnk = (uint32_t*)(uintptr_t)prev;
+                if (*lnk != 0) *lnk = 0;
+            }
+            pl->free_head = head;
+            if (vald && freec != walked)
+                log_printf("[bpvald] !! %s canon freec=%u != walked=%u\n",
+                           g_pool_rva[i].name, freec, walked);
+        } else {
+            freec = walked;
+        }
+        g_prof.link += qpc() - t_link0;
+        st_free += freec;
+
+        // The allocator struct goes in AFTER the rewrite so free_head matches
+        // the emitted bitmap.
+        if (!put(pl, sizeof(Pool))) return 0;
 
         // Block table.
         if (!put(&nblk, 4)) return 0;
@@ -339,6 +498,7 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         // Slots are make_shared records: object (and its vtable) at slot+0x10.
         // Render-tainted pools skip this — their whole record is excluded below
         // (inner spans first would also break the span list's ascending order).
+        const uint64_t t_slot0 = qpc();
         if (p + 4 > end) return 0;
         uint32_t* nlive = (uint32_t*)p; p += 4;
         uint32_t live = 0;
@@ -365,17 +525,26 @@ uint32_t save(uint8_t* out, uint32_t cap) {
             }
         }
         *nlive = live;
+        g_prof.slot += qpc() - t_slot0;
+        st_live += live;
+        if (i < 64 && live > g_peak_live[i]) g_peak_live[i] = live;
 
-        // The free list, in allocation order — 4 bytes per free slot.
-        if (p + 4 > end) return 0;
-        uint32_t* nfree = (uint32_t*)p; p += 4;
-        uint32_t freec = 0;
-        for (uint32_t fa = pl->free_head, guard = 0; fa && guard <= total; ++guard) {
-            if (!put(&fa, 4)) return 0;
-            ++freec;
-            fa = *(const uint32_t*)(uintptr_t)fa;
+        // The free set. Canonical: [total][bitmap], one bit per slot, set =
+        // free — the order is implied. Legacy: [nfree] then one address each.
+        if (canon) {
+            const uint32_t nbytes = (total + 7) / 8;
+            if (!put(&total, 4) || !put(g_freebits, nbytes)) return 0;
+        } else {
+            if (p + 4 > end) return 0;
+            uint32_t* nfree = (uint32_t*)p; p += 4;
+            uint32_t fc = 0;
+            for (uint32_t fa = pl->free_head, guard = 0; fa && guard <= total; ++guard) {
+                if (!put(&fa, 4)) return 0;
+                ++fc;
+                fa = *(const uint32_t*)(uintptr_t)fa;
+            }
+            *nfree = fc;
         }
-        *nfree = freec;
 
         // Render-tainted pools: the RENDERER writes into these objects
         // (Camera2D/3D are ConnectRenderSlot'ed — the forward-only draw pass
@@ -396,6 +565,11 @@ uint32_t save(uint8_t* out, uint32_t cap) {
     if (!put((const void*)ACTOR_MGR_ADDR, ACTOR_MGR_BYTES)) return 0;
     uint32_t idb = *(const uint32_t*)ACTOR_ID_CTR_B;
     if (!put(&idb, 4)) return 0;
+
+    g_prof.slots = st_slots; g_prof.live = st_live;
+    g_prof.freec = st_free;  g_prof.blocks = st_blocks;
+    ++g_prof.nsave;
+    prof_report();
     return (uint32_t)(p - out);
 }
 
@@ -681,7 +855,8 @@ void load(const uint8_t* blob, uint32_t len) {
 
     uint32_t magic = 0, npool = 0;
     get_u32(magic); get_u32(npool);
-    if (magic != POOL_MAGIC || npool != (uint32_t)NPOOL) {
+    const bool canon = (magic == POOL_MAGIC_C);
+    if ((magic != POOL_MAGIC && !canon) || npool != (uint32_t)NPOOL) {
         log_printf("[battle_pools] load: bad header magic=%08x npool=%u\n",
                    magic, npool);
         return;
@@ -692,16 +867,22 @@ void load(const uint8_t* blob, uint32_t len) {
         if (!get(&saved, sizeof(Pool))) return;
         uint32_t ss = saved.slot_size;
 
-        // Block table — addresses are match-stable (pre-grown, never freed);
-        // read past it (validation only — restore is by absolute slot addr).
+        // Block table. The canonical format needs it (the free set is by slot
+        // index, so index -> address is resolved here); the legacy format
+        // restored by absolute address and read past it.
+        struct Blk { uint32_t addr, nslots; };
+        Blk blk[32];
         uint32_t nblk = 0;
         if (!get_u32(nblk)) return;
+        if (nblk > 32) return;
         for (uint32_t b = 0; b < nblk; ++b) {
-            uint32_t a = 0, s = 0;
-            if (!get_u32(a) || !get_u32(s)) return;
+            uint32_t a = 0, sz = 0;
+            if (!get_u32(a) || !get_u32(sz)) return;
+            blk[b] = { a, ss ? (sz - 8) / ss : 0 };
         }
 
         // Live slots — memcpy each back to its stable address.
+        const uint64_t t_l0 = qpc();
         uint32_t nlive = 0;
         if (!get_u32(nlive)) return;
         for (uint32_t k = 0; k < nlive; ++k) {
@@ -711,19 +892,52 @@ void load(const uint8_t* blob, uint32_t len) {
             if (!bp_wp("bppool", sa, ss)) memcpy((void*)(uintptr_t)sa, p, ss);
             p += ss;
         }
+        g_prof.lload += qpc() - t_l0;
 
-        // Free list — relink each free slot's first dword to the next, so the
-        // allocator hands out slots in the exact saved order on re-sim.
-        uint32_t nfree = 0;
-        if (!get_u32(nfree)) return;
-        uint32_t prev = 0;
-        for (uint32_t k = 0; k < nfree; ++k) {
-            uint32_t fa = 0;
-            if (!get_u32(fa)) return;
-            if (prev) *(uint32_t*)(uintptr_t)prev = fa;
-            prev = fa;
+        // Free list. Canonical: the saved bitmap is walked in ascending slot
+        // index and each free slot's first dword is pointed at the next one —
+        // one forward pass with a predictable stride, where the legacy format
+        // had to chase the saved address array. Writes are elided when the
+        // link already holds the right value, which after a short rollback is
+        // almost all of them.
+        const uint64_t t_f0 = qpc();
+        if (canon) {
+            uint32_t total = 0;
+            if (!get_u32(total)) return;
+            const uint32_t nbytes = (total + 7) / 8;
+            if (p + nbytes > end) return;
+            const uint8_t* bits = p; p += nbytes;
+            uint32_t prev = 0, idx = 0;
+            for (uint32_t b = 0; b < nblk; ++b) {
+                const uint32_t a0 = blk[b].addr, n0 = blk[b].nslots;
+                for (uint32_t k = 0; k < n0; ++k, ++idx) {
+                    if (idx >= total) break;
+                    if (!(bits[idx >> 3] & (1u << (idx & 7)))) continue;
+                    const uint32_t sa = a0 + k * ss;
+                    if (prev) {
+                        uint32_t* lnk = (uint32_t*)(uintptr_t)prev;
+                        if (*lnk != sa) *lnk = sa;
+                    }
+                    prev = sa;
+                }
+            }
+            if (prev) {
+                uint32_t* lnk = (uint32_t*)(uintptr_t)prev;
+                if (*lnk != 0) *lnk = 0;
+            }
+        } else {
+            uint32_t nfree = 0;
+            if (!get_u32(nfree)) return;
+            uint32_t prev = 0;
+            for (uint32_t k = 0; k < nfree; ++k) {
+                uint32_t fa = 0;
+                if (!get_u32(fa)) return;
+                if (prev) *(uint32_t*)(uintptr_t)prev = fa;
+                prev = fa;
+            }
+            if (prev) *(uint32_t*)(uintptr_t)prev = 0;
         }
-        if (prev) *(uint32_t*)(uintptr_t)prev = 0;
+        g_prof.lfree += qpc() - t_f0;
 
         // Restore the allocator struct (free_head, chain, counters) last.
         *pool_at(i) = saved;
@@ -735,25 +949,33 @@ void load(const uint8_t* blob, uint32_t len) {
     uint32_t idb = 0;
     if (!get_u32(idb)) return;
     *(uint32_t*)ACTOR_ID_CTR_B = idb;
+    ++g_prof.nload;
 
-    // DIAGNOSTIC: re-serialise from the just-restored pools and compare to the
-    // blob — a mismatch means save/load is not a faithful round-trip. Capped;
-    // the blob is now ~0.4 MB so this is cheap.
+    // Re-serialise from the just-restored pools and compare to the blob — a
+    // mismatch means save/load is not a faithful round-trip. This is THE
+    // oracle for any change to this file: it catches a wrong free set or a
+    // wrong live set here, as a log line, instead of as a cross-peer desync or
+    // an `eip` inside the pool region minutes later. Capped at 24 loads by
+    // default (the blob is ~0.25 MB, so it is cheap but not free);
+    // SQUIROLL_BPVALIDATE=1 runs it for the whole session.
     static int bp_selftest = 24;
-    if (bp_selftest > 0) {
-        --bp_selftest;
+    if (bp_selftest > 0 || validate_on()) {
+        if (bp_selftest > 0) --bp_selftest;
         static constexpr uint32_t RE_CAP = 24u * 1024 * 1024;
         static uint8_t* re = nullptr;
         if (!re) re = (uint8_t*)VirtualAlloc(nullptr, RE_CAP,
                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (re) {
+            // The self-test's own save() must not be counted in the profile.
+            const BpProf keep = g_prof;
             uint32_t rn = save(re, RE_CAP);
+            g_prof = keep;
             if (rn != len || memcmp(re, blob, len) != 0) {
                 uint32_t d = 0, m = rn < len ? rn : len;
                 while (d < m && re[d] == blob[d]) ++d;
                 log_printf("[bp] ROUND-TRIP FAIL len=%u vs %u  first-diff@%u\n",
                            len, rn, d);
-            } else {
+            } else if (!validate_on()) {
                 log_printf("[bp] round-trip OK (%u bytes)\n", len);
             }
         }
@@ -1033,6 +1255,12 @@ void diff_locate(int frame, int rb) {
 // address / field offset (save() format: [magic][npool] then per pool
 // [Pool][nblk][nblk*(addr,size)][nlive][nlive*(addr,slot_bytes)][nfree][...]).
 namespace {
+// Free-section size in a save() blob. Canonical ('POOC'): [total][bitmap],
+// one bit per slot. Legacy ('POOL'): [nfree][nfree x addr].
+static inline uint32_t free_sect_bytes(const uint8_t* b, uint32_t off, bool canon) {
+    uint32_t n = *(const uint32_t*)(b + off);
+    return canon ? 4 + (n + 7) / 8 : 4 + n * 4;
+}
 // Walk the save() blob (fwd's structure) and report EVERY diverging live slot
 // (pool / slot real address / first diverging field + value), capped. Reporting
 // all -- not just the first -- shows whether the actor (Actor2D, late in the
@@ -1040,6 +1268,7 @@ namespace {
 // own. Requires matching structure (same liveness); a length mismatch is noted
 // by the caller and the walk is best-effort.
 void bplive_decode(const uint8_t* fwd, const uint8_t* re, uint32_t len) {
+    const bool canon = (*(const uint32_t*)fwd == POOL_MAGIC_C);
     uint32_t off = 8;  // skip [magic][npool]
     int reports = 0;
     for (int i = 0; i < NPOOL && reports < 14; ++i) {
@@ -1080,7 +1309,7 @@ void bplive_decode(const uint8_t* fwd, const uint8_t* re, uint32_t len) {
             off = bytes0 + ss;
         }
         if (off + 4 > len) break;
-        uint32_t nfree = *(const uint32_t*)(fwd + off); off += 4 + nfree * 4;
+        off += free_sect_bytes(fwd, off, canon);
     }
 }
 }  // namespace
@@ -1095,6 +1324,7 @@ void bplive_decode(const uint8_t* fwd, const uint8_t* re, uint32_t len) {
 void diff_report(const uint8_t* fwd, const uint8_t* re, uint32_t len) {
     if (!fwd || !re || len < 8) { log_printf("[bpreport] no stash pair\n"); return; }
     log_printf("[bpreport] ==== bp divergence report (%u bytes) ====\n", len);
+    const bool canon = (*(const uint32_t*)fwd == POOL_MAGIC_C);
     uint32_t off = 8;  // skip [magic][npool]
     int slots_reported = 0, unknown_dwords = 0, known_dwords = 0;
     for (int i = 0; i < NPOOL; ++i) {
@@ -1166,15 +1396,17 @@ void diff_report(const uint8_t* fwd, const uint8_t* re, uint32_t len) {
             }
         }
         if (off + 4 > len) break;
-        uint32_t nfree = *(const uint32_t*)(fwd + off);
-        uint32_t fl0 = off + 4;
-        off = fl0 + nfree * 4;
-        // Free-list divergence = allocation-ORDER divergence (real sim signal).
-        if (off <= len && memcmp(fwd + fl0, re + fl0, nfree * 4) != 0) {
+        const uint32_t nfree = *(const uint32_t*)(fwd + off);
+        const uint32_t fl0   = off + 4;
+        const uint32_t flen  = free_sect_bytes(fwd, off, canon) - 4;
+        off = fl0 + flen;
+        // Free-SET divergence (canonical) or allocation-ORDER divergence
+        // (legacy) — either way a real sim signal, not render noise.
+        if (off <= len && memcmp(fwd + fl0, re + fl0, flen) != 0) {
             ++unknown_dwords;
-            log_printf("[bpreport] pool='%s' FREE-LIST diverges (%u entries) — "
-                       "allocation-order nondeterminism ** UNKNOWN **\n",
-                       nm, nfree);
+            log_printf("[bpreport] pool='%s' FREE-%s diverges (%u slots) — "
+                       "allocation nondeterminism ** UNKNOWN **\n",
+                       nm, canon ? "SET" : "LIST", nfree);
         }
     }
 done:

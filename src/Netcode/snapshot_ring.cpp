@@ -1410,7 +1410,13 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
                     sn[pg >> 3] |= (uint8_t)(1u << (pg & 7));
                     memcpy(A.base   + off, pre, PAGE);   // live  -> frame target
                     memcpy(A.mirror + off, pre, PAGE);   // mirror tracks live
-                    A.phash[pg] = hash_page(pre);
+                    // Same gate as capture(): the per-page hash feeds only
+                    // fold_checksum and the divergence diagnostics, and dual
+                    // netplay uses the STRUCTURAL cross-peer checksum instead
+                    // (raw page hashes are pointer-contaminated across
+                    // processes). Hashing every restored page for a value
+                    // nothing reads was ~0.7 us x every unique rolled-back page.
+                    if (g_want_raw_cs) A.phash[pg] = hash_page(pre);
                 }
                 dp += REC;
             }
