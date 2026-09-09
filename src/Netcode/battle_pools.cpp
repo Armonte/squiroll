@@ -597,22 +597,39 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         // attempt, so it stayed wherever the very first pre-canonical save put
         // it and the partition only trimmed 21%.)
         const uint32_t Wwalk = W;
-        uint32_t newW = W;
+        uint32_t newW = W, blob_w = 0;
         if (total) {
             uint32_t maxlive = 0; bool any = false;
             for (uint32_t idx = Wwalk + 1; idx-- > 0; )
                 if (!(g_freebits[idx >> 3] & (1u << (idx & 7)))) {
                     maxlive = idx; any = true; break;
                 }
+            if (i < 64) g_maxlive[i] = any ? maxlive : 0;
+
+            // THE BOUNDARY THAT GOES IN THE BLOB is the highest live index, and
+            // nothing else. It has to be a pure function of the free SET: the
+            // forward sim and a re-simulation of the same frame must emit
+            // byte-identical records, and so must two peers. An earlier version
+            // emitted the hysteretic boundary below, which depends on where the
+            // boundary happened to be and on whether this save did a full walk
+            // -- history, not state -- so save/load/save did not round-trip and
+            // two timelines could have emitted different-length bitmaps for the
+            // same simulation. The round-trip self-test caught it; nothing else
+            // would have, until a desync.
+            blob_w = any ? maxlive : 0;
+
+            // The boundary we WALK and lay the chain out to is separate, and may
+            // be hysteretic, because it is not observable: the list is ascending
+            // over every free slot however it is split, so free_head and the
+            // whole allocation order come out identical either way. Grow freely;
+            // shrink only once it is a quarter too big, since a shrink has to
+            // rewrite the chain over the range it gives back.
             uint64_t nw = any ? (uint64_t)maxlive + maxlive / 2 + 64 : 64;
             if (nw >= total) nw = total - 1;
             const uint32_t target = (uint32_t)nw;
-            if (i < 64) g_maxlive[i] = any ? maxlive : 0;
-            // Grow freely; shrink only once the boundary is a quarter too big,
-            // because a shrink has to rewrite the cold chain over the whole
-            // range it gives back. Hysteresis keeps that off the per-frame path.
-            if (covered_all)                    newW = target;
+            if (covered_all)                       newW = target;
             else if (target < Wwalk - (Wwalk >> 2)) newW = target;
+            if (newW < blob_w) newW = blob_w;      // the chain must reach the last live slot
         }
         // The chain has to be rewritten end to end whenever the cold tail moves.
         const bool rewrite_all = covered_all || newW != Wwalk;
@@ -673,7 +690,7 @@ uint32_t save(uint8_t* out, uint32_t cap) {
             // clobber it (the chain only ever touches offset 0).
             if (cold_head) *(uint32_t*)(uintptr_t)(cold_head + 4) = COLD_MAGIC;
             pc.valid = true; pc.total = total; pc.w = newW; pc.coldw = newW;
-            if (vald && !covered_all && freec != mapped)
+            if (vald && !covered_all && newW == Wwalk && freec != mapped)
                 log_printf("[bpvald] !! %s canon hotfree=%u != walked=%u\n",
                            g_pool_rva[i].name, freec, mapped);
         } else {
@@ -714,7 +731,7 @@ uint32_t save(uint8_t* out, uint32_t cap) {
             const uint32_t b = bi;
             for (uint32_t j = 0; j < blk[b].nslots; ++j) {
                 uint32_t idx = blk[b].base_idx + j;
-                if (idx > newW) { live_done = true; break; }   // cold tail: all free
+                if (idx > blob_w) { live_done = true; break; }  // above the last live slot
                 if (g_freebits[idx >> 3] & (1u << (idx & 7))) continue;  // free
                 uint32_t sa = blk[b].addr + j * ss;
                 if (!put(&sa, 4) || !put((const void*)(uintptr_t)sa, ss)) return 0;
@@ -741,9 +758,17 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         // [0, w]], bit set = free; every slot above w is free by construction
         // and the order is implied. Legacy: [nfree] then one address each.
         if (canon) {
-            const uint32_t nbits  = total ? newW + 1 : 0;
+            const uint32_t nbits  = total ? blob_w + 1 : 0;
             const uint32_t nbytes = (nbits + 7) / 8;
-            if (!put(&total, 4) || !put(&newW, 4)) return 0;
+            // Mask the padding bits above w in the last byte. The walk marks
+            // every free slot up to the LOCAL boundary, which runs past w, so
+            // those bits carry whatever the local boundary happened to expose
+            // -- history again, not state, and the record has to be a pure
+            // function of the free set. The round-trip self-test caught this
+            // as 'ActorCollisionData free set (bitmap) saved F8 vs re-saved 00'.
+            if (const uint32_t stray = nbits & 7)
+                g_freebits[nbytes - 1] &= (uint8_t)((1u << stray) - 1);
+            if (!put(&total, 4) || !put(&blob_w, 4)) return 0;
             if (nbytes && !put(g_freebits, nbytes)) return 0;
         } else {
             if (p + 4 > end) return 0;
@@ -1053,6 +1078,71 @@ void log_fingerprint(const char* tag) {
     }
 }
 
+// Free-section size in a save() blob. Canonical ('POOC'): [total][w][bitmap]
+// over slots [0,w]. Legacy ('POOL'): [nfree][nfree x addr].
+static inline uint32_t free_sect_bytes(const uint8_t* b, uint32_t off, bool canon) {
+    if (!canon) return 4 + *(const uint32_t*)(b + off) * 4;   // [nfree][addrs]
+    const uint32_t total = *(const uint32_t*)(b + off);       // [total][w][bits]
+    const uint32_t w     = *(const uint32_t*)(b + off + 4);
+    return 8 + ((total ? w + 1 : 0) + 7) / 8;
+}
+
+// Name a byte offset inside a save() blob: which pool record, and which part of
+// it. A round-trip failure that reports only "first-diff@201736" is not
+// actionable (rule 5 in docs/INSTRUMENTATION.md); this turns it into a pool
+// name and a field.
+static void describe_offset(const uint8_t* b, uint32_t len, uint32_t want,
+                            char* out, int outn) {
+    if (len < 8) { _snprintf(out, outn, "<short>"); return; }
+    const bool canon = (*(const uint32_t*)b == POOL_MAGIC_C);
+    uint32_t off = 8;
+    if (want < off) { _snprintf(out, outn, "header"); return; }
+    for (int i = 0; i < NPOOL; ++i) {
+        const uint32_t rec = off;
+        if (off + sizeof(Pool) + 4 > len) break;
+        const Pool* pl = (const Pool*)(b + off);
+        const uint32_t ss = pl->slot_size ? pl->slot_size : 1;
+        const char* nm = g_pool_rva[i].name;
+        off += sizeof(Pool);
+        if (want < off) {
+            _snprintf(out, outn, "pool '%s' Pool struct +%u", nm, want - rec);
+            return;
+        }
+        const uint32_t nblk = *(const uint32_t*)(b + off);
+        off += 4 + nblk * 8;
+        if (want < off) { _snprintf(out, outn, "pool '%s' block table", nm); return; }
+        if (off + 4 > len) break;
+        const uint32_t nlive = *(const uint32_t*)(b + off);
+        off += 4;
+        for (uint32_t k = 0; k < nlive; ++k) {
+            if (off + 4 + ss > len) { off = len; break; }
+            const uint32_t sa = *(const uint32_t*)(b + off);
+            if (want < off + 4 + ss) {
+                if (want < off + 4)
+                    _snprintf(out, outn, "pool '%s' live slot %u/%u ADDRESS",
+                              nm, k, nlive);
+                else
+                    _snprintf(out, outn, "pool '%s' live slot %u/%u @%08X +0x%X",
+                              nm, k, nlive, sa, want - (off + 4));
+                return;
+            }
+            off += 4 + ss;
+        }
+        if (off + 4 > len) break;
+        const uint32_t fs = free_sect_bytes(b, off, canon);
+        if (want < off + fs) {
+            if (canon)
+                _snprintf(out, outn, "pool '%s' free set (%s)", nm,
+                          want < off + 8 ? "total/w header" : "bitmap");
+            else
+                _snprintf(out, outn, "pool '%s' free list", nm);
+            return;
+        }
+        off += fs;
+    }
+    _snprintf(out, outn, "actor-manager tail (+%u)", want > off ? want - off : 0);
+}
+
 void load(const uint8_t* blob, uint32_t len) {
     if (len < 8) return;
     const uint8_t* p   = blob;
@@ -1123,41 +1213,45 @@ void load(const uint8_t* blob, uint32_t len) {
             const uint32_t nbytes = (nbits + 7) / 8;
             if (p + nbytes > end) return;
             const uint8_t* bits = p; p += nbytes;
-            // Rebuild the hot chain [0, w] in ascending order and hand off to
-            // the cold tail. The cold tail is rewritten only when the boundary
-            // it currently holds is not the one being restored -- that happens
-            // on the first restore, and whenever a rollback crosses a save
-            // where the working set grew. w is part of the blob precisely so
-            // both timelines partition the same way (see PoolCache).
+            // Rebuild the free list in ascending order and hand off to the
+            // cold tail, which is reused only if it verifies (see below).
             auto addr_of = [&](uint32_t x) -> uint32_t {
                 for (uint32_t b = 0; b < nblk; ++b)
                     if (x >= blk[b].base_idx && x < blk[b].base_idx + blk[b].nslots)
                         return blk[b].addr + (x - blk[b].base_idx) * ss;
                 return 0;
             };
-            const uint32_t cold_head = (w + 1 < total) ? addr_of(w + 1) : 0;
-
+            // `w` from the blob is the highest LIVE index (a pure function of
+            // the saved free set); everything above it was free at the save.
+            // The boundary the in-memory chain is laid out to is separate and
+            // local -- pc.coldw -- and the two need not agree: the rebuilt list
+            // is ascending over every free slot either way, so free_head and
+            // the allocation order are identical whichever split we use.
             PoolCache& pc = g_pc[i];
             // The cold tail may be reused as-is only if it is STILL the intact
-            // ascending chain someone wrote for this boundary. pc is our own
-            // bookkeeping and is NOT rolled back, so pc.coldw agreeing with the
-            // blob is not enough: if the hot range was exhausted between the
+            // ascending chain someone wrote for pc.coldw. pc is our own
+            // bookkeeping and is NOT rolled back, so a matching boundary proves
+            // nothing about memory: if the hot range was exhausted between the
             // save being restored and now -- a round-end burst does exactly
-            // that -- the game allocated out of the cold tail, and those slots
-            // now hold live objects. Relinking the hot chain's tail onto slot
-            // w+1 would then splice the free list into a live object and hand
-            // the same memory out twice. Verify the sentinel and the first link
-            // the same way save()'s chase does, and rewrite the whole chain
-            // when either fails.
-            bool cold_intact = pc.valid && pc.total == total && pc.coldw == w;
-            if (cold_intact && cold_head) {
-                const uint32_t cold_second = (w + 2 < total) ? addr_of(w + 2) : 0;
-                const uint32_t link = *(const uint32_t*)(uintptr_t)cold_head;
-                const uint32_t mag  = *(const uint32_t*)(uintptr_t)(cold_head + 4);
-                if (mag != COLD_MAGIC || link != cold_second) cold_intact = false;
+            // that -- the game allocated out of the cold tail and those slots
+            // hold live objects. Relinking onto them would splice the free list
+            // through a live object and hand the same memory out twice. Verify
+            // the sentinel and the first link the way save()'s chase does.
+            bool cold_intact = pc.valid && pc.total == total && pc.coldw < total;
+            uint32_t tail_at = cold_intact ? pc.coldw : 0;
+            if (cold_intact && tail_at + 1 < total) {
+                const uint32_t c1 = addr_of(tail_at + 1);
+                const uint32_t c2 = (tail_at + 2 < total) ? addr_of(tail_at + 2) : 0;
+                const uint32_t link = *(const uint32_t*)(uintptr_t)c1;
+                const uint32_t mag  = *(const uint32_t*)(uintptr_t)(c1 + 4);
+                if (mag != COLD_MAGIC || link != c2) cold_intact = false;
             }
+            // Rebuild at least as far as the last live slot the blob describes.
             const bool need_cold = !cold_intact;
-            const uint32_t cbound = need_cold ? (total ? total - 1 : 0) : w;
+            uint32_t cbound = need_cold ? (total ? total - 1 : 0)
+                                        : (tail_at > w ? tail_at : w);
+            if (total && cbound > total - 1) cbound = total - 1;
+            const uint32_t cold_head = (cbound + 1 < total) ? addr_of(cbound + 1) : 0;
             const uint32_t tail_link = need_cold ? 0 : cold_head;
             uint32_t prev = 0, idx = 0;
             bool done = false;
@@ -1180,7 +1274,7 @@ void load(const uint8_t* blob, uint32_t len) {
                 if (*lnk != tail_link) *lnk = tail_link;
             }
             if (cold_head) *(uint32_t*)(uintptr_t)(cold_head + 4) = COLD_MAGIC;
-            pc.valid = true; pc.total = total; pc.w = w; pc.coldw = w;
+            pc.valid = true; pc.total = total; pc.w = cbound; pc.coldw = cbound;
         } else {
             uint32_t nfree = 0;
             if (!get_u32(nfree)) return;
@@ -1229,8 +1323,15 @@ void load(const uint8_t* blob, uint32_t len) {
             if (rn != len || memcmp(re, blob, len) != 0) {
                 uint32_t d = 0, m = rn < len ? rn : len;
                 while (d < m && re[d] == blob[d]) ++d;
-                log_printf("[bp] ROUND-TRIP FAIL len=%u vs %u  first-diff@%u\n",
-                           len, rn, d);
+                char what[128] = {0};
+                describe_offset(blob, len, d, what, sizeof what);
+                log_printf("[bp] ROUND-TRIP FAIL len=%u vs %u  first-diff@%u "
+                           "in %s  (saved %02X%02X%02X%02X vs re-saved "
+                           "%02X%02X%02X%02X)\n", len, rn, d, what,
+                           blob[d], d+1<len?blob[d+1]:0, d+2<len?blob[d+2]:0,
+                           d+3<len?blob[d+3]:0,
+                           re[d], d+1<rn?re[d+1]:0, d+2<rn?re[d+2]:0,
+                           d+3<rn?re[d+3]:0);
             } else if (!validate_on()) {
                 log_printf("[bp] round-trip OK (%u bytes)\n", len);
             }
@@ -1511,14 +1612,6 @@ void diff_locate(int frame, int rb) {
 // address / field offset (save() format: [magic][npool] then per pool
 // [Pool][nblk][nblk*(addr,size)][nlive][nlive*(addr,slot_bytes)][nfree][...]).
 namespace {
-// Free-section size in a save() blob. Canonical ('POOC'): [total][bitmap],
-// one bit per slot. Legacy ('POOL'): [nfree][nfree x addr].
-static inline uint32_t free_sect_bytes(const uint8_t* b, uint32_t off, bool canon) {
-    if (!canon) return 4 + *(const uint32_t*)(b + off) * 4;   // [nfree][addrs]
-    const uint32_t total = *(const uint32_t*)(b + off);       // [total][w][bits]
-    const uint32_t w     = *(const uint32_t*)(b + off + 4);
-    return 8 + ((total ? w + 1 : 0) + 7) / 8;
-}
 // Walk the save() blob (fwd's structure) and report EVERY diverging live slot
 // (pool / slot real address / first diverging field + value), capped. Reporting
 // all -- not just the first -- shows whether the actor (Actor2D, late in the

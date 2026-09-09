@@ -62,6 +62,10 @@ static constexpr int      NCLS       = CLS_MAX_SH - CLS_MIN_SH + 1;
 static constexpr uint32_t HDR_MAGIC  = 0x42504143;  // 'CAPB' — allocated block
 static constexpr uint32_t META_MAGIC = 0x4D504143;  // 'CAPM'
 
+static constexpr uint32_t PGSH = 12;
+static constexpr uint32_t PGSZ = 1u << PGSH;
+static constexpr uint32_t NPG  = ARENA_SIZE / PGSZ;   // 32768 pages
+
 // 16-byte block header; keeps the payload 16-byte aligned.
 struct Hdr {
     uint32_t cls;        // size-class shift, CLS_MIN_SH..CLS_MAX_SH
@@ -101,9 +105,18 @@ static constexpr uint32_t RENDER_BASE = 112u * 1024 * 1024;
 // Frames a freed block must sit dead before arena_alloc may hand it out again.
 static constexpr int32_t QUARANTINE_FRAMES = 90;
 
+// WRITE-WATCH QUERY NARROWING: TRIED, MEASURED, REVERTED. GetWriteWatch is
+// dominated by PER-CALL cost (~52 us/call) and not by the size of the range,
+// so asking about less memory in more ranges is a large loss -- narrowing the
+// cpp query from 91 MB in 1 range to 35 MB in 21 took getww from 380 us to
+// 1344 us. The measurement, and what it means for the budget, is in
+// docs/INSTRUMENTATION.md; SQUIROLL_ARENAMAP=1 below still reports coverage.
+
 static uint8_t* g_base      = nullptr;
 static Meta*    g_meta      = nullptr;
 static bool     g_installed = false;
+
+
 static bool     g_armed     = false;   // route operator new -> arena only while a match is armed
 static bool     g_resim     = false;   // a rollback re-simulation advance is in progress
 static uint32_t g_warn      = 8;
@@ -1799,9 +1812,6 @@ const char* region_of(const void* p) {
     if (!in_arena(p)) return "none";
     return ((const uint8_t*)p - g_base) >= RENDER_BASE ? "render" : "sim";
 }
-// Quarantine clock: once per sim advance (forward AND re-sim — Meta is rewound
-// with the snapshot, so the re-sim replays the same values) and once per vanilla
-// frame during the round transition (pre_arm_poll).
 // MEASUREMENT (SQUIROLL_ARENAMAP=1, one shot): how much of the SIM bump could
 // the dirty-page query actually skip?
 //
