@@ -1802,6 +1802,70 @@ const char* region_of(const void* p) {
 // Quarantine clock: once per sim advance (forward AND re-sim — Meta is rewound
 // with the snapshot, so the re-sim replays the same values) and once per vanilla
 // frame during the round transition (pre_arm_poll).
+// MEASUREMENT (SQUIROLL_ARENAMAP=1, one shot): how much of the SIM bump could
+// the dirty-page query actually skip?
+//
+// GetWriteWatch is charged per page of the range it is ASKED about, and
+// snapshot_ring asks about [0, bump) -- 91 MB -- twice a frame, ~550 us, to
+// find about 70 dirty pages. The arena reports live=16.6 MB against a 94 MB
+// bump, so most of that range is dead setup allocation that can never be
+// written again. Whether narrowing the query is worth building depends on
+// whether the LIVE blocks are clustered or smeared across the whole bump, so
+// walk the block chain once and count the pages that hold at least one live
+// block, plus the coalesced range count at a few merge gaps.
+void map_live_pages() {
+    if (!g_meta) return;
+    static constexpr uint32_t PG = 4096;
+    const uint32_t bump = g_meta->bump;
+    static uint8_t seen[(ARENA_SIZE / PG) / 8];
+    memset(seen, 0, sizeof seen);
+    uint32_t off = (sizeof(Meta) + 15u) & ~15u;   // first block — see install()
+    uint32_t nblk = 0, nlive = 0, livebytes = 0, bad = 0;
+    // Blocks are power-of-two sized and laid down contiguously from the bump,
+    // so the region is walkable header to header.
+    while (off + sizeof(Hdr) <= bump) {
+        const Hdr* h = (const Hdr*)(g_base + off);
+        if (h->cls < (uint32_t)CLS_MIN_SH || h->cls > (uint32_t)CLS_MAX_SH) {
+            ++bad;
+            log_printf("[arenamap] walk stopped at off=%u (cls=%u) after %u blocks\n",
+                       off, h->cls, nblk);
+            break;
+        }
+        const uint32_t blk = 1u << h->cls;
+        ++nblk;
+        if (h->magic == HDR_MAGIC) {
+            ++nlive; livebytes += blk;
+            for (uint32_t a = off & ~(PG - 1); a < off + blk; a += PG) {
+                const uint32_t pg = a / PG;
+                seen[pg >> 3] |= (uint8_t)(1u << (pg & 7));
+            }
+        }
+        off += blk;
+    }
+    const uint32_t npg = (bump + PG - 1) / PG;
+    uint32_t livepg = 0;
+    for (uint32_t pg = 0; pg < npg; ++pg)
+        if (seen[pg >> 3] & (1u << (pg & 7))) ++livepg;
+    log_printf("[arenamap] bump=%uKB blocks=%u live=%u (%uKB) live_pages=%u/%u "
+               "(%u%% of the query)\n", bump / 1024, nblk, nlive, livebytes / 1024,
+               livepg, npg, npg ? livepg * 100 / npg : 0);
+    for (uint32_t gap : { 1u, 8u, 64u, 512u }) {
+        uint32_t ranges = 0, covered = 0, run = 0, hole = 0;
+        bool in = false;
+        for (uint32_t pg = 0; pg < npg; ++pg) {
+            const bool live = (seen[pg >> 3] & (1u << (pg & 7))) != 0;
+            if (live) {
+                if (!in) { ++ranges; in = true; covered += hole; }
+                ++run; covered += 1; hole = 0;
+            } else if (in) {
+                if (++hole > gap) { in = false; hole = 0; }
+            }
+        }
+        log_printf("[arenamap]   merge_gap=%-4u ranges=%-5u queried=%uKB\n",
+                   gap, ranges, covered * 4);
+    }
+}
+
 void advance_frame() {
     if (!g_meta) return;
     ++g_meta->frame;

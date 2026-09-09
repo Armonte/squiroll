@@ -652,6 +652,8 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
         {   // one-shot: how much of each reservation we actually query
             static bool shown[NARENA] = {false};
             if (!shown[a] && frame > 60) {
+                if (a == CPP_ARENA && getenv("SQUIROLL_ARENAMAP"))
+                    cpp_arena::map_live_pages();
                 shown[a] = true;
                 uint32_t q = 0;
                 for (int u = 0; u < nur; ++u) q += ur[u].size;
