@@ -267,16 +267,57 @@ recurring classes. So ~1 MB of Squirrel VM state genuinely changes every frame
 and no single structure is responsible; the way to make it cheaper is to halve
 the per-page cost (the mirror indirection), not to reduce the page count.
 
-## Stability, as of 2026-09-08
+## Stability — and a correction to every number above it
 
-14 dual runs after the pool pass: 7 clean, 7 with one peer failing, and the
-failures cluster in runs that get past ~3100 frames (the third round
-transition). That is unchanged from before the pass — the pool work neither
-helped nor hurt it. The crash signatures (`__purecall`, `vtable=008451CC`,
-`ret=0046D9D7`, `region=none`, and a VEH access violation executing at a
-non-module address) are identical in the fast and slow arms, so this is a
-pre-existing class near the round seam and it is still open. An early "5 of 6
-clean" batch during this pass was small-sample noise; see rule 11.
+**The "crash class past ~3100 frames" was not past 3100 frames and was not a
+netcode failure.** Every stability figure quoted during this work counted it, so
+they are all wrong in the same direction.
+
+The fatal `__purecall` lands on the LAST FRAME OF THE RUN, whatever that number
+happens to be. Measured across four different exit budgets:
+
+| purecall | last frame | | purecall | last frame |
+|---|---|---|---|---|
+| 3210 | 3210 | | 2309 | 2310 |
+| 3181 | 3180 | | 2341 | 2340 |
+| 3202 | 3180 | | 3174 | 3150 |
+
+~3200 is just where a 60 s run lands. **desync was 0 in every run**, across
+dozens of runs and 2,300-3,570 frames each. The simulation is deterministic; the
+crash is in teardown.
+
+Three fixes were tried and none of them moved it: requesting a clean loop exit
+instead of `ExitProcess` from inside the tick, tearing the rollback stack down
+before `WM_DESTROY`, and enabling `SQUIROLL_GL_PIN`. The first two are kept as
+correct hygiene regardless.
+
+`SQUIROLL_GL_PIN` deserves its own warning: over 8 runs it looked like it halved
+the crash rate (4 of 8 against 7 of 8), and when the arms were **alternated** it
+showed no effect at all. That is rule 11's trap, walked into a second time in
+the same body of work. Alternate the arms.
+
+What the forensics did establish — the lead worth having — is that there are at
+least two signatures and one of them is **th155's own networking thread running
+on rolled-back memory**:
+
+    __purecall: this=34A5E710 vtable=0078B680 region=sim ret=0057770A
+    arena block payload=34A5E710 size=16 alloc_rva=00175E4B
+    boost thread_start -> thread_start_function -> ref_TF4::UDP_
+      -> reactor_process_or_initialize -> iocp_reactor_process_event
+      -> init_NetworkClient_obj_40 -> __purecall
+
+th155's boost.asio IOCP UDP reactor is neither the sim thread nor a
+deterministic worker, so anything of its that lives in `cpp_arena` is rewound
+underneath it by every rollback. It gets there through the pre-gate window:
+before `set_sim_thread`, `arena_alloc` admits every thread, which is exactly
+where another subsystem's long-lived objects get captured for the whole match.
+Excluding that one alloc site did not change the rate, so it is not the whole
+story.
+
+13. **Fix the anomaly criterion before quoting another stability number.**
+   `probe_stall.sh` flags a run when a peer does not log a clean exit or when
+   the crash log has any fatal signature — and the end-of-run teardown crash
+   trips both, in about half of all runs, regardless of what the netcode did.
 
 ## The rig
 
