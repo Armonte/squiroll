@@ -99,22 +99,104 @@ static constexpr uint32_t MAX_ARENA_BYTES = 144u * 1024 * 1024;   // headroom ov
 // background (audio/streaming decoder) thread that lives in the TF4 mspace, so
 // its cap is raised to 20 MB (~5100 records) to capture the whole region B
 // churn without the delta `break` that would leave it half-captured.
-static const uint32_t DELTA_CAP[NARENA] = { 8u * 1024 * 1024, 4u * 1024 * 1024,
-                                            8u * 1024 * 1024, 8u * 1024 * 1024,
-                                            20u * 1024 * 1024 };
+// Max delta RECORDS per arena per ring slot. Records are 8 bytes now (offset +
+// pool page index) rather than 4100, so this is kilobytes, not the 768 MB of
+// committed buffers the inline pre-images needed.
+static const uint32_t DELTA_MAXREC[NARENA] = { 8192, 4096, 8192, 8192, 24576 };
 static constexpr uint32_t SMALL_CAP = 4u * 1024 * 1024;
 
 // One dirty-page record in a delta buffer: [page-offset u32][PAGE bytes].
-static constexpr uint32_t REC = 4 + PAGE;
+// A delta record used to carry a 4 KB PRE-IMAGE inline. It now carries the
+// POOL PAGE INDEX of that pre-image instead: capture hands the outgoing mirror
+// page straight to the record and installs a fresh page in the mirror, so one
+// copy does the work of two. See the MIRROR PAGE POOL note below.
+static constexpr uint32_t REC = 8;
+static constexpr uint32_t NOPAGE = 0xFFFFFFFFu;
 
 struct Arena {
     uint8_t*  base;     // live arena base — the MEM_WRITE_WATCH region
-    uint8_t*  mirror;   // full-size shadow == arena state as of g_cur
+    uint32_t* mirror_pg;// npages page indices into g_pool — the shadow, one
+                        // page at a time, == arena state as of g_cur
     uint32_t  size;     // arena reserved size
     uint32_t  npages;
     uint32_t* phash;    // per-page hash, npages entries — tracks live state
 };
 static Arena  g_ar[NARENA];
+
+// ---------------------------------------------------------------------------
+// MIRROR PAGE POOL.
+//
+// Every dirty page used to be copied TWICE per capture (mirror -> delta, then
+// base -> mirror) and twice again per reverse-apply (pre -> base, pre ->
+// mirror). At ~280 dirty pages a frame that was ~520 us of capture and ~670 us
+// of restore, and the capture side is paid ~7x more often than the restore
+// side (see rule 12), so it was the largest item left in the frame.
+//
+// The mirror is now an array of PAGE INDICES rather than a flat buffer, over a
+// shared pool of 4 KB pages. That makes both directions a single copy:
+//
+//   capture: hand the outgoing mirror page to the delta record (no copy — the
+//            record IS the pre-image now) and install a fresh page holding the
+//            live bytes (one copy).
+//   restore: copy the pre-image into the arena (one copy) and ADOPT that same
+//            page as the new mirror page (no copy), releasing the one it
+//            replaces.
+//
+// Ownership: a page belongs to exactly one of {a mirror slot, one ring slot's
+// delta, the free list}. A ring slot releases everything it holds when it is
+// re-captured, and a record whose page the reverse-apply adopted is stamped
+// NOPAGE so that release skips it. This also replaces 768 MB of committed
+// per-slot delta buffers with one pool.
+static uint8_t*  g_pool_base  = nullptr;
+static uint32_t* g_pool_free  = nullptr;   // stack of free page indices
+static uint32_t  g_pool_pages = 0;
+static uint32_t  g_pool_nfree = 0;
+static uint32_t  g_pool_lowwater = 0xFFFFFFFFu;
+
+static inline uint8_t* pool_page(uint32_t idx) {
+    return g_pool_base + (size_t)idx * PAGE;
+}
+static inline uint32_t pool_take() {
+    if (!g_pool_nfree) return NOPAGE;
+    const uint32_t i = g_pool_free[--g_pool_nfree];
+    if (g_pool_nfree < g_pool_lowwater) g_pool_lowwater = g_pool_nfree;
+    return i;
+}
+static inline void pool_give(uint32_t idx) {
+    if (idx != NOPAGE && g_pool_nfree < g_pool_pages) g_pool_free[g_pool_nfree++] = idx;
+}
+// SQUIROLL_MIRRORCHK=N: audit page ownership every N captures.
+//
+// The failure mode the pool introduces is aliasing: a page owned by two mirror
+// slots, or by a mirror slot and a ring slot at once, or handed back to the
+// free list twice. That is silent — the arena keeps working and the snapshot
+// quietly restores the wrong bytes — so check it directly. Every page must
+// appear exactly once across {mirror slots, ring-slot records, free list}, and
+// the counts must add up to the pool.
+static int mirrorchk_every() {
+    static int v = -1;
+    if (v < 0) { char b[16] = {0}; v = 0;
+        if (GetEnvironmentVariableA("SQUIROLL_MIRRORCHK", b, sizeof b) > 0) {
+            for (const char* c = b; *c >= '0' && *c <= '9'; ++c) v = v * 10 + (*c - '0');
+            if (v <= 0) v = 60; } }
+    return v;
+}
+// The mirror page for the page containing `off`.
+static inline uint8_t* mpage(const Arena& A, uint32_t off) {
+    return pool_page(A.mirror_pg[off / PAGE]);
+}
+// Sub-page write into the mirror, split across page boundaries. Three callers
+// (the game-loop pin, the sync-primitive re-apply, the gl_sc preservation)
+// write arbitrary offsets and lengths; everything else is page-aligned.
+static void mirror_write(const Arena& A, uint32_t off, const void* src, uint32_t len) {
+    const uint8_t* s = (const uint8_t*)src;
+    while (len) {
+        const uint32_t in_pg = PAGE - (off & (PAGE - 1));
+        const uint32_t n = len < in_pg ? len : in_pg;
+        memcpy(mpage(A, off) + (off & (PAGE - 1)), s, n);
+        off += n; s += n; len -= n;
+    }
+}
 static bool   g_want_raw_cs = true;   // see set_want_raw_checksum
 static void** g_pgbuf = nullptr;   // GetWriteWatch address scratch
 
@@ -189,6 +271,44 @@ static uint32_t hash_page(const uint8_t* p) {
 // and every "ask about fewer pages" idea is dead. Run at arm, right after
 // ResetWriteWatch, so the dirty set is empty and we time the scan, not the
 // reporting. No WRITE_WATCH_FLAG_RESET: the bench must not consume state.
+static void pool_audit(uint32_t frame) {
+    if (!g_pool_base) return;
+    static uint8_t* seen = nullptr;
+    if (!seen) seen = (uint8_t*)VirtualAlloc(nullptr, (g_pool_pages + 7) / 8,
+                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!seen) return;
+    memset(seen, 0, (g_pool_pages + 7) / 8);
+    uint32_t dup = 0, oob = 0, n = 0;
+    auto mark = [&](uint32_t idx, const char* who) {
+        if (idx == NOPAGE) return;
+        if (idx >= g_pool_pages) { ++oob; return; }
+        if (seen[idx >> 3] & (1u << (idx & 7))) {
+            if (++dup <= 4)
+                log_printf("[mirrorchk] !! f=%u page %u owned twice (%s)\n",
+                           frame, idx, who);
+            return;
+        }
+        seen[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+        ++n;
+    };
+    for (int a = 0; a < NARENA; ++a) {
+        const Arena& A = g_ar[a];
+        if (!A.size || !A.mirror_pg) continue;
+        for (uint32_t pg = 0; pg < A.npages; ++pg) mark(A.mirror_pg[pg], "mirror");
+    }
+    for (int sI = 0; sI < RING; ++sI)
+        for (int a = 0; a < NARENA; ++a) {
+            const uint8_t* rp = g_ring[sI].delta[a];
+            if (!rp) continue;
+            for (uint32_t i = 0; i < g_ring[sI].dn[a]; ++i, rp += REC)
+                mark(*(const uint32_t*)(rp + 4), "delta");
+        }
+    for (uint32_t i = 0; i < g_pool_nfree; ++i) mark(g_pool_free[i], "freelist");
+    if (dup || oob || n != g_pool_pages)
+        log_printf("[mirrorchk] !! f=%u accounted %u of %u pages (%u dup, %u out of "
+                   "range, %u free)\n", frame, n, g_pool_pages, dup, oob, g_pool_nfree);
+}
+
 static void ww_bench(uint8_t* base, uint32_t size) {
     if (!base || size < PAGE) return;
     LARGE_INTEGER fr; QueryPerformanceFrequency(&fr);
@@ -331,6 +451,31 @@ void arm() {
         { tf4b_on ? tf4_arena::base(1) : nullptr, tf4b_on ? tf4_arena::size(1) : 0 },
     };
 
+    // The mirror pool: one page for every arena page, plus enough spare that
+    // every ring slot can hold a frame's worth of pre-images at once. A page is
+    // owned by a mirror slot, a ring slot, or the free list, so that bound is
+    // exact: npages + RING x peak-dirty-per-frame.
+    {
+        uint32_t total_pages = 0;
+        for (int a = 0; a < NARENA; ++a) total_pages += src[a].size / PAGE;
+        static constexpr uint32_t POOL_SPARE_PER_SLOT = 1536;
+        g_pool_pages = total_pages + RING * POOL_SPARE_PER_SLOT;
+        g_pool_base = (uint8_t*)VirtualAlloc(nullptr, (size_t)g_pool_pages * PAGE,
+                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        g_pool_free = (uint32_t*)VirtualAlloc(nullptr, g_pool_pages * 4,
+                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!g_pool_base || !g_pool_free) {
+            log_printf("[snapshot_ring] !! arm: mirror pool alloc failed (%u MB)\n",
+                       (uint32_t)(((size_t)g_pool_pages * PAGE) >> 20));
+            return;
+        }
+        for (uint32_t i = 0; i < g_pool_pages; ++i) g_pool_free[i] = g_pool_pages - 1 - i;
+        g_pool_nfree = g_pool_pages;
+        log_printf("[snapshot_ring] mirror pool %u MB (%u pages: %u resident + "
+                   "%u x %u spare)\n", (uint32_t)(((size_t)g_pool_pages * PAGE) >> 20),
+                   g_pool_pages, total_pages, (uint32_t)RING, POOL_SPARE_PER_SLOT);
+    }
+
     uint32_t maxpages = 0;
     for (int a = 0; a < NARENA; ++a) {
         Arena& A = g_ar[a];
@@ -340,7 +485,7 @@ void arm() {
         // Zero-size arena (e.g. tf4 pools unavailable): skip it entirely. All
         // per-arena loops (capture/restore/report) tolerate size==0 and no-op.
         if (A.size == 0) {
-            A.mirror = nullptr;
+            A.mirror_pg = nullptr;
             A.phash  = nullptr;
             continue;
         }
@@ -357,16 +502,26 @@ void arm() {
             log_printf("[snapshot_ring] !! arm: arena %d not installed\n", a);
             return;
         }
-        A.mirror = (uint8_t*)VirtualAlloc(nullptr, A.size,
-                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        A.mirror_pg = (uint32_t*)VirtualAlloc(nullptr, A.npages * 4,
+                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         A.phash  = (uint32_t*)VirtualAlloc(nullptr, A.npages * 4,
                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!A.mirror || !A.phash) {
+        if (!A.mirror_pg || !A.phash) {
             log_printf("[snapshot_ring] !! arm: alloc failed (arena %d)\n", a);
             return;
         }
         // Baseline: mirror = current arena; per-page hashes; clear the watch.
-        memcpy(A.mirror, A.base, A.size);
+        // Baseline: one pool page per arena page, holding the arena's bytes.
+        for (uint32_t pg = 0; pg < A.npages; ++pg) {
+            const uint32_t idx = pool_take();
+            if (idx == NOPAGE) {
+                log_printf("[snapshot_ring] !! arm: mirror pool exhausted at arena "
+                           "%d page %u — raise POOL_SPARE\n", a, pg);
+                return;
+            }
+            A.mirror_pg[pg] = idx;
+            memcpy(pool_page(idx), A.base + (size_t)pg * PAGE, PAGE);
+        }
         for (uint32_t pg = 0; pg < A.npages; ++pg)
             A.phash[pg] = hash_page(A.base + pg * PAGE);
         ResetWriteWatch(A.base, A.size);
@@ -399,7 +554,7 @@ void arm() {
                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         bool delta_ok = true;
         for (int a = 0; a < NARENA; ++a) {
-            S.delta[a] = (uint8_t*)VirtualAlloc(nullptr, DELTA_CAP[a],
+            S.delta[a] = (uint8_t*)VirtualAlloc(nullptr, DELTA_MAXREC[a] * REC,
                              MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!S.delta[a]) delta_ok = false;
             // DIAGNOSTIC: phash snapshot, npages * 4. Cheap. Skip zero-size
@@ -600,7 +755,7 @@ static uint8_t  g_bfs_bits[(128u * 1024 * 1024 / 16) / 8];   // 1 MB: seen-bit p
 static void gl_apply(uint32_t off, const uint8_t* src, uint32_t len) {
     Arena& A = g_ar[CPP_ARENA];
     memcpy(A.base + off, src, len);
-    memcpy(A.mirror + off, src, len);                 // keep mirror in sync (no spurious delta)
+    mirror_write(A, off, src, len);                   // keep mirror in sync (no spurious delta)
     for (uint32_t o = off & ~(PAGE - 1); o < off + len; o += PAGE)
         A.phash[o / PAGE] = hash_page(A.base + (o & ~(PAGE - 1)));
 }
@@ -762,6 +917,14 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
     // below — this is how the per-frame phash-snap diagnostic distinguishes
     // a re-sim re-capture from a fresh forward save of frame N.
     const bool re_capture_diag = (S.frame == (int32_t)frame);
+    // This slot is about to be rewritten, so give its pre-image pages back.
+    // Records the reverse-apply already adopted are stamped NOPAGE and skipped.
+    for (int a = 0; a < NARENA; ++a) {
+        const uint8_t* rp = S.delta[a];
+        for (uint32_t i = 0; i < S.dn[a]; ++i, rp += REC)
+            pool_give(*(const uint32_t*)(rp + 4));
+        S.dn[a] = 0;
+    }
     S.frame = (int32_t)frame;
     // NB: the game-loop graph snapshot is NOT taken here (capture() can fire mid-RunOneFrame,
     // an unbalanced lock state). It's taken at the stable RunOneFrame end via gl_capture().
@@ -817,7 +980,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
         q_us[a] += (uint64_t)(w1.QuadPart - w0.QuadPart);
         LARGE_INTEGER d0; QueryPerformanceCounter(&d0);
         uint8_t* dp   = S.delta[a];
-        uint8_t* dend = dp + DELTA_CAP[a];
+        uint8_t* dend = dp + DELTA_MAXREC[a] * REC;
         uint32_t n    = 0;
         for (ULONG_PTR i = 0; i < count; ++i) {
             uint32_t off = (uint32_t)((uint8_t*)g_pgbuf[i] - A.base);
@@ -833,17 +996,29 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
             // (cppb/[comp]/divf below) so the HUD-number render geometry doesn't flag.
             if (dp + REC > dend) {
                 log_printf("[snapshot_ring] !! delta overflow arena=%d f=%u "
-                           "(%u pages) — raise DELTA_CAP\n", a, frame,
+                           "(%u pages) — raise DELTA_MAXREC\n", a, frame,
                            (uint32_t)count);
                 break;
             }
             if (g_hist[a] && !re_capture_diag)             // T0b: forward saves only
                 ++g_hist[a][off / PAGE];
-            *(uint32_t*)dp = off;                          // page offset
-            memcpy(dp + 4, A.mirror + off, PAGE);          // PRE-image (frame-1)
+            // ONE copy, not two. The page the mirror currently holds IS the
+            // frame-1 pre-image, so hand it to the record as-is and install a
+            // fresh page carrying the live bytes.
+            const uint32_t mpg   = off / PAGE;
+            const uint32_t fresh = pool_take();
+            if (fresh == NOPAGE) {
+                log_printf("[snapshot_ring] !! mirror pool exhausted arena=%d f=%u "
+                           "(%u pages this frame) — raise POOL_SPARE_PER_SLOT\n",
+                           a, frame, (uint32_t)count);
+                break;
+            }
+            *(uint32_t*)dp       = off;                    // page offset
+            *(uint32_t*)(dp + 4) = A.mirror_pg[mpg];       // PRE-image, by page
             dp += REC;
             ++n;
-            memcpy(A.mirror + off, A.base + off, PAGE);     // sync mirror -> frame
+            memcpy(pool_page(fresh), A.base + off, PAGE);   // fresh mirror = frame
+            A.mirror_pg[mpg] = fresh;
             // The per-page hash exists ONLY to feed fold_checksum and the
             // divergence diagnostics. When the fold is skipped (dual netplay,
             // see set_want_raw_checksum) hashing every dirty page is a third of
@@ -1367,6 +1542,10 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
         }
     }
 
+    if (const int mc = mirrorchk_every()) {
+        static uint32_t mcn = 0;
+        if (++mcn >= (uint32_t)mc) { mcn = 0; pool_audit(frame); }
+    }
     if (g_hist_every == 0) g_hist_every = pagehist_every();
     if (g_hist_every && !re_capture_diag) {
         // Count FORWARD saves only: a re-sim re-capture of the same frame would
@@ -1397,6 +1576,9 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
                    psq / prc, pbt / prc, pcpp / prc, pt4a / prc, pt4b / prc,
                    (psq + pbt + pcpp + pt4a + pt4b) / prc * 4,
                    us(a_ww), us(a_dirty), us(a_rest), us(a_fold));
+        log_printf("[mirrorpool] %u/%u pages free (low water %u)\n",
+                   g_pool_nfree, g_pool_pages,
+                   g_pool_lowwater == 0xFFFFFFFFu ? g_pool_nfree : g_pool_lowwater);
         {   // What a GetWriteWatch CALL is actually worth on the live path.
             // [wwbench] on a clean region says ~6 us/call + ~3 ns/page, but the
             // real path costs several times that: the difference is the dirty
@@ -1545,7 +1727,7 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
             for (ULONG_PTR i = 0; i < count; ++i) {
                 uint32_t off = (uint32_t)((uint8_t*)g_pgbuf[i] - A.base);
                 if (off + PAGE > A.size) continue;
-                memcpy(A.base + off, A.mirror + off, PAGE);   // live -> state(g_cur)
+                memcpy(A.base + off, mpage(A, off), PAGE);    // live -> state(g_cur)
                 // mirror/phash already hold the capture(g_cur) value — untouched.
             }
         }
@@ -1571,13 +1753,19 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
             const uint8_t* dp = S.delta[a];
             uint8_t*       sn = seen[a];
             for (uint32_t i = 0; i < S.dn[a]; ++i) {
-                uint32_t       off = *(const uint32_t*)dp;
-                const uint8_t* pre = dp + 4;
-                uint32_t       pg  = off / PAGE;
-                if (!(sn[pg >> 3] & (1u << (pg & 7)))) {
+                uint32_t       off  = *(const uint32_t*)dp;
+                uint32_t       pidx = *(const uint32_t*)(dp + 4);
+                uint32_t       pg   = off / PAGE;
+                const uint8_t* pre  = (pidx == NOPAGE) ? nullptr : pool_page(pidx);
+                if (pre && !(sn[pg >> 3] & (1u << (pg & 7)))) {
                     sn[pg >> 3] |= (uint8_t)(1u << (pg & 7));
-                    memcpy(A.base   + off, pre, PAGE);   // live  -> frame target
-                    memcpy(A.mirror + off, pre, PAGE);   // mirror tracks live
+                    memcpy(A.base + off, pre, PAGE);     // live -> frame target
+                    // ONE copy: the pre-image page BECOMES the mirror page.
+                    // Stamp the record so the slot's release does not hand the
+                    // same page back to the pool a second time.
+                    pool_give(A.mirror_pg[pg]);
+                    A.mirror_pg[pg] = pidx;
+                    *(uint32_t*)(dp + 4) = NOPAGE;
                     // Same gate as capture(): the per-page hash feeds only
                     // fold_checksum and the divergence diagnostics, and dual
                     // netplay uses the STRUCTURAL cross-peer checksum instead
@@ -1609,7 +1797,7 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
                 if (addr < lo || addr + len > lo + A.size) continue;
                 uint32_t off = addr - lo;
                 memcpy(A.base   + off, s_spbuf + pos, len);
-                memcpy(A.mirror + off, s_spbuf + pos, len);
+                mirror_write(A, off, s_spbuf + pos, len);
                 for (uint32_t o = off & ~(PAGE - 1); o < off + len; o += PAGE)
                     A.phash[o / PAGE] = hash_page(A.base + o);
                 ++applied;
@@ -1636,8 +1824,8 @@ const uint8_t* restore(uint32_t frame, uint32_t* sblob_len) {
         Arena& A = g_ar[CPP_ARENA];
         *(int*)(A.base   + gl_sc_off + 4) = gl_use_b;
         *(int*)(A.base   + gl_sc_off + 8) = gl_weak_b;
-        *(int*)(A.mirror + gl_sc_off + 4) = gl_use_b;     // keep mirror in sync (no spurious delta)
-        *(int*)(A.mirror + gl_sc_off + 8) = gl_weak_b;
+        mirror_write(A, gl_sc_off + 4, &gl_use_b,  4);    // keep mirror in sync (no spurious delta)
+        mirror_write(A, gl_sc_off + 8, &gl_weak_b, 4);
         A.phash[gl_sc_off / PAGE] = hash_page(A.base + (gl_sc_off & ~(PAGE - 1)));
     }
 
