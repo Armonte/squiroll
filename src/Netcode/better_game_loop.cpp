@@ -141,6 +141,31 @@ void stdcall better_game_loop() {
 
     while (expect(!exit_requested, true)) {
         ++g_real_frame;   // one per real displayed frame (all branches)
+
+        // Tick the cpp_arena quarantine clock outside a session too.
+        //
+        // Every other caller of advance_frame() is inside the armed gekko
+        // session, so during menus, character select and stage load the clock
+        // stood still -- which means NOTHING freed in all that time ever aged
+        // out of quarantine, so arena_alloc could never recycle it and the bump
+        // only ever grew. It reaches ~94 MB with 16-28 MB live, and the
+        // snapshot pays for that every frame forever after: GetWriteWatch is
+        // charged ~6 ns per page of the range it is asked about, and the range
+        // is [0, bump). 94 MB is 23,493 pages, ~140 us per query, twice a frame.
+        //
+        // Ticking here does not weaken anything: QUARANTINE_FRAMES still holds,
+        // so a block freed now is still untouchable for 90 ticks (~1.5 s at 60
+        // fps). It just lets the clock run so setup garbage can actually be
+        // reused, which is what the quarantine was designed to allow.
+        // SQUIROLL_MENU_QUARANTINE=0 restores the old behaviour for A/B.
+        if (!gekko_bridge::is_active()) {
+            static const bool tick_idle = []{
+                char b[8] = {0};
+                return !(GetEnvironmentVariableA("SQUIROLL_MENU_QUARANTINE", b,
+                                                 sizeof b) > 0 && b[0] == '0');
+            }();
+            if (tick_idle) cpp_arena::advance_frame();
+        }
 #if PROFILING
         perf_api.BeginEvent("Frame", nullptr, 0xFFFFFFFF);
 #endif

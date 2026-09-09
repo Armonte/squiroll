@@ -244,7 +244,6 @@ void reserve_anim_vectors() {
 //     [nlive]  then nlive x [slot-addr][slot-bytes (slot_size)]
 //     [nfree]  then nfree x [slot-addr]            (free list, in order)
 //   [ACTOR_MGR_BYTES of the manager region][uint32 id_ctr_b]
-static constexpr uint32_t POOL_MAGIC  = 0x4C4F4F50;  // 'POOL' — legacy free-list-as-addresses
 static constexpr uint32_t POOL_MAGIC_C = 0x434F4F50; // 'POOC' — canonical free-set bitmap
 
 // Free-slot bitmap scratch, reused per pool — one bit per slot. A pregrown
@@ -391,16 +390,6 @@ static void ncs_push(const uint8_t* lo, const uint8_t* hi) {
     }
 }
 
-// SQUIROLL_BPCANON=0 restores the pre-2026-09-08 format (free list emitted as
-// an address array, in whatever order the allocator left it). Kept only as the
-// A/B arm for the measurement; the canonical path is the default.
-static bool canon_on() {
-    static int v = -1;
-    if (v < 0) { char b[8] = {0};
-        v = (GetEnvironmentVariableA("SQUIROLL_BPCANON", b, sizeof b) > 0 &&
-             b[0] == '0') ? 0 : 1; }
-    return v != 0;
-}
 // SQUIROLL_BPVALIDATE=1 keeps the save/load round-trip self-test running for
 // the whole session instead of the first 24 loads, and cross-checks the
 // canonical rewrite against a second independent walk. Rule from
@@ -425,9 +414,8 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         return true;
     };
 
-    const bool canon = canon_on();
-    const bool vald  = validate_on();
-    uint32_t magic = canon ? POOL_MAGIC_C : POOL_MAGIC, npool = NPOOL;
+    const bool vald = validate_on();
+    uint32_t magic = POOL_MAGIC_C, npool = NPOOL;
     if (!put(&magic, 4) || !put(&npool, 4)) return 0;
 
     uint32_t st_slots = 0, st_live = 0, st_free = 0, st_blocks = 0, st_hot = 0;
@@ -491,7 +479,7 @@ uint32_t save(uint8_t* out, uint32_t cap) {
             pc.valid = false; pc.total = total; pc.coldw = 0xFFFFFFFFu;
             pc.w = total ? total - 1 : 0;
         }
-        uint32_t W = canon ? pc.w : (total ? total - 1 : 0);
+        uint32_t W = pc.w;
 
         // Walk the free list to build the free bitmap over the HOT range
         // [0, W]. The chase is a dependent load per node and used to cover
@@ -546,7 +534,7 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         // SQUIROLL_BPVALIDATE the set is derived a second time by a full walk
         // and compared. The fast path claims every slot above W is free; the
         // full walk knows. Any disagreement is printed with the slot index.
-        if (vald && canon && total && !covered_all && !outside && !breach) {
+        if (vald && total && !covered_all && !outside && !breach) {
             memset(g_freebits_ref, 0, (total + 7) / 8);
             uint32_t fa = pl->free_head, guard = 0, refn = 0;
             bool ref_ok = true;
@@ -651,7 +639,7 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         // save most of the list already is.
         const uint64_t t_link0 = qpc();
         uint32_t freec = 0;
-        if (canon && total) {
+        if (total) {
             // After a full walk the whole chain is rewritten (that is what
             // re-establishes the cold tail for the new boundary); otherwise
             // only the hot range, whose last entry links to the cold tail.
@@ -693,9 +681,6 @@ uint32_t save(uint8_t* out, uint32_t cap) {
             if (vald && !covered_all && newW == Wwalk && freec != mapped)
                 log_printf("[bpvald] !! %s canon hotfree=%u != walked=%u\n",
                            g_pool_rva[i].name, freec, mapped);
-        } else {
-            freec = mapped;
-            newW  = total ? total - 1 : 0;
         }
         g_prof.link += qpc() - t_link0;
         st_free += freec;
@@ -726,27 +711,49 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         uint32_t live = 0;
         const bool try_registry = !g_pool_rva[i].render_tainted &&
                                   !g_pool_rva[i].peer_local && ss >= 0x14;
+        // Live slots, as RUNS. The per-slot address the old format wrote is
+        // redundant -- the block table plus the bitmap give the index, and the
+        // index gives the address -- so dropping it removes 4 bytes per slot
+        // AND lets a run of adjacent live slots go out as one memcpy instead of
+        // one call per slot. Registry matching still needs per-slot granularity,
+        // so it walks the run afterwards, and only for pools that have a
+        // registered type at all.
         bool live_done = false;
         for (uint32_t bi = nblk; bi-- > 0 && !live_done; ) {
             const uint32_t b = bi;
-            for (uint32_t j = 0; j < blk[b].nslots; ++j) {
-                uint32_t idx = blk[b].base_idx + j;
-                if (idx > blob_w) { live_done = true; break; }  // above the last live slot
-                if (g_freebits[idx >> 3] & (1u << (idx & 7))) continue;  // free
-                uint32_t sa = blk[b].addr + j * ss;
-                if (!put(&sa, 4) || !put((const void*)(uintptr_t)sa, ss)) return 0;
+            const uint32_t n0 = blk[b].nslots;
+            uint32_t j = 0;
+            while (j < n0) {
+                const uint32_t idx0 = blk[b].base_idx + j;
+                if (idx0 > blob_w) { live_done = true; break; }
+                if (g_freebits[idx0 >> 3] & (1u << (idx0 & 7))) { ++j; continue; }
+                // Extend the run of live slots.
+                uint32_t k = j + 1;
+                while (k < n0) {
+                    const uint32_t idx = blk[b].base_idx + k;
+                    if (idx > blob_w) break;
+                    if (g_freebits[idx >> 3] & (1u << (idx & 7))) break;
+                    ++k;
+                }
+                const uint32_t run = k - j;
+                const uint32_t sa  = blk[b].addr + j * ss;
+                if (!put((const void*)(uintptr_t)sa, run * ss)) return 0;
                 if (try_registry) {
-                    const uint8_t* content = p - ss;      // slot bytes in the blob
-                    if (const auto* t = desync_registry::match_slot(
-                            content, ss, (uint32_t)base_address)) {
-                        for (int f = 0; f < t->nfields; ++f) {
-                            uint32_t lo = t->hdr + t->fields[f].obj_off;
-                            uint32_t hi = lo + t->fields[f].len;
-                            if (hi <= ss) ncs_push(content + lo, content + hi);
+                    const uint8_t* base_c = p - run * ss;
+                    for (uint32_t r = 0; r < run; ++r) {
+                        const uint8_t* content = base_c + r * ss;
+                        if (const auto* t = desync_registry::match_slot(
+                                content, ss, (uint32_t)base_address)) {
+                            for (int f = 0; f < t->nfields; ++f) {
+                                uint32_t lo = t->hdr + t->fields[f].obj_off;
+                                uint32_t hi = lo + t->fields[f].len;
+                                if (hi <= ss) ncs_push(content + lo, content + hi);
+                            }
                         }
                     }
                 }
-                ++live;
+                live += run;
+                j = k;
             }
         }
         *nlive = live;
@@ -757,7 +764,7 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         // The free set. Canonical: [total][w][bitmap over the HOT range
         // [0, w]], bit set = free; every slot above w is free by construction
         // and the order is implied. Legacy: [nfree] then one address each.
-        if (canon) {
+        {
             const uint32_t nbits  = total ? blob_w + 1 : 0;
             const uint32_t nbytes = (nbits + 7) / 8;
             // Mask the padding bits above w in the last byte. The walk marks
@@ -770,16 +777,6 @@ uint32_t save(uint8_t* out, uint32_t cap) {
                 g_freebits[nbytes - 1] &= (uint8_t)((1u << stray) - 1);
             if (!put(&total, 4) || !put(&blob_w, 4)) return 0;
             if (nbytes && !put(g_freebits, nbytes)) return 0;
-        } else {
-            if (p + 4 > end) return 0;
-            uint32_t* nfree = (uint32_t*)p; p += 4;
-            uint32_t fc = 0;
-            for (uint32_t fa = pl->free_head, guard = 0; fa && guard <= total; ++guard) {
-                if (!put(&fa, 4)) return 0;
-                ++fc;
-                fa = *(const uint32_t*)(uintptr_t)fa;
-            }
-            *nfree = fc;
         }
 
         // Render-tainted pools: the RENDERER writes into these objects
@@ -1481,8 +1478,7 @@ void log_fingerprint(const char* tag) {
 
 // Free-section size in a save() blob. Canonical ('POOC'): [total][w][bitmap]
 // over slots [0,w]. Legacy ('POOL'): [nfree][nfree x addr].
-static inline uint32_t free_sect_bytes(const uint8_t* b, uint32_t off, bool canon) {
-    if (!canon) return 4 + *(const uint32_t*)(b + off) * 4;   // [nfree][addrs]
+static inline uint32_t free_sect_bytes(const uint8_t* b, uint32_t off) {
     const uint32_t total = *(const uint32_t*)(b + off);       // [total][w][bits]
     const uint32_t w     = *(const uint32_t*)(b + off + 4);
     return 8 + ((total ? w + 1 : 0) + 7) / 8;
@@ -1495,7 +1491,6 @@ static inline uint32_t free_sect_bytes(const uint8_t* b, uint32_t off, bool cano
 static void describe_offset(const uint8_t* b, uint32_t len, uint32_t want,
                             char* out, int outn) {
     if (len < 8) { _snprintf(out, outn, "<short>"); return; }
-    const bool canon = (*(const uint32_t*)b == POOL_MAGIC_C);
     uint32_t off = 8;
     if (want < off) { _snprintf(out, outn, "header"); return; }
     for (int i = 0; i < NPOOL; ++i) {
@@ -1530,13 +1525,10 @@ static void describe_offset(const uint8_t* b, uint32_t len, uint32_t want,
             off += 4 + ss;
         }
         if (off + 4 > len) break;
-        const uint32_t fs = free_sect_bytes(b, off, canon);
+        const uint32_t fs = free_sect_bytes(b, off);
         if (want < off + fs) {
-            if (canon)
-                _snprintf(out, outn, "pool '%s' free set (%s)", nm,
-                          want < off + 8 ? "total/w header" : "bitmap");
-            else
-                _snprintf(out, outn, "pool '%s' free list", nm);
+            _snprintf(out, outn, "pool '%s' free set (%s)", nm,
+                      want < off + 8 ? "total/w header" : "bitmap");
             return;
         }
         off += fs;
@@ -1558,8 +1550,7 @@ void load(const uint8_t* blob, uint32_t len) {
 
     uint32_t magic = 0, npool = 0;
     get_u32(magic); get_u32(npool);
-    const bool canon = (magic == POOL_MAGIC_C);
-    if ((magic != POOL_MAGIC && !canon) || npool != (uint32_t)NPOOL) {
+    if (magic != POOL_MAGIC_C || npool != (uint32_t)NPOOL) {
         log_printf("[battle_pools] load: bad header magic=%08x npool=%u\n",
                    magic, npool);
         return;
@@ -1591,13 +1582,11 @@ void load(const uint8_t* blob, uint32_t len) {
         const uint64_t t_l0 = qpc();
         uint32_t nlive = 0;
         if (!get_u32(nlive)) return;
-        for (uint32_t k = 0; k < nlive; ++k) {
-            uint32_t sa = 0;
-            if (!get_u32(sa)) return;
-            if (p + ss > end) return;
-            if (!bp_wp("bppool", sa, ss)) memcpy((void*)(uintptr_t)sa, p, ss);
-            p += ss;
-        }
+        // Bodies only -- the address of each comes from the block table and the
+        // bitmap, which the free-set section below reads. Deferred until then.
+        const uint8_t* live_bodies = p;
+        if (p + (size_t)nlive * ss > end) return;
+        p += (size_t)nlive * ss;
         g_prof.lload += qpc() - t_l0;
 
         // Free list. Canonical: the saved bitmap is walked in ascending slot
@@ -1607,7 +1596,7 @@ void load(const uint8_t* blob, uint32_t len) {
         // link already holds the right value, which after a short rollback is
         // almost all of them.
         const uint64_t t_f0 = qpc();
-        if (canon) {
+        {
             uint32_t total = 0, w = 0;
             if (!get_u32(total) || !get_u32(w)) return;
             const uint32_t nbits  = total ? w + 1 : 0;
@@ -1676,17 +1665,27 @@ void load(const uint8_t* blob, uint32_t len) {
             }
             if (cold_head) *(uint32_t*)(uintptr_t)(cold_head + 4) = COLD_MAGIC;
             pc.valid = true; pc.total = total; pc.w = cbound; pc.coldw = cbound;
-        } else {
-            uint32_t nfree = 0;
-            if (!get_u32(nfree)) return;
-            uint32_t prev = 0;
-            for (uint32_t k = 0; k < nfree; ++k) {
-                uint32_t fa = 0;
-                if (!get_u32(fa)) return;
-                if (prev) *(uint32_t*)(uintptr_t)prev = fa;
-                prev = fa;
+
+            // Live bodies: same ascending order save() emitted them in, with the
+            // address recomputed from the block table rather than carried.
+            const uint64_t t_lb = qpc();
+            uint32_t used = 0;
+            for (uint32_t bi = nblk; bi-- > 0; ) {
+                const uint32_t a0 = blk[bi].addr, n0 = blk[bi].nslots;
+                bool stop = false;
+                for (uint32_t k = 0; k < n0; ++k) {
+                    const uint32_t ix = blk[bi].base_idx + k;
+                    if (ix > w) { stop = true; break; }
+                    if (bits[ix >> 3] & (1u << (ix & 7))) continue;   // free
+                    if (used >= nlive) { stop = true; break; }
+                    const uint32_t sa = a0 + k * ss;
+                    if (!bp_wp("bppool", sa, ss))
+                        memcpy((void*)(uintptr_t)sa, live_bodies + (size_t)used * ss, ss);
+                    ++used;
+                }
+                if (stop) break;
             }
-            if (prev) *(uint32_t*)(uintptr_t)prev = 0;
+            g_prof.lload += qpc() - t_lb;
         }
         g_prof.lfree += qpc() - t_f0;
 
@@ -2020,7 +2019,6 @@ namespace {
 // own. Requires matching structure (same liveness); a length mismatch is noted
 // by the caller and the walk is best-effort.
 void bplive_decode(const uint8_t* fwd, const uint8_t* re, uint32_t len) {
-    const bool canon = (*(const uint32_t*)fwd == POOL_MAGIC_C);
     uint32_t off = 8;  // skip [magic][npool]
     int reports = 0;
     for (int i = 0; i < NPOOL && reports < 14; ++i) {
@@ -2061,7 +2059,7 @@ void bplive_decode(const uint8_t* fwd, const uint8_t* re, uint32_t len) {
             off = bytes0 + ss;
         }
         if (off + 4 > len) break;
-        off += free_sect_bytes(fwd, off, canon);
+        off += free_sect_bytes(fwd, off);
     }
 }
 }  // namespace
@@ -2148,18 +2146,17 @@ void diff_report(const uint8_t* fwd, const uint8_t* re, uint32_t len) {
             }
         }
         if (off + 4 > len) break;
-        const uint32_t hdr   = canon ? 8u : 4u;   // [total][w] vs [nfree]
+        const uint32_t hdr   = 8u;                // [total][w]
         const uint32_t nfree = *(const uint32_t*)(fwd + off);
         const uint32_t fl0   = off + hdr;
-        const uint32_t flen  = free_sect_bytes(fwd, off, canon) - hdr;
+        const uint32_t flen  = free_sect_bytes(fwd, off) - hdr;
         off = fl0 + flen;
         // Free-SET divergence (canonical) or allocation-ORDER divergence
         // (legacy) — either way a real sim signal, not render noise.
         if (off <= len && memcmp(fwd + fl0, re + fl0, flen) != 0) {
             ++unknown_dwords;
-            log_printf("[bpreport] pool='%s' FREE-%s diverges (%u slots) — "
-                       "allocation nondeterminism ** UNKNOWN **\n",
-                       nm, canon ? "SET" : "LIST", nfree);
+            log_printf("[bpreport] pool='%s' FREE-SET diverges (%u slots) — "
+                       "allocation nondeterminism ** UNKNOWN **\n", nm, nfree);
         }
     }
 done:
