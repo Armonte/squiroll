@@ -137,34 +137,43 @@ into the small-blob serialization and the page capture) and load, per 240 saves.
 `[perf-sect]` splits the small blob by section. `[perf] save_battle` is the
 structural checksum walk.
 
-Current cost per call, measured on the SOLO rig (`probe_solo.sh`), which rolls
-back 8 frames every frame and so exercises save/load far harder than netplay.
-Medians over 240-save windows, ship config, after the 2026-09-08 pool pass:
+Current cost per call on the DUAL rig (55 ms delay / 20 ms jitter / 6% loss),
+medians over 240-save windows, ship config:
 
-| Phase | before this pass | now | largest component now |
-|---|---|---|---|
-| save | 3705 µs | **~1900 µs** | arena capture ~1450 (`battle_pools` is ~200) |
-| load | 3899 µs | **~2300 µs** | reverse-apply ~1100, restore step 0 ~675 |
-
-`[perf-bp]` splits the pool section (walk / canonical relink / live-slot copy,
-and on load slot restore / free rebuild) and prints the slot census.
-`[perf-sect]` and `[perf-load]` split the small blob by section.
-`[perf-restore]` splits the restore. `[snapshot_ring] dirty/cap` gives the
-dirty-page counts and where capture's time goes.
-
-What is left, measured:
-
-| item | µs | why it is hard |
+| | start of this work | now |
 |---|---|---|
-| reverse-apply on load | ~1100 | real restore work: 8 frames x ~350 dirty pages, two 4 KB copies per unique page |
-| `GetWriteWatch` (capture + step 0 + reset) | ~775 | 112 MB queried per pass; the cpp arena is 91 MB of it — see below |
-| dirty page copy | ~730 | ~350 pages, pre-image to the delta plus a mirror sync |
-| restore step 0 copy | ~355 | reverts the post-capture window (render pass + game-loop dispatch) |
-| boost pools on load | ~230 | |
-| `battle_pools` save | ~200 | walk ~70, relink ~18, live-slot copy ~135 |
-| fold_checksum | ~320 | solo only — dual uses the structural cross-peer checksum |
+| save | 3353 µs | **~1150 µs** (best window 992) |
+| load | 3383 µs | **~1500 µs** (best window 1371) |
 
-**The pool subsystem is no longer the problem.** It went from 1654 µs to ~200 µs
+Where the save goes now: GetWriteWatch ~290, dirty page copy ~220, small-blob
+copy ~100, battle pools ~180, boost pools ~90, engine ~25. The load adds restore
+step 0 (~350 of it GetWriteWatch) and the reverse-apply.
+
+`[perf-bp]` splits the pool section, `[perf-sect]`/`[perf-load]` the small blob,
+`[perf-restore]` the restore, `[snapshot_ring] dirty/cap` the capture, `[wwcost]`
+the write-watch queries, `[mirrorpool]` the page-pool headroom.
+
+Four changes got it there, in order of size:
+
+*The mirror is a page pool.* Every dirty page used to be copied twice per
+capture and twice per reverse-apply. `Arena::mirror` is now an array of page
+indices, so capture hands the outgoing mirror page to the delta record (it IS
+the pre-image) and installs a fresh one, and the reverse-apply adopts the
+pre-image page as the new mirror. **1.49-1.74 → 0.85-0.88 µs per dirty page**,
+normalised per page so machine drift cannot flatter it. Delta records went from
+4100 bytes to 8, which also took the ring from 992 MB of committed buffers to
+320 MB. `SQUIROLL_MIRRORCHK=N` audits page ownership, which is the one thing
+that can go wrong and the one thing nothing else would catch.
+
+*Boost pools, live-slot where it pays.* 1,092 KB copied whole every save and
+load; only ~135 KB live, and two pools hold 448 KB with zero live slots. Now
+live slots plus a bitmap — but only for stride >= 64, because saves outnumber
+loads ~7:1 and whole-pool conversion lost 80 µs on save to win 342 on load.
+**save 277 → 182, load 552 → 256.**
+
+*Battle pools: canonical free list, then a hot/cold partition.* See below.
+
+**The pool subsystem is no longer the problem.****The pool subsystem is no longer the problem.** It went from 1654 µs to ~200 µs
 on save and 1157 µs to 50 µs on the load-side free-list rebuild, by two changes:
 
 *Canonical free list.* The free list's ORDER is real state — it decides which
