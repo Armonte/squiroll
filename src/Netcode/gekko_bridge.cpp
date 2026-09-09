@@ -931,6 +931,12 @@ static SQInteger gekko_vec3_register(HSQUIRRELVM vm) {
 // rb, fwd, frame, desync }. Real GekkoNet stats (no packet-loss field
 // exists upstream); rb/fwd are the total rollback-re-sim / forward advance
 // counts, frame is the current gekko frame, desync the confirmed count.
+// How far ahead of the remote this peer is running, for the game loop's time
+// sync. 0 when there is no live session (solo, or before the handshake).
+float frames_ahead() {
+    return (g_session && !g_solo) ? gekko_frames_ahead(g_session) : 0.0f;
+}
+
 static SQInteger gekko_netstats(HSQUIRRELVM vm) {
     float ping = 0, avg = 0, jit = 0, sent = 0, recv = 0, ahead = 0;
     bool active = (g_session != nullptr) && !g_solo;

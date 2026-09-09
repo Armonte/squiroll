@@ -170,7 +170,28 @@ void stdcall better_game_loop() {
         perf_api.BeginEvent("Frame", nullptr, 0xFFFFFFFF);
 #endif
 
-        uint64_t qpc_target = current_qpc() + qpc_frame_frequency;
+        // TIME SYNC. GekkoNet reports how far ahead of the remote we are, and
+        // the integration is expected to ACT on it: the peer that is ahead
+        // stretches its frame period slightly until the two converge. We were
+        // only ever displaying the number, and it showed: on the dual rig the
+        // host took ~1,200 rollbacks a run against the client's ~400, at equal
+        // ping. The peer that runs ahead predicts further, so it eats every
+        // mispredict while the trailing peer never mispredicts at all.
+        //
+        // 1.6% longer, matching GekkoNet's own reference integration
+        // (Examples/OnlineSession handle_frame_time). Small enough to be
+        // invisible, and it only applies while genuinely ahead.
+        // SQUIROLL_NO_TIMESYNC=1 disables it for A/B.
+        uint64_t frame_period = qpc_frame_frequency;
+        {
+            static const bool timesync = []{
+                char b[8] = {0};
+                return GetEnvironmentVariableA("SQUIROLL_NO_TIMESYNC", b, sizeof b) == 0;
+            }();
+            if (timesync && gekko_bridge::frames_ahead() > 0.5f)
+                frame_period += qpc_frame_frequency / 64;   // ~1.6%
+        }
+        uint64_t qpc_target = current_qpc() + frame_period;
         timer.set(166667 - leniency);
 
         // tick() pumps the UDP poll + session events whenever a session

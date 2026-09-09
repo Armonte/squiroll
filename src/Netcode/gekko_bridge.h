@@ -69,6 +69,10 @@ void shutdown();
 bool is_active();
 bool menu_mash_active();          // session exists; UDP poll runs in background
 bool is_session_started(); // GekkoSessionStarted fired; tick() owns the frame
+// GekkoNet time sync: how far ahead of the remote this peer is. The game loop
+// stretches its frame period slightly while this is > 0.5, so the peer that is
+// ahead does not absorb every mispredict. 0 when there is no live session.
+float frames_ahead();
 bool is_holding_transition(); // round-end: engine held until the remote reaches the latch
 void hold_poll();             // per-frame pump while holding (render-only frames)
 void hold_vanilla_feed();     // arm-handshake hold: keep the vanilla input step alive for the peer
