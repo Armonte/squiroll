@@ -1256,6 +1256,26 @@ static const bool DUAL_TRANSITION_LOCKSTEP = true;
 static bool  g_lockstep_req = false;      // switch to lockstep requested
 static bool  g_in_lockstep  = false;      // transition running under lockstep
 static bool  g_lockstep_seen_leave = false; // state left 8 since the latch (the round really ended)
+static int   g_lockstep_drain = 0;        // ticks spent draining predictions for lockstep
+static int   g_lockstep_delay = -1;       // local delay we raised to for lockstep (-1 = not raised)
+
+// Lockstep gives up prediction, so the delay has to cover the round trip
+// instead -- otherwise gekko can only advance a frame once the remote's input
+// for that exact frame has ARRIVED, which is one frame per RTT (~8 fps at the
+// rig's 130 ms) and the round transition crawls. GekkoNet supports raising the
+// delay mid-session: InputBuffer::SetDelay expands the buffer by repeating the
+// last input, so there is no gap.
+static int lockstep_delay_for_ping() {
+    if (!g_session || g_solo) return -1;
+    GekkoNetworkStats ns = {};
+    gekko_network_stats(g_session, (uint8_t)(1 - g_local_idx), &ns);
+    const float ms = ns.avg_ping > 0.f ? ns.avg_ping : (float)ns.last_ping;
+    int d = (int)(ms / 16.667f) + 1;          // frames of RTT, plus one
+    if (d < g_local_delay) d = g_local_delay;
+    if (d > 9) d = 9;                          // gekko's cap
+    return d;
+}
+static constexpr int LOCKSTEP_DRAIN_MAX = 150;  // ~2.5 s at 60 Hz before giving up
 static bool  g_restore_req  = false;      // prediction restore requested (next Round_Fight seen)
 // Rollback depth. SQUIROLL_PREDICTION_WINDOW overrides it; 0 means the session
 // never predicts and therefore never rolls back, while every other part of the
@@ -3321,7 +3341,13 @@ void advance_one_frame() {
             gekko_set_prediction_window(g_session, PREDICTION_WINDOW)) {
             g_restore_req = false;
             g_in_lockstep = false;
-            log_printf("[gekko_bridge] prediction window %u restored at f=%d\n", (unsigned)PREDICTION_WINDOW, g_trace_frame);
+            if (g_lockstep_delay > 0) {
+                gekko_set_local_delay(g_session, g_local_idx, (uint8_t)g_local_delay);
+                g_lockstep_delay = -1;
+            }
+            log_printf("[gekko_bridge] prediction window %u restored at f=%d "
+                       "(local delay back to %d)\n", (unsigned)PREDICTION_WINDOW,
+                       g_trace_frame, g_local_delay);
         }
         }
     } else
@@ -4491,6 +4517,7 @@ void pre_arm_poll() {
 
 void shutdown() {
     g_lockstep_req = false; g_in_lockstep = false; g_lockstep_seen_leave = false; g_restore_req = false;
+    g_lockstep_drain = 0; g_lockstep_delay = -1;
     reader_unbind();
     g_f0_input_reset_done = false;
     g_draining = false;
@@ -4874,7 +4901,55 @@ bool tick() {
     // gekko_add_local_input: skipping that until SessionStarted keeps
     // both peers at frame 0 until the handshake completes, so their
     // first real frame happens at the same wall-clock moment.
-    if (g_session_started) {
+    // LOCKSTEP DRAIN (round-end transition).
+    //
+    // gekko_set_prediction_window(0) REFUSES while any prediction is still
+    // outstanding (GameSession::SetPredictionWindow: at window 0 AddInput stops
+    // checking for mispredictions, so an outstanding one would go uncorrected).
+    // The old code set g_lockstep_req at the round-end latch and then retried
+    // once per advance -- but every advance adds local input, which creates new
+    // predictions, so at 55 ms delay it lost that race essentially forever. In
+    // practice lockstep engaged ~900 frames late, around the NEXT round's end:
+    //
+    //     round-end latch f=939 reached -> LOCKSTEP transition requested
+    //     LOCKSTEP ON (prediction window 0) at f=1833
+    //
+    // So the victory pose, the round transition and most of the following round
+    // ran at the full prediction window, rolling back the whole way.
+    //
+    // gekko's frame counter only advances on gekko_add_local_input, so simply
+    // not feeding it drains: no new predictions are made, the outstanding ones
+    // confirm as the remote's inputs arrive, and the window can drop. Both
+    // peers reach the latch on the SAME sim frame (it is sim-latched, not
+    // wall-clock), so they hold together. Costs a hold of about one round trip
+    // at the round end, which is what a lockstep transition is.
+    // DEFAULT OFF -- see the deadlock note below. Draining makes lockstep
+    // engage at the seam as designed, and that turns out to be unviable at this
+    // latency: at prediction window 0 gekko can only advance a frame once the
+    // remote's input for THAT EXACT FRAME has arrived, so the local delay has
+    // to cover the round trip -- and gekko caps local delay at 9 frames
+    // (150 ms) while this rig runs 166-183 ms. Both peers then sit waiting on
+    // each other, stop producing input, and the session deadlocks at the next
+    // round end (traffic falls to 0.08 KB/s and the sim stops).
+    // SQUIROLL_LOCKSTEP_DRAIN=1 to experiment.
+    static const bool lockstep_drain_on = []{
+        char b[8] = {0};
+        return GetEnvironmentVariableA("SQUIROLL_LOCKSTEP_DRAIN", b, sizeof b) > 0
+               && b[0] != '0';
+    }();
+    const bool lockstep_draining = lockstep_drain_on && g_lockstep_req &&
+                                   g_session && !g_solo;
+    if (lockstep_draining && ++g_lockstep_drain > LOCKSTEP_DRAIN_MAX) {
+        // Never hang on this. If the peer has gone quiet the round transition
+        // still has to happen; carry on at the current window.
+        log_printf("[gekko_bridge] !! lockstep drain gave up after %d ticks at "
+                   "f=%d — continuing at the current prediction window\n",
+                   g_lockstep_drain, g_trace_frame);
+        g_lockstep_req = false;
+        g_lockstep_drain = 0;
+    }
+
+    if (g_session_started && !lockstep_draining) {
         if (g_fake_input) {
             // Test harness: generated inputs. Each player draws from its
             // own stream — for solo we add both; for dual each peer adds
@@ -4912,6 +4987,24 @@ bool tick() {
 
     count = 0;
     GekkoGameEvent** uevents = gekko_update_session(g_session, &count);
+    // Retry the switch HERE, not only in advance_one_frame: while draining
+    // there are no Advance events, so the retry that lived there could never
+    // run. gekko_update_session has just processed whatever arrived, so this is
+    // the moment the last prediction may have been confirmed.
+    if (g_lockstep_req && g_session && gekko_set_prediction_window(g_session, 0)) {
+        g_lockstep_req = false;
+        g_in_lockstep  = true;
+        const int d = lockstep_delay_for_ping();
+        if (d > g_local_delay) {
+            gekko_set_local_delay(g_session, g_local_idx, (uint8_t)d);
+            g_lockstep_delay = d;
+        }
+        log_printf("[gekko_bridge] LOCKSTEP ON (prediction window 0) at f=%d "
+                   "after %d drain tick(s), local delay %d -> %d\n",
+                   g_trace_frame, g_lockstep_drain, g_local_delay,
+                   g_lockstep_delay > 0 ? g_lockstep_delay : g_local_delay);
+        g_lockstep_drain = 0;
+    }
     // [evorder] one-shot audit (dual): the raw event batch order for the
     // first ticks. Gekko's contract is AdvanceEvent(F) THEN SaveEvent(F)
     // (save = post-advance state; rollback loads save(min-1) and re-runs
