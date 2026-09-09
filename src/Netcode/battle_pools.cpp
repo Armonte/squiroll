@@ -101,10 +101,17 @@ static Pool* pool_at(int i) {
 #define ACTOR_MGR_BYTES  0x40u
 #define ACTOR_ID_CTR_B   (0x4DCEE8_R)
 
-// TF4::TPoolAllocator::Grow — __thiscall(this=&pool). Self-contained:
-// mallocs a block, threads its slots onto the free list, doubles grow_count.
-typedef void thiscall begin_streaming_t(void* pool);
-#define begin_streaming ((begin_streaming_t*)(0x37C30_R))
+// TF4::TPoolAllocator::GrowAndAlloc — __thiscall(this=&pool). Allocates a
+// block of grow_count slots from the TF4 mesh-vertex mspace, threads them onto
+// the free list, stores [prev_block][prev_block_size] in the block's last 8
+// bytes, doubles grow_count -- AND THEN POPS AND RETURNS THE BLOCK'S FIRST
+// SLOT. It is the allocation slow path, not a plain grow (was guess-named
+// Manbow__NetworkNode__BeginStreaming in the IDB; renamed 2026-09-08).
+//
+// pregrow() therefore has to hand the returned slot back, or every grow leaks
+// one permanently-live slot at the base of the block it just made.
+typedef uint32_t thiscall grow_and_alloc_t(void* pool);
+#define grow_and_alloc ((grow_and_alloc_t*)(0x37C30_R))
 
 // Walk every block of a pool: fn(block_addr, block_size).
 template <typename L>
@@ -148,7 +155,19 @@ void pregrow() {
         Pool* p = pool_at(i);
         if (p->slot_size == 0) continue;  // pool never used yet — leave it
         for (int g = 0; g < 10 && pool_slots(p) < TARGET; ++g) {
-            begin_streaming(p);
+            // Push the slot the allocator just handed us straight back onto the
+            // free list -- it was never constructed, so this is exactly the
+            // pool's own free operation. Dropping it instead left one live slot
+            // at the base index of every block: 133 slots of stale junk
+            // serialised into every savestate, and (much worse) a permanently
+            // live slot at the TOP of each pool's index range, which pinned the
+            // snapshot's hot/cold boundary at the end of the pool and made the
+            // partition worth 21% instead of 7x.
+            uint32_t slot = grow_and_alloc(p);
+            if (slot) {
+                *(uint32_t*)(uintptr_t)slot = p->free_head;
+                p->free_head = slot;
+            }
         }
     }
     for (int i = 0; i < NPOOL; ++i) {
@@ -233,6 +252,9 @@ static constexpr uint32_t POOL_MAGIC_C = 0x434F4F50; // 'POOC' — canonical fre
 // is wide headroom even if a pool grows mid-match.
 static constexpr uint32_t MAXSLOT = 65536;
 static uint8_t g_freebits[MAXSLOT / 8];
+// Second bitmap, used only by SQUIROLL_BPVALIDATE to re-derive the free set
+// with a full walk and compare it against the fast partitioned one.
+static uint8_t g_freebits_ref[MAXSLOT / 8];
 
 // Checksum-exempt spans of the LAST save(): byte ranges (absolute, into the
 // caller's dest buffer) that the desync checksum must skip. Two producers:
@@ -264,7 +286,7 @@ struct BpProf {
     uint64_t lload = 0;   // load: live-slot restore
     uint64_t lfree = 0;   // load: free-list rebuild
     uint32_t nsave = 0, nload = 0;
-    uint32_t slots = 0, live = 0, freec = 0, blocks = 0;
+    uint32_t slots = 0, live = 0, freec = 0, blocks = 0, hot = 0;
 };
 static BpProf g_prof;
 static inline uint64_t qpc() {
@@ -279,15 +301,57 @@ static void prof_report() {
         return n ? (uint32_t)(t * 1000000ull / hz / n) : 0u;
     };
     log_printf("[perf-bp] save us: walk=%u link=%u slot=%u | load us: slots=%u "
-               "free=%u | slots=%u live=%u free=%u blocks=%u\n",
+               "free=%u | slots=%u hot=%u live=%u hotfree=%u blocks=%u\n",
                us(g_prof.walk, g_prof.nsave), us(g_prof.link, g_prof.nsave),
                us(g_prof.slot, g_prof.nsave), us(g_prof.lload, g_prof.nload),
                us(g_prof.lfree, g_prof.nload),
-               g_prof.slots, g_prof.live, g_prof.freec, g_prof.blocks);
+               g_prof.slots, g_prof.hot, g_prof.live, g_prof.freec, g_prof.blocks);
     static int nrep = 0;
     if ((nrep++ % 4) == 0) log_peaks();
     g_prof = BpProf{};
 }
+
+// HOT / COLD PARTITION.
+//
+// pregrow() sizes every pool to ~2016 slots so it never has to grow mid-match
+// (a mid-match grow changes the block set between the forward sim and the
+// re-sim and desyncs). [bppeak] says what those slots are actually for: 21 of
+// the 22 pools peak at 168 live or fewer, and the whole set peaks at ~3,200
+// live out of 46,400. So the free-list chase, the canonical relink, the
+// bitmap and the load-side rebuild were all being paid on 43,000 slots that
+// the match never touches.
+//
+// `w` is a high-water slot index with the invariant: EVERY slot with index > w
+// is free, has never been allocated since the last full walk, and is therefore
+// still linked in the ascending canonical chain that the last canonicalisation
+// wrote. That makes the cold tail free by construction: the chase stops at it,
+// the bitmap ends at w, and the blob carries w instead of the whole pool.
+//
+// Allocation pops the head and the chain is ascending, so cold slots can only
+// ever be consumed in ascending order starting at slot w+1. Breaching the
+// boundary is therefore detectable at exactly one place, and THREE independent
+// conditions have to hold for the fast path to be taken:
+//   1. the chase arrives at slot w+1 (and not at some other cold-index node),
+//   2. slot w+1 still carries COLD_MAGIC at offset +4 -- an allocation writes
+//      its object over that word and freeing the slot only restores offset 0,
+//      so the magic cannot survive a round trip through the allocator, and
+//   3. slot w+1 still links to slot w+2.
+// Anything else falls back to the full walk, which recomputes w from the
+// highest live index. A false breach costs one slow save; a false fast path
+// would be a wrong free set, so the checks are deliberately redundant.
+//
+// `w` is ROLLED-BACK STATE: it goes in the blob and load() restores it, so the
+// forward sim and the re-sim (and both peers) always partition identically.
+// Without that the two timelines could emit different-length bitmaps for the
+// same simulation state and flag a false desync.
+struct PoolCache {
+    uint32_t total = 0;                  // slot count this cache was built for
+    uint32_t w     = 0;                  // high-water: index > w implies free
+    uint32_t coldw = 0xFFFFFFFFu;        // boundary the in-memory cold chain holds
+    bool     valid = false;
+};
+static PoolCache g_pc[64];
+static constexpr uint32_t COLD_MAGIC = 0xC01DC01Du;
 
 // Per-pool high-water live-slot count. pregrow() sizes EVERY pool to the same
 // ~2016 slots, so the walk, the bitmap and the relink are all paid on ~46,400
@@ -296,11 +360,13 @@ static void prof_report() {
 // pool per save.
 static uint32_t g_peak_live[64];
 static uint32_t g_peak_slots[64];
+static uint32_t g_maxlive[64];
 
 static void log_peaks() {
     for (int i = 0; i < NPOOL; ++i)
-        log_printf("[bppeak] %-22s peak_live=%u slots=%u\n",
-                   g_pool_rva[i].name, g_peak_live[i], g_peak_slots[i]);
+        log_printf("[bppeak] %-22s peak_live=%u slots=%u hot=%u maxlive=%u\n",
+                   g_pool_rva[i].name, g_peak_live[i], g_peak_slots[i],
+                   g_pc[i].valid ? g_pc[i].w + 1 : 0, g_maxlive[i]);
 }
 
 static const int NCS_MAX = 2048;
@@ -364,7 +430,7 @@ uint32_t save(uint8_t* out, uint32_t cap) {
     uint32_t magic = canon ? POOL_MAGIC_C : POOL_MAGIC, npool = NPOOL;
     if (!put(&magic, 4) || !put(&npool, 4)) return 0;
 
-    uint32_t st_slots = 0, st_live = 0, st_free = 0, st_blocks = 0;
+    uint32_t st_slots = 0, st_live = 0, st_free = 0, st_blocks = 0, st_hot = 0;
     g_ncs_n = 0;
     for (int i = 0; i < NPOOL; ++i) {
         const uint8_t* pool_rec_start = p;
@@ -379,10 +445,18 @@ uint32_t save(uint8_t* out, uint32_t cap) {
             ++nblk_seen;
             if (nblk >= 32) return;
             uint32_t ns = ss ? (s - 8) / ss : 0;
-            blk[nblk] = { b, s, total, ns };
-            total += ns;
+            blk[nblk] = { b, s, 0, ns };
             ++nblk;
         });
+        // Slot INDEX runs oldest block first, i.e. BACKWARDS along the chain.
+        // TPoolAllocator::Grow links each new block at the head, so pregrow()
+        // leaves the empty blocks at the front and the objects that already
+        // existed at the back. Indexing in chain order would put those live
+        // objects at the highest indices and pin the hot/cold high-water at the
+        // end of the pool, which is exactly what it did on the first attempt
+        // (`hot` stayed at the full 46,400). Reversed, the pregrown-and-never-
+        // touched blocks are the cold tail, which is what they are.
+        for (uint32_t b = nblk; b-- > 0; ) { blk[b].base_idx = total; total += blk[b].nslots; }
         if (nblk_seen > 32) {
             // Would silently drop the tail of the pool from BOTH the live set
             // and the free list — the exact shape of a wrong state
@@ -395,65 +469,188 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         st_slots += total; st_blocks += nblk;
         if (i < 64) g_peak_slots[i] = total;
 
-        // Mark every free slot in the bitmap by walking the free list.
-        //
-        // MEASURED: these pools hold ~46,400 slots totalling ~13.6 MB, of which
-        // only ~3,000 are live, so this chase covers ~43,000 nodes and used to
-        // be the single largest item in the frame. It is a dependent load per
-        // node, so its cost is set by how scrambled the list is — which is why
-        // the canonical rewrite below pays for itself twice: it removes the
-        // second chase AND leaves this one walking in ascending address order,
-        // where the hardware prefetcher can work.
-        const uint64_t t_walk0 = qpc();
-        memset(g_freebits, 0, (total + 7) / 8);
-        uint32_t walked = 0, mapped = 0;
-        for (uint32_t fa = pl->free_head, guard = 0; fa && guard <= total; ++guard) {
-            ++walked;
-            for (uint32_t b = 0; b < nblk; ++b) {
+        // Index <-> address inside this pool. Block base_idx is cumulative in
+        // chain order, so indices ascend across the block table.
+        auto addr_of = [&](uint32_t idx) -> uint32_t {
+            for (uint32_t b = 0; b < nblk; ++b)
+                if (idx >= blk[b].base_idx && idx < blk[b].base_idx + blk[b].nslots)
+                    return blk[b].addr + (idx - blk[b].base_idx) * ss;
+            return 0;
+        };
+        auto index_of = [&](uint32_t fa, uint32_t& out) -> bool {
+            for (uint32_t b = 0; b < nblk; ++b)
                 if (fa >= blk[b].addr && fa < blk[b].addr + blk[b].nslots * ss) {
-                    uint32_t idx = blk[b].base_idx + (fa - blk[b].addr) / ss;
+                    out = blk[b].base_idx + (fa - blk[b].addr) / ss;
+                    return true;
+                }
+            return false;
+        };
+
+        PoolCache& pc = g_pc[i];
+        if (!pc.valid || pc.total != total) {   // first save, or the pool grew
+            pc.valid = false; pc.total = total; pc.coldw = 0xFFFFFFFFu;
+            pc.w = total ? total - 1 : 0;
+        }
+        uint32_t W = canon ? pc.w : (total ? total - 1 : 0);
+
+        // Walk the free list to build the free bitmap over the HOT range
+        // [0, W]. The chase is a dependent load per node and used to cover
+        // ~43,000 of them -- the single largest item in the frame. With the
+        // partition it covers only the working set; the cold tail is free by
+        // construction (see PoolCache).
+        const uint64_t t_walk0 = qpc();
+        // `retried` = the fast path breached and we fell back. `covered_all` =
+        // the walk that succeeded covered every slot (either because the cache
+        // was cold, or because of that fallback), which is what licenses
+        // recomputing the boundary and rewriting the whole chain.
+        bool retried = false, breach = false, outside = false;
+        uint32_t mapped = 0;
+        if (total) {
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                const uint32_t cold_first  = (W + 1 < total) ? addr_of(W + 1) : 0;
+                const uint32_t cold_second = (W + 2 < total) ? addr_of(W + 2) : 0;
+                memset(g_freebits, 0, (W >> 3) + 1);
+                mapped = 0; breach = false; outside = false;
+                uint32_t fa = pl->free_head, guard = 0;
+                while (fa) {
+                    if (fa == cold_first) {
+                        const uint32_t link = *(const uint32_t*)(uintptr_t)fa;
+                        const uint32_t mag  = *(const uint32_t*)(uintptr_t)(fa + 4);
+                        if (mag != COLD_MAGIC || link != cold_second) breach = true;
+                        break;                       // cold tail intact -> done
+                    }
+                    if (++guard > total) { breach = true; break; }   // cycle
+                    uint32_t idx;
+                    if (!index_of(fa, idx)) { outside = true; break; }
+                    if (idx > W) { breach = true; break; }           // in the cold tail
                     g_freebits[idx >> 3] |= (uint8_t)(1u << (idx & 7));
                     ++mapped;
-                    break;
+                    fa = *(const uint32_t*)(uintptr_t)fa;
+                }
+                // Chain ended before reaching the cold tail: cold was consumed.
+                if (!breach && !outside && fa == 0 && cold_first != 0) breach = true;
+                if (outside) break;
+                if (!breach) break;
+                if (attempt == 1) break;             // the full walk also failed
+                W = total - 1; retried = true;       // retry, whole pool hot
+            }
+        }
+        const bool covered_all = (total != 0 && W == total - 1);
+        g_prof.walk += qpc() - t_walk0;
+
+        // THE ORACLE for the hot/cold partition. A wrong free set is the worst
+        // bug this file can produce -- linking a live object into the free list
+        // hands the same memory out twice -- and it does not announce itself:
+        // the last attempt at incremental pool tracking was reverted after a
+        // run executed pool memory as code during a re-simulation. So under
+        // SQUIROLL_BPVALIDATE the set is derived a second time by a full walk
+        // and compared. The fast path claims every slot above W is free; the
+        // full walk knows. Any disagreement is printed with the slot index.
+        if (vald && canon && total && !covered_all && !outside && !breach) {
+            memset(g_freebits_ref, 0, (total + 7) / 8);
+            uint32_t fa = pl->free_head, guard = 0, refn = 0;
+            bool ref_ok = true;
+            while (fa && guard <= total) {
+                uint32_t idx;
+                if (!index_of(fa, idx)) { ref_ok = false; break; }
+                g_freebits_ref[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+                ++refn; ++guard;
+                fa = *(const uint32_t*)(uintptr_t)fa;
+            }
+            if (!ref_ok) {
+                log_printf("[bpvald] !! %s reference walk left the blocks\n",
+                           g_pool_rva[i].name);
+            } else {
+                int bad = 0;
+                for (uint32_t idx = 0; idx < total && bad < 4; ++idx) {
+                    const bool fast = (idx > W) ||
+                        ((g_freebits[idx >> 3] >> (idx & 7)) & 1);
+                    const bool ref  = (g_freebits_ref[idx >> 3] >> (idx & 7)) & 1;
+                    if (fast != ref) {
+                        ++bad;
+                        log_printf("[bpvald] !! %s slot %u: partition says %s, "
+                                   "full walk says %s (W=%u total=%u)\n",
+                                   g_pool_rva[i].name, idx,
+                                   fast ? "free" : "live", ref ? "free" : "live",
+                                   W, total);
+                    }
                 }
             }
-            fa = *(const uint32_t*)(uintptr_t)fa;
         }
-        g_prof.walk += qpc() - t_walk0;
-        if (walked != mapped) {
-            // A node outside every block: the canonical rewrite would drop it,
-            // which changes what the allocator hands out. Refuse rather than
-            // quietly repair.
-            log_printf("[battle_pools] !! %s free list has %u node(s) outside its "
-                       "blocks (walked=%u) — save aborted\n",
-                       g_pool_rva[i].name, walked - mapped, walked);
+
+        if (outside || (breach && retried)) {
+            // A node outside every block, or a cycle in the free list. The
+            // canonical rewrite would drop or duplicate slots, which changes
+            // what the allocator hands out. Refuse rather than quietly repair.
+            log_printf("[battle_pools] !! %s free list is malformed (%s) — "
+                       "save aborted\n", g_pool_rva[i].name,
+                       outside ? "node outside every block" : "cycle");
             return 0;
         }
 
-        // Canonical rewrite. The free list's ORDER is real state — it decides
+        // New boundary: the highest LIVE index, plus half again and 64 slots of
+        // headroom, so a working set that grows steadily does not breach every
+        // frame. Every slot above the walked boundary is free, so the highest
+        // live index is always inside the bitmap we just built -- no full walk
+        // is needed to recompute this, which is the whole point: the boundary
+        // has to be able to come DOWN as well as up. (It could not on the first
+        // attempt, so it stayed wherever the very first pre-canonical save put
+        // it and the partition only trimmed 21%.)
+        const uint32_t Wwalk = W;
+        uint32_t newW = W;
+        if (total) {
+            uint32_t maxlive = 0; bool any = false;
+            for (uint32_t idx = Wwalk + 1; idx-- > 0; )
+                if (!(g_freebits[idx >> 3] & (1u << (idx & 7)))) {
+                    maxlive = idx; any = true; break;
+                }
+            uint64_t nw = any ? (uint64_t)maxlive + maxlive / 2 + 64 : 64;
+            if (nw >= total) nw = total - 1;
+            const uint32_t target = (uint32_t)nw;
+            if (i < 64) g_maxlive[i] = any ? maxlive : 0;
+            // Grow freely; shrink only once the boundary is a quarter too big,
+            // because a shrink has to rewrite the cold chain over the whole
+            // range it gives back. Hysteresis keeps that off the per-frame path.
+            if (covered_all)                    newW = target;
+            else if (target < Wwalk - (Wwalk >> 2)) newW = target;
+        }
+        // The chain has to be rewritten end to end whenever the cold tail moves.
+        const bool rewrite_all = covered_all || newW != Wwalk;
+
+        // Canonical rewrite. The free list's ORDER is real state -- it decides
         // which slot the next allocation returns, and a re-simulation has to
-        // hand out the same ones — but it is order we are free to CHOOSE, as
+        // hand out the same ones -- but it is order we are free to CHOOSE, as
         // long as both peers and both timelines choose identically. Rewriting
         // it into ascending slot-index order at every save makes it a pure
-        // function of the free SET, so the blob carries a 1-bit-per-slot
-        // bitmap (~5.8 KB) instead of ~43,000 addresses (~172 KB), the load
-        // relinks with one ascending pass instead of a pointer chase, and the
-        // next save's walk above runs in address order.
+        // function of the free SET, so the blob carries a bitmap over the hot
+        // range instead of ~43,000 addresses, the load relinks with one
+        // ascending pass instead of a pointer chase, and the next save's walk
+        // runs in address order.
         //
         // Ascending SLOT INDEX, not ascending address: the index is
         // (block position in the chain, slot within block), which is identical
         // on both peers by construction, whereas addresses need not be.
-        // Writes are elided when the link is already correct — after the first
+        // Writes are elided when the link is already correct -- after the first
         // save most of the list already is.
         const uint64_t t_link0 = qpc();
         uint32_t freec = 0;
-        if (canon) {
+        if (canon && total) {
+            // After a full walk the whole chain is rewritten (that is what
+            // re-establishes the cold tail for the new boundary); otherwise
+            // only the hot range, whose last entry links to the cold tail.
+            const uint32_t cbound    = rewrite_all ? total - 1 : newW;
+            const uint32_t cold_head = (newW + 1 < total) ? addr_of(newW + 1) : 0;
+            const uint32_t tail_link = rewrite_all ? 0 : cold_head;
             uint32_t prev = 0, head = 0;
-            for (uint32_t b = 0; b < nblk; ++b) {
+            bool done = false;
+            for (uint32_t bi = nblk; bi-- > 0 && !done; ) {
+                const uint32_t b = bi;
                 const uint32_t a0 = blk[b].addr, n0 = blk[b].nslots;
                 uint32_t idx = blk[b].base_idx;
                 for (uint32_t k = 0; k < n0; ++k, ++idx) {
-                    if (!(g_freebits[idx >> 3] & (1u << (idx & 7)))) continue;
+                    if (idx > cbound) { done = true; break; }
+                    if (idx <= Wwalk && !(g_freebits[idx >> 3] & (1u << (idx & 7))))
+                        continue;                       // known live
                     const uint32_t sa = a0 + k * ss;
                     if (prev) {
                         uint32_t* lnk = (uint32_t*)(uintptr_t)prev;
@@ -462,22 +659,30 @@ uint32_t save(uint8_t* out, uint32_t cap) {
                         head = sa;
                     }
                     prev = sa;
-                    ++freec;
+                    if (idx <= newW) ++freec;
                 }
             }
             if (prev) {
                 uint32_t* lnk = (uint32_t*)(uintptr_t)prev;
-                if (*lnk != 0) *lnk = 0;
+                if (*lnk != tail_link) *lnk = tail_link;
+            } else {
+                head = tail_link;
             }
             pl->free_head = head;
-            if (vald && freec != walked)
-                log_printf("[bpvald] !! %s canon freec=%u != walked=%u\n",
-                           g_pool_rva[i].name, freec, walked);
+            // Re-stamp the cold sentinel last, so the chain write above cannot
+            // clobber it (the chain only ever touches offset 0).
+            if (cold_head) *(uint32_t*)(uintptr_t)(cold_head + 4) = COLD_MAGIC;
+            pc.valid = true; pc.total = total; pc.w = newW; pc.coldw = newW;
+            if (vald && !covered_all && freec != mapped)
+                log_printf("[bpvald] !! %s canon hotfree=%u != walked=%u\n",
+                           g_pool_rva[i].name, freec, mapped);
         } else {
-            freec = walked;
+            freec = mapped;
+            newW  = total ? total - 1 : 0;
         }
         g_prof.link += qpc() - t_link0;
         st_free += freec;
+        st_hot  += total ? newW + 1 : 0;
 
         // The allocator struct goes in AFTER the rewrite so free_head matches
         // the emitted bitmap.
@@ -504,9 +709,12 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         uint32_t live = 0;
         const bool try_registry = !g_pool_rva[i].render_tainted &&
                                   !g_pool_rva[i].peer_local && ss >= 0x14;
-        for (uint32_t b = 0; b < nblk; ++b) {
+        bool live_done = false;
+        for (uint32_t bi = nblk; bi-- > 0 && !live_done; ) {
+            const uint32_t b = bi;
             for (uint32_t j = 0; j < blk[b].nslots; ++j) {
                 uint32_t idx = blk[b].base_idx + j;
+                if (idx > newW) { live_done = true; break; }   // cold tail: all free
                 if (g_freebits[idx >> 3] & (1u << (idx & 7))) continue;  // free
                 uint32_t sa = blk[b].addr + j * ss;
                 if (!put(&sa, 4) || !put((const void*)(uintptr_t)sa, ss)) return 0;
@@ -529,11 +737,14 @@ uint32_t save(uint8_t* out, uint32_t cap) {
         st_live += live;
         if (i < 64 && live > g_peak_live[i]) g_peak_live[i] = live;
 
-        // The free set. Canonical: [total][bitmap], one bit per slot, set =
-        // free — the order is implied. Legacy: [nfree] then one address each.
+        // The free set. Canonical: [total][w][bitmap over the HOT range
+        // [0, w]], bit set = free; every slot above w is free by construction
+        // and the order is implied. Legacy: [nfree] then one address each.
         if (canon) {
-            const uint32_t nbytes = (total + 7) / 8;
-            if (!put(&total, 4) || !put(g_freebits, nbytes)) return 0;
+            const uint32_t nbits  = total ? newW + 1 : 0;
+            const uint32_t nbytes = (nbits + 7) / 8;
+            if (!put(&total, 4) || !put(&newW, 4)) return 0;
+            if (nbytes && !put(g_freebits, nbytes)) return 0;
         } else {
             if (p + 4 > end) return 0;
             uint32_t* nfree = (uint32_t*)p; p += 4;
@@ -568,6 +779,7 @@ uint32_t save(uint8_t* out, uint32_t cap) {
 
     g_prof.slots = st_slots; g_prof.live = st_live;
     g_prof.freec = st_free;  g_prof.blocks = st_blocks;
+    g_prof.hot   = st_hot;
     ++g_prof.nsave;
     prof_report();
     return (uint32_t)(p - out);
@@ -870,7 +1082,7 @@ void load(const uint8_t* blob, uint32_t len) {
         // Block table. The canonical format needs it (the free set is by slot
         // index, so index -> address is resolved here); the legacy format
         // restored by absolute address and read past it.
-        struct Blk { uint32_t addr, nslots; };
+        struct Blk { uint32_t addr, base_idx, nslots; };
         Blk blk[32];
         uint32_t nblk = 0;
         if (!get_u32(nblk)) return;
@@ -878,8 +1090,11 @@ void load(const uint8_t* blob, uint32_t len) {
         for (uint32_t b = 0; b < nblk; ++b) {
             uint32_t a = 0, sz = 0;
             if (!get_u32(a) || !get_u32(sz)) return;
-            blk[b] = { a, ss ? (sz - 8) / ss : 0 };
+            blk[b] = { a, 0, ss ? (sz - 8) / ss : 0 };
         }
+        // Same reversed index order as save() — oldest block is index 0.
+        { uint32_t acc = 0;
+          for (uint32_t b = nblk; b-- > 0; ) { blk[b].base_idx = acc; acc += blk[b].nslots; } }
 
         // Live slots — memcpy each back to its stable address.
         const uint64_t t_l0 = qpc();
@@ -902,17 +1117,37 @@ void load(const uint8_t* blob, uint32_t len) {
         // almost all of them.
         const uint64_t t_f0 = qpc();
         if (canon) {
-            uint32_t total = 0;
-            if (!get_u32(total)) return;
-            const uint32_t nbytes = (total + 7) / 8;
+            uint32_t total = 0, w = 0;
+            if (!get_u32(total) || !get_u32(w)) return;
+            const uint32_t nbits  = total ? w + 1 : 0;
+            const uint32_t nbytes = (nbits + 7) / 8;
             if (p + nbytes > end) return;
             const uint8_t* bits = p; p += nbytes;
+            // Rebuild the hot chain [0, w] in ascending order and hand off to
+            // the cold tail. The cold tail is rewritten only when the boundary
+            // it currently holds is not the one being restored -- that happens
+            // on the first restore, and whenever a rollback crosses a save
+            // where the working set grew. w is part of the blob precisely so
+            // both timelines partition the same way (see PoolCache).
+            PoolCache& pc = g_pc[i];
+            const bool need_cold = !pc.valid || pc.total != total || pc.coldw != w;
+            const uint32_t cbound = need_cold ? (total ? total - 1 : 0) : w;
+            auto addr_of = [&](uint32_t x) -> uint32_t {
+                for (uint32_t b = 0; b < nblk; ++b)
+                    if (x >= blk[b].base_idx && x < blk[b].base_idx + blk[b].nslots)
+                        return blk[b].addr + (x - blk[b].base_idx) * ss;
+                return 0;
+            };
+            const uint32_t cold_head = (w + 1 < total) ? addr_of(w + 1) : 0;
+            const uint32_t tail_link = need_cold ? 0 : cold_head;
             uint32_t prev = 0, idx = 0;
-            for (uint32_t b = 0; b < nblk; ++b) {
-                const uint32_t a0 = blk[b].addr, n0 = blk[b].nslots;
+            bool done = false;
+            for (uint32_t bi = nblk; bi-- > 0 && !done; ) {
+                const uint32_t a0 = blk[bi].addr, n0 = blk[bi].nslots;
                 for (uint32_t k = 0; k < n0; ++k, ++idx) {
-                    if (idx >= total) break;
-                    if (!(bits[idx >> 3] & (1u << (idx & 7)))) continue;
+                    if (idx > cbound) { done = true; break; }
+                    // Above w every slot is free by construction.
+                    if (idx <= w && !(bits[idx >> 3] & (1u << (idx & 7)))) continue;
                     const uint32_t sa = a0 + k * ss;
                     if (prev) {
                         uint32_t* lnk = (uint32_t*)(uintptr_t)prev;
@@ -923,8 +1158,10 @@ void load(const uint8_t* blob, uint32_t len) {
             }
             if (prev) {
                 uint32_t* lnk = (uint32_t*)(uintptr_t)prev;
-                if (*lnk != 0) *lnk = 0;
+                if (*lnk != tail_link) *lnk = tail_link;
             }
+            if (cold_head) *(uint32_t*)(uintptr_t)(cold_head + 4) = COLD_MAGIC;
+            pc.valid = true; pc.total = total; pc.w = w; pc.coldw = w;
         } else {
             uint32_t nfree = 0;
             if (!get_u32(nfree)) return;
@@ -1258,8 +1495,10 @@ namespace {
 // Free-section size in a save() blob. Canonical ('POOC'): [total][bitmap],
 // one bit per slot. Legacy ('POOL'): [nfree][nfree x addr].
 static inline uint32_t free_sect_bytes(const uint8_t* b, uint32_t off, bool canon) {
-    uint32_t n = *(const uint32_t*)(b + off);
-    return canon ? 4 + (n + 7) / 8 : 4 + n * 4;
+    if (!canon) return 4 + *(const uint32_t*)(b + off) * 4;   // [nfree][addrs]
+    const uint32_t total = *(const uint32_t*)(b + off);       // [total][w][bits]
+    const uint32_t w     = *(const uint32_t*)(b + off + 4);
+    return 8 + ((total ? w + 1 : 0) + 7) / 8;
 }
 // Walk the save() blob (fwd's structure) and report EVERY diverging live slot
 // (pool / slot real address / first diverging field + value), capped. Reporting
@@ -1396,9 +1635,10 @@ void diff_report(const uint8_t* fwd, const uint8_t* re, uint32_t len) {
             }
         }
         if (off + 4 > len) break;
+        const uint32_t hdr   = canon ? 8u : 4u;   // [total][w] vs [nfree]
         const uint32_t nfree = *(const uint32_t*)(fwd + off);
-        const uint32_t fl0   = off + 4;
-        const uint32_t flen  = free_sect_bytes(fwd, off, canon) - 4;
+        const uint32_t fl0   = off + hdr;
+        const uint32_t flen  = free_sect_bytes(fwd, off, canon) - hdr;
         off = fl0 + flen;
         // Free-SET divergence (canonical) or allocation-ORDER divergence
         // (legacy) — either way a real sim signal, not render noise.
