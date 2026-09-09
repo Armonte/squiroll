@@ -878,7 +878,24 @@ static const uint32_t g_boostpool_rva[] = {
 };
 static constexpr int NBOOSTPOOL =
     (int)(sizeof(g_boostpool_rva) / sizeof(g_boostpool_rva[0]));
-static constexpr uint32_t BOOSTPOOL_MAGIC = 0x4C4F4F4D;  // 'MOOL'
+static constexpr uint32_t BOOSTPOOL_MAGIC  = 0x4C4F4F4D;  // 'MOOL' — whole-block
+static constexpr uint32_t BOOSTPOOL_MAGIC2 = 0x324F4F4D;  // 'MOO2' — live-slot + bitmap
+// Per-record kind, so one bad pool falls back on its own instead of forcing the
+// whole section back to whole-block.
+enum : uint32_t { MPK_EMPTY = 0, MPK_BITMAP = 1, MPK_RAW = 2 };
+static constexpr uint32_t MP_MAXSLOT = 65536;
+static uint8_t g_mpbits[MP_MAXSLOT / 8];      // NOT shared with save()'s g_freebits
+static uint8_t g_mpbits_ref[MP_MAXSLOT / 8];  // SQUIROLL_BPVALIDATE cross-check
+
+// SQUIROLL_BPMPCANON=0 keeps the pre-2026-09-08 whole-block format, as the A/B
+// arm in the same binary (SQUIROLL_BPCANON is the model).
+static bool mpcanon_on() {
+    static int v = -1;
+    if (v < 0) { char b[8] = {0};
+        v = (GetEnvironmentVariableA("SQUIROLL_BPMPCANON", b, sizeof b) > 0 &&
+             b[0] == '0') ? 0 : 1; }
+    return v != 0;
+}
 
 // Diagnostic probe: the player's va.x C++ address (set by the [nuttrace]
 // __gekko_watch_va native). boostpool_save/load log the value at this address as
@@ -892,6 +909,67 @@ void set_va_probe(uint32_t a) { g_va_probe = a; log_printf("[bpprobe] set_va_pro
 int g_load_frame = -2;
 void set_load_frame(int f) { g_load_frame = f; }
 
+// MEASUREMENT (SQUIROLL_MPCENSUS=N, every N saves): what the boostpool section
+// is actually made of. The section costs 227 us to save and 544-890 us to LOAD
+// on the dual rig but only ~52 us to load on the solo rig -- a 12x gap that
+// says the two rigs are not exercising the same thing, and the load side is
+// whole-block memcpy, so its cost is exactly "bytes written". Per pool: blocks,
+// slots, how many are live, bytes, and which region the blocks live in.
+//
+// Three questions answered at once:
+//   * the live fraction -- decides whether live-slot serialization is worth
+//     anything here, or whether these pools are simply full;
+//   * whether the free lists are monotone in slot index in practice (this
+//     family's allocator inserts by ascending address, unlike the family that
+//     save() serves, which pushes at the head);
+//   * how many blocks sit in cpp_arena (0x30xxxxxx) rather than the tf4 mspace
+//     -- because blocks in cpp_arena are ALREADY dirty-page captured and
+//     restored by snapshot_ring, and duplicating them here would be pure waste.
+static int mpcensus_every() {
+    static int v = -1;
+    if (v < 0) { char b[16] = {0}; v = 0;
+        if (GetEnvironmentVariableA("SQUIROLL_MPCENSUS", b, sizeof b) > 0) {
+            for (const char* c = b; *c >= '0' && *c <= '9'; ++c) v = v * 10 + (*c - '0');
+            if (v <= 0) v = 240; } }
+    return v;
+}
+static void mp_census() {
+    uint32_t tot_bytes = 0, tot_slots = 0, tot_live = 0, tot_blk = 0, tot_cpp = 0;
+    log_printf("[mpcensus] ==== boost pools ====\n");
+    for (int i = 0; i < NBOOSTPOOL; ++i) {
+        const Pool* pl = (const Pool*)(g_boostpool_rva[i] + base_address);
+        const uint32_t ss = pl->slot_size;
+        if (!ss || !pl->block_list_head) continue;
+        struct B { uint32_t addr, size, nslots; };
+        B blk[64]; uint32_t nblk = 0, slots = 0, bytes = 0, in_cpp = 0;
+        for_each_block(pl, [&](uint32_t b, uint32_t sz) {
+            if (nblk >= 64) return;
+            const uint32_t ns = (sz > 8) ? (sz - 8) / ss : 0;
+            blk[nblk++] = { b, sz, ns };
+            slots += ns; bytes += sz;
+            if ((b & 0xFF000000u) == 0x30000000u) ++in_cpp;
+        });
+        // Free count + whether the list ascends in address order.
+        uint32_t nfree = 0; bool mono = true; uint32_t prev = 0;
+        for (uint32_t fa = pl->free_head, g = 0; fa && g <= slots; ++g) {
+            if (prev && fa < prev) mono = false;
+            prev = fa; ++nfree;
+            fa = *(const uint32_t*)(uintptr_t)fa;
+        }
+        const uint32_t live = (nfree <= slots) ? slots - nfree : 0;
+        tot_bytes += bytes; tot_slots += slots; tot_live += live;
+        tot_blk += nblk; tot_cpp += in_cpp;
+        log_printf("[mpcensus] rva=%05X stride=%-4u blk=%-3u slots=%-5u live=%-5u "
+                   "free=%-5u bytes=%-7u cpp_blk=%u/%u addr=%08X %s\n",
+                   g_boostpool_rva[i], ss, nblk, slots, live, nfree, bytes,
+                   in_cpp, nblk, nblk ? blk[0].addr : 0,
+                   mono ? "ASCENDING" : "!! NOT-ASCENDING");
+    }
+    log_printf("[mpcensus] TOTAL blocks=%u (%u in cpp_arena) slots=%u live=%u "
+               "(%u%%) bytes=%u KB\n", tot_blk, tot_cpp, tot_slots, tot_live,
+               tot_slots ? tot_live * 100 / tot_slots : 0, tot_bytes / 1024);
+}
+
 uint32_t boostpool_save(uint8_t* out, uint32_t cap) {
     uint8_t* p = out;
     uint8_t* end = out + cap;
@@ -904,8 +982,14 @@ uint32_t boostpool_save(uint8_t* out, uint32_t cap) {
         return true;
     };
 
-    uint32_t magic = BOOSTPOOL_MAGIC, npool = (uint32_t)NBOOSTPOOL;
+    uint32_t magic = mpcanon_on() ? BOOSTPOOL_MAGIC2 : BOOSTPOOL_MAGIC;
+    uint32_t npool = (uint32_t)NBOOSTPOOL;
     if (!put(&magic, 4) || !put(&npool, 4)) return 0;
+
+    if (const int every = mpcensus_every()) {
+        static int n = 0;
+        if (n++ % every == 0) mp_census();
+    }
 
     { static int _dn = 0; if (_dn < 4) { _dn++; log_printf("[bpprobe] boostpool_save sees g_va_probe=%08X f=%d\n", g_va_probe, _pf); } }
 
@@ -928,28 +1012,226 @@ uint32_t boostpool_save(uint8_t* out, uint32_t cap) {
         log_printf("[bpcover] va.x @%08X covered_by_boostpool=%d\n", g_va_probe, covered);
     }
 
+    // ---- live-slot + free-bitmap records ('MOO2') -------------------------
+    //
+    // The whole-block path below copied 1,092 KB of block memory on EVERY save
+    // and every load ([mpcensus]: 64 blocks, 18,304 slots, 32% live). Only
+    // ~135 KB of that is live -- two of the pools hold 448 KB with ZERO live
+    // slots. So emit the live slots and a free bitmap instead, and rebuild the
+    // free chain on load.
+    //
+    // What makes this cheap and safe here, and DIFFERENT from the sibling
+    // save(): this pool family's allocator (th155 0x45D20) splices new blocks
+    // and freed chunks into the free list by ASCENDING ADDRESS, where the
+    // family save() serves (0x37C30) pushes at the head. [mpcensus] confirms it
+    // on every pool, every frame: the free lists are already sorted. So the
+    // canonical order we want is the order the game already maintains, which
+    // means:
+    //   * slot index is assigned by ascending block ADDRESS (blocks are sorted
+    //     here, so we do not have to assume anything about chain order), and
+    //     index order then coincides with the allocator's own free-list order;
+    //   * boostpool_save WRITES NOTHING -- it is a pure read. That matters
+    //     because these pools' structs live in .data and are owned by
+    //     engine_snap: with no writes there is no ordering requirement between
+    //     the two sections at all. (If anyone ever adds a write to the pool
+    //     struct here, boostpool_save MUST stay ahead of engine_snap::save in
+    //     gekko_bridge.cpp, or engine_snap captures a free_head that
+    //     contradicts the emitted bitmap.)
+    //   * the free_head engine_snap restores equals the head of the chain this
+    //     rebuilds, by construction: both are the lowest free slot.
+    //
+    // Anything unexpected -- a non-monotone free list, a node outside every
+    // block, a cycle, too many blocks, a size that is not a whole number of
+    // slots -- falls back to a whole-block RAW record for THAT POOL ONLY, and
+    // logs. A wrong free set here hands the same memory out twice, so the
+    // checks refuse rather than repair.
+    const bool mpcanon = mpcanon_on();
+    const bool mpvald  = validate_on();
     for (int i = 0; i < NBOOSTPOOL; ++i) {
         const Pool* pl = (const Pool*)(g_boostpool_rva[i] + base_address);
-        // Count blocks first (single-threaded save: the set is stable between
-        // the two walks) so the reader knows how many block records follow.
-        uint32_t nblk = 0;
-        for_each_block(pl, [&](uint32_t, uint32_t) { ++nblk; });
-        if (!put(&nblk, 4)) return 0;
-        bool ok = true;
-        for_each_block(pl, [&](uint32_t b, uint32_t s) {
-            if (!ok) return;
-            if (_plog && g_va_probe >= b && g_va_probe < b + s)
-                log_printf("[bpsave] f=%d rb=%d pool#%d SAVE block %08X..%08X "
-                           "va.x=%08X (probe in this block)\n", _pf,
-                           gekko_bridge::g_trace_rb, i, b, b + s,
-                           *(const uint32_t*)(uintptr_t)g_va_probe);
-            // [addr][size][size bytes] -- the whole block, including its
-            // 8-byte block-list trailer (next-ptr/next-size, stable pointers).
-            if (!put(&b, 4) || !put(&s, 4) ||
-                !put((const void*)(uintptr_t)b, s)) ok = false;
-        });
-        if (!ok) return 0;
+        const uint32_t ss = pl->slot_size;
+
+        struct MBlk { uint32_t addr, size, base_idx, nslots; };
+        MBlk blk[64];
+        uint32_t nblk = 0, total = 0;
+        // WHICH POOLS THIS PAYS FOR, and why it is a static rule.
+        //
+        // Live-slot serialization trades a walk over every SLOT for not copying
+        // every BYTE. Measured on the dual rig, alternating arms in one binary:
+        // it takes the section's load from ~627 us to ~285 us, but its save
+        // from ~159 us to ~239 us -- and there are roughly SEVEN saves per load,
+        // so paying 80 us on save to win 342 us on load is a net loss of about
+        // 220 us a frame. Per-call numbers are the wrong thing to optimise here.
+        //
+        // The trade is only good when a slot is big: walking one slot buys not
+        // copying `stride` bytes. At stride 224-272 the pools are nearly all
+        // free and the whole-block copy is almost entirely waste (two of them
+        // hold 448 KB with ZERO live slots); at stride 20 a pool has 8,160
+        // slots to walk and 163 KB to copy, and the memcpy wins easily.
+        //
+        // So: bitmap for stride >= 64, whole-block below it. The threshold is a
+        // function of slot_size alone -- a constant of the pool, identical on
+        // both peers and in every timeline -- so it cannot make the record
+        // history-dependent.
+        bool raw = !mpcanon || ss < 64;
+        if (!ss || !pl->block_list_head) {
+            if (mpcanon) { uint32_t k = MPK_EMPTY; if (!put(&k, 4)) return 0; continue; }
+        }
+        if (mpcanon) {
+            bool bad = false;
+            for_each_block(pl, [&](uint32_t b, uint32_t sz) {
+                if (nblk >= 64 || sz < 8 || ss == 0 || ((sz - 8) % ss) != 0) { bad = true; return; }
+                blk[nblk++] = { b, sz, 0, (sz - 8) / ss };
+            });
+            if (bad || !nblk) raw = true;
+            if (!raw) {
+                // Sort by address, then number slots in that order. Sorting
+                // rather than trusting chain order keeps this independent of
+                // how the allocator links blocks.
+                for (uint32_t a = 1; a < nblk; ++a) {
+                    MBlk t = blk[a]; uint32_t b = a;
+                    while (b && blk[b - 1].addr > t.addr) { blk[b] = blk[b - 1]; --b; }
+                    blk[b] = t;
+                }
+                for (uint32_t b = 0; b < nblk; ++b) { blk[b].base_idx = total; total += blk[b].nslots; }
+                if (total > MP_MAXSLOT) raw = true;
+            }
+        }
+
+        uint32_t w = 0, nlive = 0;
+        if (!raw && mpcanon) {
+            auto index_of = [&](uint32_t fa, uint32_t& out) -> bool {
+                for (uint32_t b = 0; b < nblk; ++b)
+                    if (fa >= blk[b].addr && fa < blk[b].addr + blk[b].nslots * ss) {
+                        if ((fa - blk[b].addr) % ss) return false;   // mid-slot pointer
+                        out = blk[b].base_idx + (fa - blk[b].addr) / ss;
+                        return true;
+                    }
+                return false;
+            };
+            // Deriving the free set by CHASING the list costs ~30 ns a node --
+            // a cache miss each, 12,300 of them across these pools, ~375 us,
+            // which is MORE than the 1 MB whole-block copy it was meant to
+            // replace. (And there are ~9 saves per load, so the save side is
+            // what the frame budget actually weighs.)
+            //
+            // Since the list is ascending, walk the SLOTS forward and the chain
+            // alongside them: a slot is free exactly when it is the one the
+            // chain currently expects, and then the chain's next expectation is
+            // that slot's own first dword -- which is a line the scan has just
+            // loaded. So the chase disappears into a sequential stride and the
+            // prefetcher can work, with no heuristic anywhere: this is a merge
+            // of two ascending sequences, not a guess about what a slot holds.
+            // (A classifier that called a slot free when its first dword was 0
+            // or a plausible in-pool pointer was tried first and mis-classified
+            // constantly -- plenty of live objects start with a null pointer.)
+            //
+            // If the chain is NOT ascending, the expectation is never met, the
+            // walk ends with a non-zero expectation, and the pool falls back to
+            // a whole-block record. That is the only assumption, and it fails
+            // loudly rather than silently.
+            memset(g_mpbits, 0, (total + 7) / 8);
+            uint32_t nfree = 0;
+            const char* why = nullptr;
+            {
+                uint32_t expect = pl->free_head;
+                for (uint32_t b = 0; b < nblk; ++b) {
+                    const uint32_t a0 = blk[b].addr, n0 = blk[b].nslots;
+                    for (uint32_t j = 0; j < n0; ++j) {
+                        const uint32_t sa = a0 + j * ss;
+                        if (sa != expect) continue;                 // live
+                        const uint32_t idx = blk[b].base_idx + j;
+                        g_mpbits[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+                        ++nfree;
+                        expect = *(const uint32_t*)(uintptr_t)sa;
+                    }
+                }
+                if (expect != 0) why = "free list is not in ascending address order";
+            }
+            if (why) {
+                static int nwarn = 0;
+                if (nwarn < 12) { ++nwarn;
+                    log_printf("[battle_pools] boostpool rva=%05X %s — whole-block "
+                               "record for this pool\n", g_boostpool_rva[i], why); }
+                raw = true;
+            } else {
+                // w = highest LIVE index, a pure function of the free set. The
+                // hot/cold boundary lesson from save(): nothing history-dependent
+                // may reach the record.
+                bool any = false;
+                for (uint32_t idx = total; idx-- > 0; )
+                    if (!(g_mpbits[idx >> 3] & (1u << (idx & 7)))) { w = idx; any = true; break; }
+                if (!any) w = 0;
+                for (uint32_t idx = 0; idx <= w && idx < total; ++idx)
+                    if (!(g_mpbits[idx >> 3] & (1u << (idx & 7)))) ++nlive;
+                if (mpvald && nblk && pl->free_head) {
+                    uint32_t lo = 0; bool found = false;
+                    for (uint32_t idx = 0; idx < total && !found; ++idx)
+                        if (g_mpbits[idx >> 3] & (1u << (idx & 7))) { lo = idx; found = true; }
+                    // engine_snap restores free_head; this asserts it will agree
+                    // with the chain load rebuilds.
+                    if (found) {
+                        uint32_t a = 0;
+                        for (uint32_t b = 0; b < nblk; ++b)
+                            if (lo >= blk[b].base_idx && lo < blk[b].base_idx + blk[b].nslots)
+                                a = blk[b].addr + (lo - blk[b].base_idx) * ss;
+                        if (a != pl->free_head)
+                            log_printf("[mpvald] !! rva=%05X free_head=%08X but lowest "
+                                       "free slot is %08X\n", g_boostpool_rva[i],
+                                       pl->free_head, a);
+                    }
+                }
+            }
+        }
+
+        if (mpcanon && !raw) {
+            uint32_t k = MPK_BITMAP;
+            if (!put(&k, 4) || !put(&ss, 4) || !put(&nblk, 4)) return 0;
+            for (uint32_t b = 0; b < nblk; ++b)
+                if (!put(&blk[b].addr, 4) || !put(&blk[b].size, 4)) return 0;
+            if (!put(&total, 4) || !put(&w, 4) || !put(&nlive, 4)) return 0;
+            for (uint32_t b = 0; b < nblk; ++b) {
+                for (uint32_t j = 0; j < blk[b].nslots; ++j) {
+                    const uint32_t idx = blk[b].base_idx + j;
+                    if (idx > w) break;
+                    if (g_mpbits[idx >> 3] & (1u << (idx & 7))) continue;   // free
+                    if (!put((const void*)(uintptr_t)(blk[b].addr + j * ss), ss)) return 0;
+                }
+            }
+            const uint32_t nbits = total ? w + 1 : 0, nbytes = (nbits + 7) / 8;
+            // Mask the stray high bits, and zero the alignment pad: both are
+            // history rather than state, and both are the c867e10 bug class.
+            if (const uint32_t stray = nbits & 7)
+                g_mpbits[nbytes - 1] &= (uint8_t)((1u << stray) - 1);
+            if (nbytes && !put(g_mpbits, nbytes)) return 0;
+            const uint32_t pad = (4 - (nbytes & 3)) & 3;
+            if (pad) { const uint32_t z = 0; if (!put(&z, pad)) return 0; }
+            continue;
+        }
+
+        // ---- RAW: the original whole-block record --------------------------
+        if (mpcanon) { uint32_t k = MPK_RAW; if (!put(&k, 4)) return 0; }
+        {
+            uint32_t nb = 0;
+            for_each_block(pl, [&](uint32_t, uint32_t) { ++nb; });
+            if (!put(&nb, 4)) return 0;
+            bool ok = true;
+            for_each_block(pl, [&](uint32_t b, uint32_t sz) {
+                if (!ok) return;
+                if (_plog && g_va_probe >= b && g_va_probe < b + sz)
+                    log_printf("[bpsave] f=%d rb=%d pool#%d SAVE block %08X..%08X "
+                               "va.x=%08X (probe in this block)\n", _pf,
+                               gekko_bridge::g_trace_rb, i, b, b + sz,
+                               *(const uint32_t*)(uintptr_t)g_va_probe);
+                // [addr][size][size bytes] -- the whole block, including its
+                // 8-byte block-list trailer (next-ptr/next-size, stable pointers).
+                if (!put(&b, 4) || !put(&sz, 4) ||
+                    !put((const void*)(uintptr_t)b, sz)) ok = false;
+            });
+            if (!ok) return 0;
+        }
     }
+
     return (uint32_t)(p - out);
 }
 
@@ -998,6 +1280,49 @@ static bool bp_wp(const char* tag, uint32_t a, uint32_t l) {
     return g_bp_skip_band;
 }
 
+// SQUIROLL_BPVALIDATE: called from the load path AFTER engine_snap has put the
+// pool structs back. boostpool_load rebuilds the free chain, engine_snap
+// restores free_head, and nothing else checks that the two agree -- that is the
+// single assumption the live-slot format rests on (both are "the lowest free
+// slot", so they are equal by construction). This is the witness.
+//
+// Walking from the restored head, the chain must be strictly ascending in
+// address, stay inside the pool's blocks, land on slot boundaries, and
+// terminate. A head left pointing at a LIVE slot fails immediately: a live
+// slot's first dword is a vtable, which is outside every block.
+bool validate_enabled() { return validate_on(); }
+
+void boostpool_verify(const char* when) {
+    for (int i = 0; i < NBOOSTPOOL; ++i) {
+        const Pool* pl = (const Pool*)(g_boostpool_rva[i] + base_address);
+        const uint32_t ss = pl->slot_size;
+        if (!ss || !pl->block_list_head) continue;
+        struct R { uint32_t lo, hi; };
+        R rg[64]; uint32_t nr = 0, slots = 0;
+        for_each_block(pl, [&](uint32_t b, uint32_t sz) {
+            if (nr >= 64 || sz < 8) return;
+            const uint32_t ns = (sz - 8) / ss;
+            rg[nr++] = { b, b + ns * ss };
+            slots += ns;
+        });
+        const char* why = nullptr;
+        uint32_t n = 0, prev = 0;
+        for (uint32_t fa = pl->free_head; fa; ++n) {
+            if (n > slots) { why = "cycle"; break; }
+            bool in = false;
+            for (uint32_t r = 0; r < nr && !in; ++r)
+                if (fa >= rg[r].lo && fa < rg[r].hi && ((fa - rg[r].lo) % ss) == 0) in = true;
+            if (!in) { why = "node outside every block (head into a live slot?)"; break; }
+            if (prev && fa <= prev) { why = "not ascending"; break; }
+            prev = fa;
+            fa = *(const uint32_t*)(uintptr_t)fa;
+        }
+        if (why)
+            log_printf("[mpvald] !! %s: rva=%05X free chain broken after %u nodes: %s "
+                       "(head=%08X)\n", when, g_boostpool_rva[i], n, why, pl->free_head);
+    }
+}
+
 void boostpool_load(const uint8_t* blob, uint32_t len) {
     if (len < 8) return;
     const uint8_t* p   = blob;
@@ -1011,7 +1336,8 @@ void boostpool_load(const uint8_t* blob, uint32_t len) {
 
     uint32_t magic = 0, npool = 0;
     if (!get(&magic, 4) || !get(&npool, 4)) return;
-    if (magic != BOOSTPOOL_MAGIC || npool != (uint32_t)NBOOSTPOOL) {
+    const bool mpcanon = (magic == BOOSTPOOL_MAGIC2);
+    if ((magic != BOOSTPOOL_MAGIC && !mpcanon) || npool != (uint32_t)NBOOSTPOOL) {
         log_printf("[battle_pools] boostpool_load: bad header magic=%08x "
                    "npool=%u\n", magic, npool);
         return;
@@ -1023,6 +1349,81 @@ void boostpool_load(const uint8_t* blob, uint32_t len) {
 
     for (uint32_t i = 0; i < npool && i < (uint32_t)NBOOSTPOOL; ++i) {
         const Pool* pl = (const Pool*)(g_boostpool_rva[i] + base_address);
+        uint32_t kind = MPK_RAW;
+        if (mpcanon && !get(&kind, 4)) return;
+        if (kind == MPK_EMPTY) continue;
+
+        if (kind == MPK_BITMAP) {
+            // Live slots back to their saved addresses, then one ascending pass
+            // that relinks the free chain. Everything comes from the BLOB's own
+            // block table -- never from the live pool struct, which at this
+            // point is still the un-reverted one (engine_snap restores it after
+            // us; see the note in the RAW path below, which cost a real bug).
+            uint32_t ss = 0, nblk = 0, total = 0, w = 0, nlive = 0;
+            if (!get(&ss, 4) || !get(&nblk, 4)) return;
+            if (!ss || nblk > 64) return;
+            struct MBlk { uint32_t addr, base_idx, nslots; };
+            MBlk blk[64];
+            for (uint32_t b = 0; b < nblk; ++b) {
+                uint32_t a = 0, sz = 0;
+                if (!get(&a, 4) || !get(&sz, 4)) return;
+                blk[b] = { a, 0, (sz > 8) ? (sz - 8) / ss : 0 };
+            }
+            if (!get(&total, 4) || !get(&w, 4) || !get(&nlive, 4)) return;
+            { uint32_t acc = 0;
+              for (uint32_t b = 0; b < nblk; ++b) { blk[b].base_idx = acc; acc += blk[b].nslots; }
+              if (acc != total) {
+                  log_printf("[battle_pools] boostpool_load rva=%05X block table "
+                             "gives %u slots, blob says %u — skipped\n",
+                             g_boostpool_rva[i], acc, total);
+                  return;
+              } }
+            const uint32_t nbits = total ? w + 1 : 0, nbytes = (nbits + 7) / 8;
+            // The bitmap follows the live bodies, so find it first to classify
+            // slots while walking.
+            const uint8_t* bodies = p;
+            if (p + (size_t)nlive * ss + nbytes > end) return;
+            const uint8_t* bits = p + (size_t)nlive * ss;
+            uint32_t used = 0;
+            for (uint32_t b = 0; b < nblk; ++b) {
+                for (uint32_t j = 0; j < blk[b].nslots; ++j) {
+                    const uint32_t idx = blk[b].base_idx + j;
+                    if (idx > w) break;
+                    if (bits[idx >> 3] & (1u << (idx & 7))) continue;    // free
+                    if (used >= nlive) break;
+                    const uint32_t sa = blk[b].addr + j * ss;
+                    if (!bp_wp("boost", sa, ss))
+                        memcpy((void*)(uintptr_t)sa, bodies + (size_t)used * ss, ss);
+                    ++used;
+                }
+            }
+            // Free chain, ascending. Index order is ascending block address, so
+            // this reproduces exactly the order this pool's allocator maintains,
+            // and its head is the lowest free slot -- which is the free_head
+            // engine_snap is about to restore.
+            uint32_t prev = 0;
+            for (uint32_t b = 0; b < nblk; ++b) {
+                for (uint32_t j = 0; j < blk[b].nslots; ++j) {
+                    const uint32_t idx = blk[b].base_idx + j;
+                    const bool free_ = (idx > w) ||
+                                       ((bits[idx >> 3] >> (idx & 7)) & 1);
+                    if (!free_) continue;
+                    const uint32_t sa = blk[b].addr + j * ss;
+                    if (prev) {
+                        uint32_t* lnk = (uint32_t*)(uintptr_t)prev;
+                        if (*lnk != sa) *lnk = sa;
+                    }
+                    prev = sa;
+                }
+            }
+            if (prev) {
+                uint32_t* lnk = (uint32_t*)(uintptr_t)prev;
+                if (*lnk != 0) *lnk = 0;
+            }
+            p = bits + nbytes + ((4 - (nbytes & 3)) & 3);   // skip the zero pad
+            continue;
+        }
+
         uint32_t nblk = 0;
         if (!get(&nblk, 4)) return;
         for (uint32_t b = 0; b < nblk; ++b) {

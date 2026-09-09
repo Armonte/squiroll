@@ -46,6 +46,10 @@ bool     load(const uint8_t* blob, uint32_t len);
 // Diagnostics.
 bool   installed();
 size_t live_bytes();   // bytes currently handed out (excludes free-listed)
+// SQUIROLL_PAGEHIST: describe the block(s) covering a 4 KB page of the arena
+// (offset, requested size, size class, live/free, first payload dwords) into
+// out[0..outn). Returns bytes written.
+int describe_page(uint32_t page_off, char* out, int outn);
 
 } // namespace sq_arena
 

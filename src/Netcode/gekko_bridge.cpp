@@ -2057,8 +2057,17 @@ void load_state_from_buf(const void* buf, uint32_t len) {
             };
             sect(&battle_pools::load, &pl_bp);
             battle_pools::set_load_frame((int)hdr->frame);  // probe: which save is being restored
+            // ORDER NOTE: boostpool_load rebuilds the boost-pool free chains
+            // from the blob's own block table; engine_snap then restores those
+            // pools' .data structs, including free_head. The two agree because
+            // both are "the lowest free slot" -- boostpool_save writes nothing,
+            // so engine_snap captured a free_head the allocator itself left.
+            // If a write to the pool struct is ever added to boostpool_save,
+            // it MUST stay ahead of engine_snap::save on the save side.
             sect(&battle_pools::boostpool_load, &pl_mp);   // Sqrat math boost::pools
             sect(&engine_snap::load, &pl_eng);
+            if (battle_pools::validate_enabled())
+                battle_pools::boostpool_verify("post-eng");
             sect(&input_rec_load, &pl_ir);
             sect(&input_hist::load, &pl_ih);
             sect(&engine_snap::rng_load, &pl_rng);   // restore-but-not-checksum

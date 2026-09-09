@@ -211,6 +211,37 @@ static void cdecl hook_free(void* block) {
 
 } // namespace
 
+// DIAGNOSTIC (SQUIROLL_PAGEHIST): name what lives on a 4 KB page of the arena.
+// The dirty-page histogram in snapshot_ring says WHICH pages the Squirrel VM
+// rewrites every frame; this says what is on them. Blocks are power-of-two
+// sized and laid down contiguously from the bump, so the region is walkable
+// header to header exactly like cpp_arena's map_live_pages().
+int describe_page(uint32_t page_off, char* out, int outn) {
+    if (!g_base || !g_meta || outn < 32) return 0;
+    const uint32_t pg_lo = page_off & ~4095u, pg_hi = pg_lo + 4096;
+    uint32_t off = (sizeof(Meta) + 15u) & ~15u;
+    const uint32_t bump = g_meta->bump;
+    int n = 0, shown = 0;
+    while (off + sizeof(Hdr) <= bump && shown < 3) {
+        const Hdr* h = (const Hdr*)(g_base + off);
+        if (h->cls < (uint32_t)CLS_MIN_SH || h->cls > (uint32_t)CLS_MAX_SH) break;
+        const uint32_t blk = 1u << h->cls;
+        if (off < pg_hi && off + blk > pg_lo) {
+            const uint32_t* pay = (const uint32_t*)(g_base + off + sizeof(Hdr));
+            n += _snprintf(out + n, outn - n,
+                           "%s{off=%u sz=%u/%u %s w0=%08X w1=%08X}",
+                           shown ? " " : "", off, h->reqsize, blk,
+                           h->magic == HDR_MAGIC ? "live" : "FREE",
+                           pay[0], pay[1]);
+            ++shown;
+            if (n >= outn - 48) break;
+        }
+        off += blk;
+    }
+    if (!shown) n = _snprintf(out, outn, "{no block covers this page}");
+    return n;
+}
+
 void install(uintptr_t sq_code_lo, uintptr_t sq_code_hi) {
     if (g_installed) return;
 

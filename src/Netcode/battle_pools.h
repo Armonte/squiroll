@@ -55,6 +55,10 @@ void load(const uint8_t* blob, uint32_t len);
 // by engine_snap). See battle_pools.cpp for the full rationale.
 uint32_t boostpool_save(uint8_t* out, uint32_t cap);
 void boostpool_load(const uint8_t* blob, uint32_t len);
+// SQUIROLL_BPVALIDATE: verify the rebuilt boost-pool free chains against the
+// free_head engine_snap restored. Call AFTER engine_snap::load.
+void boostpool_verify(const char* when);
+bool validate_enabled();   // SQUIROLL_BPVALIDATE
 
 // Diagnostics for the f=24 va.x rollback bug: set_va_probe publishes the
 // player's va.x C++ address; set_load_frame publishes the frame whose blob is

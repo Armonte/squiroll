@@ -178,6 +178,121 @@ static uint32_t hash_page(const uint8_t* p) {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// T0a — SQUIROLL_WWBENCH=1: GetWriteWatch cost curve.
+//
+// The budget says GetWriteWatch is call-dominated, but that came from solving
+// two equations against two whole-system configurations, which also differed in
+// other ways. This times the syscall directly: the SAME region, split into
+// 1/2/4/.../64 calls. If cost is flat in the split, it is per-page and a
+// narrowing scheme could pay; if it rises with the split, per-call dominates
+// and every "ask about fewer pages" idea is dead. Run at arm, right after
+// ResetWriteWatch, so the dirty set is empty and we time the scan, not the
+// reporting. No WRITE_WATCH_FLAG_RESET: the bench must not consume state.
+static void ww_bench(uint8_t* base, uint32_t size) {
+    if (!base || size < PAGE) return;
+    LARGE_INTEGER fr; QueryPerformanceFrequency(&fr);
+    const uint64_t hz = (uint64_t)fr.QuadPart;
+    static void* pgbuf[4096];
+    log_printf("[wwbench] region=%uMB (%u pages), 8 iterations each\n",
+               size >> 20, size / PAGE);
+    static const int SPLITS[] = { 1, 2, 4, 8, 16, 32, 64 };
+    // Both flag values. The real capture/restore path always passes
+    // WRITE_WATCH_FLAG_RESET, and clearing the PTE dirty bits is a different
+    // operation from reading them — plausibly one that has to shoot down TLB
+    // entries on every core, in which case the cost is per CALL and the number
+    // of calls per frame (4 in capture + 4 in restore step 0 + 5 in the final
+    // reset) is the thing to attack. Timing only the read would have measured
+    // the wrong syscall.
+    for (int mode = 0; mode < 2; ++mode) {
+        const UINT flag = mode ? WRITE_WATCH_FLAG_RESET : 0;
+        log_printf("[wwbench]  flag=%s\n", mode ? "RESET" : "read-only");
+        for (int si = 0; si < (int)(sizeof(SPLITS)/sizeof(SPLITS[0])); ++si) {
+            const int splits = SPLITS[si];
+            const uint32_t chunk = (size / splits) & ~(PAGE - 1);
+            if (!chunk) continue;
+            uint64_t t = 0;
+            for (int it = 0; it < 8; ++it) {
+                LARGE_INTEGER a; QueryPerformanceCounter(&a);
+                for (int k = 0; k < splits; ++k) {
+                    uint8_t* b = base + (uint32_t)k * chunk;
+                    uint32_t len = (k == splits - 1) ? (size - (uint32_t)k * chunk) : chunk;
+                    ULONG_PTR c = sizeof(pgbuf) / sizeof(pgbuf[0]);
+                    ULONG gran = 0;
+                    GetWriteWatch(flag, b, len, pgbuf, &c, &gran);
+                }
+                LARGE_INTEGER b2; QueryPerformanceCounter(&b2);
+                t += (uint64_t)(b2.QuadPart - a.QuadPart);
+            }
+            const uint32_t us = (uint32_t)(t * 1000000ull / hz / 8);
+            log_printf("[wwbench]    splits=%-3d  %6u us   (%u us/call)\n",
+                       splits, us, us / (uint32_t)splits);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T0b — SQUIROLL_PAGEHIST=N: which pages are dirty, and what is on them.
+//
+// ~250 sq-arena pages are rewritten every frame (~1 MB), and they are paid for
+// twice: once in the capture's dirty copy and again in the restore's
+// reverse-apply. Together that is the largest item in the budget. If most of
+// the churn is one or two structures, a targeted fix beats every other
+// optimisation on the list, so find out before optimising anything else.
+static uint32_t* g_hist[NARENA] = { nullptr };
+static uint32_t  g_hist_frames  = 0;
+static int       g_hist_every   = 0;   // dump every N frames; 0 = off
+static int pagehist_every() {
+    static int v = -1;
+    if (v < 0) {
+        char b[16] = {0};
+        v = 0;
+        if (GetEnvironmentVariableA("SQUIROLL_PAGEHIST", b, sizeof b) > 0) {
+            for (const char* c = b; *c >= '0' && *c <= '9'; ++c) v = v * 10 + (*c - '0');
+            if (v <= 0) v = 600;
+        }
+    }
+    return v;
+}
+static void hist_dump() {
+    static const char* names[NARENA] = { "sq", "bt", "cpp", "tf4A", "tf4B" };
+    log_printf("[pagehist] ==== %u frames ====\n", g_hist_frames);
+    for (int a = 0; a < NARENA; ++a) {
+        if (!g_hist[a] || !g_ar[a].size) continue;
+        const uint32_t np = g_ar[a].npages;
+        uint64_t total = 0;
+        uint32_t nonzero = 0;
+        for (uint32_t p = 0; p < np; ++p) {
+            total += g_hist[a][p];
+            if (g_hist[a][p]) ++nonzero;
+        }
+        if (!total) continue;
+        log_printf("[pagehist] %s: %u distinct pages ever dirty, %u page-writes "
+                   "total (%u per frame)\n", names[a], nonzero,
+                   (uint32_t)total, (uint32_t)(total / (g_hist_frames ? g_hist_frames : 1)));
+        // Top 24 by dirty count. np is at most 36k, so a selection scan is fine
+        // for a diagnostic that runs every few hundred frames.
+        uint64_t shown = 0;
+        for (int rank = 0; rank < 24; ++rank) {
+            uint32_t best = 0, bestpg = 0;
+            for (uint32_t p = 0; p < np; ++p)
+                if (g_hist[a][p] > best) { best = g_hist[a][p]; bestpg = p; }
+            if (!best) break;
+            g_hist[a][bestpg] = 0;                    // consume, so the scan advances
+            shown += best;
+            char what[192] = {0};
+            if (a == 0) sq_arena::describe_page(bestpg * PAGE, what, sizeof what);
+            log_printf("[pagehist]   %s pg=%-6u off=0x%08X  %u/%u frames (%u%%)  "
+                       "cum=%u%%  %s\n", names[a], bestpg, bestpg * PAGE, best,
+                       g_hist_frames, g_hist_frames ? best * 100 / g_hist_frames : 0,
+                       (uint32_t)(shown * 100 / total), what);
+        }
+    }
+    for (int a = 0; a < NARENA; ++a)
+        if (g_hist[a]) memset(g_hist[a], 0, g_ar[a].npages * 4);
+    g_hist_frames = 0;
+}
+
 void arm() {
     if (g_armed) return;
 
@@ -255,6 +370,19 @@ void arm() {
         for (uint32_t pg = 0; pg < A.npages; ++pg)
             A.phash[pg] = hash_page(A.base + pg * PAGE);
         ResetWriteWatch(A.base, A.size);
+        // T0b: one counter per page, only when asked for.
+        if (pagehist_every()) {
+            g_hist[a] = (uint32_t*)VirtualAlloc(nullptr, A.npages * 4,
+                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (!g_hist[a])
+                log_printf("[pagehist] !! histogram alloc failed (arena %d)\n", a);
+        }
+        // T0a: time the syscall here, with the dirty set freshly cleared.
+        if (getenv("SQUIROLL_WWBENCH")) {
+            log_printf("[wwbench] arena %d:\n", a);
+            ww_bench(A.base, A.size);
+            ResetWriteWatch(A.base, A.size);
+        }
     }
 
     g_pgbuf = (void**)VirtualAlloc(nullptr, (maxpages + 16) * sizeof(void*),
@@ -641,6 +769,14 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
 
     LARGE_INTEGER pt0; QueryPerformanceCounter(&pt0);
     uint64_t t_ww = 0, t_dirty = 0;
+    // Per-arena GetWriteWatch cost, against pages scanned and pages found
+    // dirty. [wwbench] says a clean region costs ~6 us/call + ~3 ns/page, but
+    // the real path costs 4x that, so the driver is the dirty pages actually
+    // being cleared (a TLB shootdown per call). This is the line that proves
+    // it and says what a call is really worth.
+    static uint64_t q_us[NARENA] = {0}; static uint64_t q_scan[NARENA] = {0};
+    static uint32_t q_calls[NARENA] = {0};
+
     for (int a = 0; a < NARENA; ++a) {
         Arena& A = g_ar[a];
         if (A.size == 0) { S.dn[a] = 0; continue; }   // unregistered arena (tf4 off)
@@ -665,6 +801,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
         ULONG     gran  = 0;
         LARGE_INTEGER w0; QueryPerformanceCounter(&w0);
         for (int u = 0; u < nur; ++u) {
+            q_scan[a] += ur[u].size / PAGE; ++q_calls[a];
             ULONG_PTR c = A.npages - count;
             if ((ULONG_PTR)0 == c) break;
             UINT rc = GetWriteWatch(WRITE_WATCH_FLAG_RESET, ur[u].base, ur[u].size,
@@ -677,6 +814,7 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
         }
         LARGE_INTEGER w1; QueryPerformanceCounter(&w1);
         t_ww += (uint64_t)(w1.QuadPart - w0.QuadPart);
+        q_us[a] += (uint64_t)(w1.QuadPart - w0.QuadPart);
         LARGE_INTEGER d0; QueryPerformanceCounter(&d0);
         uint8_t* dp   = S.delta[a];
         uint8_t* dend = dp + DELTA_CAP[a];
@@ -699,6 +837,8 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
                            (uint32_t)count);
                 break;
             }
+            if (g_hist[a] && !re_capture_diag)             // T0b: forward saves only
+                ++g_hist[a][off / PAGE];
             *(uint32_t*)dp = off;                          // page offset
             memcpy(dp + 4, A.mirror + off, PAGE);          // PRE-image (frame-1)
             dp += REC;
@@ -1227,6 +1367,13 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
         }
     }
 
+    if (g_hist_every == 0) g_hist_every = pagehist_every();
+    if (g_hist_every && !re_capture_diag) {
+        // Count FORWARD saves only: a re-sim re-capture of the same frame would
+        // count the same churn twice and skew every percentage.
+        if (++g_hist_frames >= (uint32_t)g_hist_every) hist_dump();
+    }
+
     // Periodic report — dirty pages + where capture's time goes.
     static uint32_t prc = 0, psq = 0, pbt = 0, pcpp = 0, pt4a = 0, pt4b = 0;
     static uint64_t a_ww = 0, a_dirty = 0, a_rest = 0, a_fold = 0;
@@ -1250,6 +1397,25 @@ uint32_t capture(uint32_t frame, const uint8_t* sblob, uint32_t sblob_len, uint3
                    psq / prc, pbt / prc, pcpp / prc, pt4a / prc, pt4b / prc,
                    (psq + pbt + pcpp + pt4a + pt4b) / prc * 4,
                    us(a_ww), us(a_dirty), us(a_rest), us(a_fold));
+        {   // What a GetWriteWatch CALL is actually worth on the live path.
+            // [wwbench] on a clean region says ~6 us/call + ~3 ns/page, but the
+            // real path costs several times that: the difference is the dirty
+            // pages actually being cleared, which appears to cost a TLB
+            // shootdown once per CALL. That is why narrowing the query into
+            // more ranges was a large loss, and it means the lever is the
+            // NUMBER of calls per frame, not the pages they cover.
+            static const char* nm[NARENA] = { "sq", "bt", "cpp", "tf4A", "tf4B" };
+            const uint32_t dirty[NARENA] = { psq, pbt, pcpp, pt4a, pt4b };
+            for (int a = 0; a < NARENA; ++a) {
+                if (!q_calls[a]) continue;
+                log_printf("[wwcost]   %-4s %u call/frame  %u pages scanned  "
+                           "%u dirty  %u us/frame (%u us/call)\n", nm[a],
+                           q_calls[a] / prc, (uint32_t)(q_scan[a] / prc),
+                           dirty[a] / prc, us(q_us[a]),
+                           (uint32_t)(q_us[a] * 1000000ull / hz / q_calls[a]));
+                q_us[a] = 0; q_scan[a] = 0; q_calls[a] = 0;
+            }
+        }
         prc = psq = pbt = pcpp = pt4a = pt4b = 0;
         a_ww = a_dirty = a_rest = a_fold = 0;
     }
