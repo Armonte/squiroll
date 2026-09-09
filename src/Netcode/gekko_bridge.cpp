@@ -1253,11 +1253,67 @@ static void apply_test_round_frames();
 // the prediction window is restored. Requested at the latch, applied on the
 // first tick with no prediction outstanding (GekkoNet refuses otherwise).
 static const bool DUAL_TRANSITION_LOCKSTEP = true;
+
+// PREDICTION WINDOW USED ACROSS THE ROUND SEAM.
+//
+// This was 0 ("lockstep"), and 0 is the one value GameSession::SetPredictionWindow
+// can REFUSE: it returns false while any prediction is outstanding, because at
+// window 0 AddInput stops checking for mispredictions and an outstanding one
+// would go uncorrected. Every advance adds local input and so creates new
+// predictions, so at any real latency the request lost that race indefinitely --
+// measured, the switch landed ~900 frames late, at the NEXT round's end:
+//
+//     round-end latch f=939 reached -> LOCKSTEP transition requested
+//     LOCKSTEP ON (prediction window 0) at f=1833
+//
+// Two things were wrong with that, and the second is worse than the first. The
+// burst the seam protection exists to protect was never protected. AND the
+// transition state machine, which is gated on the window actually being down,
+// was therefore always observing the WRONG ROUND -- it watched round N+1's
+// state-8 exit believing it was round N's.
+//
+// Forcing 0 to engage on time is not the answer either: with no prediction
+// gekko advances only once the remote's input for that exact frame has arrived,
+// so the local delay must cover the RTT, and gekko caps delay at 9 frames
+// (150 ms). Above that the peers deadlock (measured at 166-183 ms).
+//
+// Any window >= 1 sets unconditionally and instantly, and still predicts, so it
+// has no RTT dependency. 1 bounds the rollback depth across the burst to a
+// single frame instead of the full window, engages ON the latch frame, and lets
+// the state machine watch the round it is actually in.
+static uint8_t seam_window() {
+    static int v = -1;
+    if (v < 0) {
+        char b[8] = {0};
+        v = 1;
+        if (GetEnvironmentVariableA("SQUIROLL_SEAM_WINDOW", b, sizeof b) > 0) {
+            v = 0; for (const char* c = b; *c >= '0' && *c <= '9'; ++c) v = v * 10 + (*c - '0');
+            if (v > 9) v = 9;
+        }
+    }
+    return (uint8_t)v;
+}
 static bool  g_lockstep_req = false;      // switch to lockstep requested
 static bool  g_in_lockstep  = false;      // transition running under lockstep
 static bool  g_lockstep_seen_leave = false; // state left 8 since the latch (the round really ended)
 static int   g_lockstep_drain = 0;        // ticks spent draining predictions for lockstep
 static int   g_lockstep_delay = -1;       // local delay we raised to for lockstep (-1 = not raised)
+static int   g_seam_leave_f   = -1;       // sim frame the round left state 8
+static int   g_roundend_latch_last = 0;   // the latch frame, for the seam-length log
+static bool  g_between_rounds = false;    // window restored, waiting for Round_Fight
+static int   g_last_round_fight_f = -1;   // sim frame of the last observed Round_Fight
+// How long the narrowed window stays on AFTER the round leaves state 8. The
+// thing it protects is the round-end effect mass-destroy burst, which starts
+// while state is still 8 and finishes shortly after it leaves; it does NOT need
+// to cover the whole inter-round sequence. Holding it until the next
+// Round_Fight meant ~714 frames of throttled prediction per round (measured
+// f=939 -> f=1653) and cost about a third of the frame throughput.
+// Sim-frame driven, so both peers restore on the identical frame.
+static int seam_tail_frames() {
+    static int v = -1;
+    if (v < 0) v = env_int("SQUIROLL_SEAM_TAIL", 60);
+    return v;
+}
 
 // Lockstep gives up prediction, so the delay has to cover the round trip
 // instead -- otherwise gekko can only advance a frame once the remote's input
@@ -3307,7 +3363,7 @@ void advance_one_frame() {
     // Latching at time<=0 (the old condition) was several churn-frames too
     // late — the burst ran while still armed and fastfailed on both peers.
     // Rollback across the latch clears it (load_state_from_buf).
-    if (!g_solo && g_session_started && (g_in_lockstep || g_lockstep_req || g_restore_req)) {
+    if (!g_solo && g_session_started && (g_in_lockstep || g_lockstep_req)) {
         // ONLY once lockstep is actually on: before that, rollbacks still
         // re-sim frames around the latch and this machine would observe a
         // rewound state (no-recycle run 1: "left 8" on the forward f=899, then
@@ -3315,43 +3371,68 @@ void advance_one_frame() {
         // on one peer only -> desync at 902). Under window 0 every advance is
         // forward, so the observations and the hook are deterministic.
         if (!g_in_lockstep) {
-            // still waiting for the prediction window to clear; nothing to observe yet
+            // still waiting for the prediction window to change; nothing to
+            // observe yet. With a seam window >= 1 this lasts at most a frame.
         } else {
-        // Transition under lockstep. The pre-burst latch fires while state is
-        // STILL 8 (time<=20), so first wait for the state to LEAVE 8 (the round
-        // really ended), then the next state-8 frame is the new round's
-        // Round_Fight. Both checks are sim-driven -> identical frame on both
-        // peers, so the test round-length hook applied here is deterministic.
-        // The prediction-window restore itself is netcode-local and may land on
-        // a later tick.
+        // SEAM, narrowed window. Wait for the round to actually leave state 8
+        // (the latch fires while state is STILL 8 -- it triggers on time<=20,
+        // before the burst), then hold for a short tail and give the full
+        // prediction window back. Both edges are sim-driven, so both peers act
+        // on the identical frame.
         int st = 0;
-        if (read_battle_state(&st)) {
-            if (!g_lockstep_seen_leave && st != 8) {
-                g_lockstep_seen_leave = true;
-                log_printf("[gekko_bridge] lockstep transition: round left state 8 at f=%d (state=%d)\n", g_trace_frame, st);
-            } else if (g_lockstep_seen_leave && st == 8 && !g_restore_req) {
-                g_restore_req = true;
-                g_lockstep_seen_leave = false;
-                apply_test_round_frames();
-                log_printf("[gekko_bridge] Round_Fight re-entered at f=%d (round %d) -> prediction restore requested\n",
-                           g_trace_frame, g_disarm_count + 1);
-            }
+        if (read_battle_state(&st) && !g_lockstep_seen_leave && st != 8) {
+            g_lockstep_seen_leave = true;
+            g_seam_leave_f = g_trace_frame;
+            log_printf("[gekko_bridge] seam: round left state 8 at f=%d (state=%d)\n",
+                       g_trace_frame, st);
         }
-        if (g_restore_req && !g_lockstep_req && g_session &&
+        if (g_lockstep_seen_leave && g_seam_leave_f >= 0 && !g_lockstep_req && g_session &&
+            g_trace_frame >= g_seam_leave_f + seam_tail_frames() &&
             gekko_set_prediction_window(g_session, PREDICTION_WINDOW)) {
-            g_restore_req = false;
             g_in_lockstep = false;
+            g_between_rounds = true;   // suppresses the latch until Round_Fight
             if (g_lockstep_delay > 0) {
                 gekko_set_local_delay(g_session, g_local_idx, (uint8_t)g_local_delay);
                 g_lockstep_delay = -1;
             }
             log_printf("[gekko_bridge] prediction window %u restored at f=%d "
-                       "(local delay back to %d)\n", (unsigned)PREDICTION_WINDOW,
-                       g_trace_frame, g_local_delay);
+                       "(seam lasted %d frames)\n", (unsigned)PREDICTION_WINDOW,
+                       g_trace_frame, g_trace_frame - g_roundend_latch_last);
         }
         }
     } else
-    if (!g_solo && g_session_started && g_roundend_latch < 0) {
+    if (!g_solo && g_session_started && g_between_rounds) {
+        // BETWEEN ROUNDS: full window is back, but the latch must stay disarmed
+        // until the next round actually starts. The latch condition is
+        // (state != 8 || time <= 20) and BOTH hold through the whole inter-round
+        // sequence -- battle.time reads <= 20 while no round is running -- so
+        // without this state the seam re-arms immediately and never releases.
+        // That is what a tail timer alone got wrong: round 2 armed a seam one
+        // frame BEFORE its own Round_Fight.
+        int st = 0;
+        if (read_battle_state(&st) && st == 8) {
+            g_between_rounds = false; g_last_round_fight_f = -1;
+            g_lockstep_seen_leave = false;
+            g_seam_leave_f = -1;
+            g_last_round_fight_f = g_trace_frame;
+            apply_test_round_frames();
+            log_printf("[gekko_bridge] Round_Fight re-entered at f=%d (round %d)\n",
+                       g_trace_frame, g_disarm_count + 1);
+        }
+    } else
+    // The latch must not fire on a frame at or before the last Round_Fight we
+    // observed. This state is netcode-local and is NOT rolled back, so once a
+    // rollback re-simulates across the Round_Fight edge the between-rounds flag
+    // has already advanced and the re-simmed frame -- where state is still the
+    // old round's, i.e. latch-worthy -- re-arms the seam. It showed as a latch
+    // logged AFTER the Round_Fight but carrying an EARLIER frame number:
+    //     Round_Fight re-entered at f=1611 ... round-end LATCH f=1610
+    // Sim frames are agreed by both peers, so a monotonic guard is
+    // deterministic. Same lesson as the pool cache: state derived from the
+    // simulation but cached outside the snapshot has to be guarded against
+    // re-simulation, not assumed to move forward only.
+    if (!g_solo && g_session_started && g_roundend_latch < 0 &&
+        g_trace_frame > g_last_round_fight_f) {
         int st = 0, bt = 0;
         if (read_battle_state(&st) &&
             (st != 8 ||
@@ -4517,7 +4598,8 @@ void pre_arm_poll() {
 
 void shutdown() {
     g_lockstep_req = false; g_in_lockstep = false; g_lockstep_seen_leave = false; g_restore_req = false;
-    g_lockstep_drain = 0; g_lockstep_delay = -1;
+    g_between_rounds = false;
+    g_lockstep_drain = 0; g_lockstep_delay = -1; g_seam_leave_f = -1;
     reader_unbind();
     g_f0_input_reset_done = false;
     g_draining = false;
@@ -4991,18 +5073,21 @@ bool tick() {
     // there are no Advance events, so the retry that lived there could never
     // run. gekko_update_session has just processed whatever arrived, so this is
     // the moment the last prediction may have been confirmed.
-    if (g_lockstep_req && g_session && gekko_set_prediction_window(g_session, 0)) {
+    if (g_lockstep_req && g_session &&
+        gekko_set_prediction_window(g_session, seam_window())) {
         g_lockstep_req = false;
         g_in_lockstep  = true;
-        const int d = lockstep_delay_for_ping();
-        if (d > g_local_delay) {
-            gekko_set_local_delay(g_session, g_local_idx, (uint8_t)d);
-            g_lockstep_delay = d;
+        // Only window 0 needs the delay to cover the RTT; >= 1 still predicts.
+        if (seam_window() == 0) {
+            const int d = lockstep_delay_for_ping();
+            if (d > g_local_delay) {
+                gekko_set_local_delay(g_session, g_local_idx, (uint8_t)d);
+                g_lockstep_delay = d;
+            }
         }
-        log_printf("[gekko_bridge] LOCKSTEP ON (prediction window 0) at f=%d "
-                   "after %d drain tick(s), local delay %d -> %d\n",
-                   g_trace_frame, g_lockstep_drain, g_local_delay,
-                   g_lockstep_delay > 0 ? g_lockstep_delay : g_local_delay);
+        log_printf("[gekko_bridge] SEAM ON (prediction window %u) at f=%d "
+                   "after %d drain tick(s)\n", (unsigned)seam_window(),
+                   g_trace_frame, g_lockstep_drain);
         g_lockstep_drain = 0;
     }
     // [evorder] one-shot audit (dual): the raw event batch order for the
@@ -5358,6 +5443,7 @@ bool tick() {
         if (DUAL_TRANSITION_LOCKSTEP) {
             log_printf("[gekko_bridge] round-end latch f=%d reached -> LOCKSTEP transition requested "
                        "(session stays up)\n", g_roundend_latch);
+            g_roundend_latch_last = g_roundend_latch;
             g_roundend_latch = -1;
             g_lockstep_req = true;
             ++g_disarm_count;
@@ -5369,12 +5455,12 @@ bool tick() {
             return advanced;
         }
     }
-    if (g_lockstep_req && g_session) {
-        if (gekko_set_prediction_window(g_session, 0)) {
-            g_lockstep_req = false;
-            g_in_lockstep  = true;
-            log_printf("[gekko_bridge] LOCKSTEP ON (prediction window 0) at f=%d\n", g_trace_frame);
-        }
+    if (g_lockstep_req && g_session &&
+        gekko_set_prediction_window(g_session, seam_window())) {
+        g_lockstep_req = false;
+        g_in_lockstep  = true;
+        log_printf("[gekko_bridge] SEAM ON (prediction window %u) at f=%d\n",
+                   (unsigned)seam_window(), g_trace_frame);
     }
     if (g_session_started && g_solo && !no_disarm) {
         int st = 0;
