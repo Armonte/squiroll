@@ -93,6 +93,14 @@ These are not style preferences; each one cost real debugging time.
    that the crash signatures (`__purecall`, `vtable=008451CC`, `ret=0046D9D7`,
    `region=none`) were identical in both arms.
 
+12. **Weight save and load by how often they actually run.** There are about
+   SEVEN saves per load (`[perf] nsave=240 nload=~33`), because a rollback
+   re-simulates and re-saves every frame it replays. Optimising a per-CALL
+   number is therefore misleading: the first cut of the boost-pool live-slot
+   format won 342 us on load and lost 80 us on save, which reads as a big win
+   per call and is a ~220 us/frame LOSS. Always convert to per-frame before
+   deciding, and prefer the save side when they conflict.
+
 ## Switch reference
 
 ### Always safe to leave on
@@ -117,6 +125,10 @@ These are not style preferences; each one cost real debugging time.
 | `SQUIROLL_BPVALIDATE=1` | ~2x the bp section | Round-trip self-test on every restore for the whole session, plus a full free-list walk cross-checked against the hot/cold partition. **The oracle for any change to `battle_pools.cpp`.** |
 | `SQUIROLL_BPCANON=0` | slower | A/B arm: the pre-2026-09-08 free-list format and no hot/cold partition, in the same binary. |
 | `SQUIROLL_ARENAMAP=1` | one walk | Reports how much of the cpp arena's write-watch query holds live blocks. |
+| `SQUIROLL_BPMPCANON=0` | slower | A/B arm: whole-block boost-pool records instead of live-slot + bitmap. |
+| `SQUIROLL_MPCENSUS=N` | one walk per N saves | Per boost pool: blocks, slots, live, bytes, region, and whether its free list is ascending. |
+| `SQUIROLL_WWBENCH=1` | one-shot at arm | GetWriteWatch cost curve: the same region split into 1..64 calls, read-only and RESET. |
+| `SQUIROLL_PAGEHIST=N` | one counter per dirty page | Per-page dirty-frequency histogram, dumped every N forward saves with sq_arena block attribution. |
 
 ## Reading the numbers
 
@@ -208,40 +220,43 @@ arm** (55 ms delay / 20 ms jitter / 6% loss, medians over 240-save windows):
 | small blob | ~2000 µs | **~690 µs** |
 | restore reverse-apply | ~1290 µs | ~730 µs |
 
-**The write-watch query was the obvious next win and it is NOT one.** Narrowing
-it was tried and reverted, and the measurement is worth keeping because it
-rules out a whole family of ideas.
+**The write-watch query was the obvious next win and it is NOT one** — but the
+first explanation of why was wrong, and the corrected one is more useful.
 
-`SQUIROLL_ARENAMAP=1` says live blocks occupy only 7,545 of the 23,484 pages we
-query in the cpp arena (32%), clustered into 88 contiguous runs, so asking about
-35 MB instead of 91 MB looked like ~400 µs/frame. Building it (and the coverage
-worked — 91 MB → 35 MB in 21 ranges) took `getww` from **380 µs to 1344 µs**.
+Narrowing the cpp arena's query from 91 MB in one range to 35 MB in 21 ranges
+took `getww` from 380 µs to **1344 µs**. The original conclusion — "GetWriteWatch
+costs ~52 µs per call" — came from solving two equations against two
+whole-system configurations. `SQUIROLL_WWBENCH=1` times the syscall directly and
+says something different: on a region with **no dirty pages**, it costs about
+**6 µs per call plus ~3 ns per page**, and `WRITE_WATCH_FLAG_RESET` costs the
+same as a read-only query.
 
-Solving the two configurations for cost = a·calls + b·pages:
+The live path (`[wwcost]`) is four times that:
 
-    4 calls, 28,672 pages -> 380 us          a = ~52 us per CALL
-    24 calls, 15,872 pages -> 1344 us        b = ~6 ns per page
+| arena | calls | pages scanned | dirty | µs/call |
+|---|---|---|---|---|
+| sq | 1 | 3,637 | ~275 | 54-92 |
+| bullet | 1 | 1,887 | ~7 | 23-27 |
+| cpp | 2 | 23,493 | ~47 | 80-94 |
 
-**GetWriteWatch is call-dominated, not range-dominated.** Of the 380 µs, about
-208 µs is four syscalls and only ~172 µs is the pages. So any scheme that trades
-one wide range for several narrow ones loses, and the only lever left is fewer
-calls — of which there are four (sq, bullet, cpp sim, cpp render) and they are
-separate reservations. Merging the two cpp ranges into one call saves ~104 µs of
-call cost and adds ~93 µs of page cost: not worth it. Treat ~380 µs capture +
-~370 µs step 0 as the floor.
+So the cost is roughly **20-25 µs fixed per call, ~3 ns per page scanned, and
+~1 µs per page actually found dirty** — and the fixed part is what the bench
+missed, because a clean region has no dirty bits to clear and so needs no TLB
+shootdown. That is the real reason narrowing lost: the per-call flush is paid
+once per range. Treat ~380 µs capture + ~370 µs step 0 as the floor. The only
+remaining lever would be co-locating the three arenas in one write-watch
+reservation to turn 4 calls into 1, which trades ~150 µs of call cost against
+scanning the gaps between them — worth trying only if something else has already
+run out.
 
-That leaves the arena snapshot itself as the remaining budget, and both items are
-memory-bandwidth bound and proportional to the ~250-300 dirty pages the Squirrel
-VM heap produces per frame:
-
-* **reverse-apply, ~730 µs** — two 4 KB copies per unique page over the rollback
-  distance. The mirror copy could in principle be avoided by making mirror pages
-  indirect (hand the old mirror page to the delta record and point the mirror at
-  a fresh one), which halves the traffic; it complicates ring recycling.
-* **dirty page copy, ~500 µs** — pre-image to the delta plus a mirror sync, same
-  trade.
-* **the dirty pages themselves** — 1.2 MB/frame of Squirrel VM churn. Reducing
-  that is a game-side question, not a snapshot one.
+**The dirty-page churn is diffuse — there is no targeted fix.**
+`SQUIROLL_PAGEHIST` over 600 forward saves: the sq arena has **557 distinct
+pages ever dirty and ~283 dirty per capture**, the hottest page is dirty in
+essentially every capture, and the top 24 pages account for only **8%** of the
+churn. The blocks on those pages are 44-128 byte objects of a handful of
+recurring classes. So ~1 MB of Squirrel VM state genuinely changes every frame
+and no single structure is responsible; the way to make it cheaper is to halve
+the per-page cost (the mirror indirection), not to reduce the page count.
 
 ## Stability, as of 2026-09-08
 
