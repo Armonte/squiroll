@@ -58,6 +58,29 @@ These are not style preferences; each one cost real debugging time.
    Levels 1 and 2 now walk only the process heap; level 3 opts into the full sweep
    and may fault.
 
+7. **A test hook that forges simulation state must be driven by a frame number
+   both peers agree on.** `SQUIROLL_ROUND_FRAMES` wrote `::battle.time` from each
+   peer's local state machine. The peers forged the timer on different simulated
+   frames, timed out on different frames, and one entered the round-end demo
+   while the other did not — 3 of 4 runs "desynced" with no netcode fault. Worse,
+   exempting `time` from the checksum made the divergence grow to 96% of the
+   state, because the timer drives the transition. It is now keyed on the gekko
+   frame inside `advance_one_frame`, which both peers agree on and a re-sim
+   reproduces.
+
+8. **Check what the rig is actually running.** `build.sh` deployed to `th155/`
+   and `thcrap/bin/` but not to `th155_alt/`, which is where every rig runner
+   lives. A whole measurement pass was run against a two-day-old DLL before the
+   numbers stopped making sense. It deploys to both now.
+9. **A crash counter that matches your own clean-exit line is worse than no
+   counter.** Both probes counted `FASTFAIL via ExitProcess(0) [clean exit]` and
+   `FASTFAIL via TerminateProcess` (our own `taskkill`) as crashes, so healthy
+   runs reported `crashlog=2`. Match the issuer, not the word FASTFAIL.
+10. **A rate question needs a probe that does not stop at the first failure.**
+   `probe_stall.sh` halts on the first anomaly, which is right when you want the
+   failing run's logs and useless when the question is "is this class more
+   common than before my change?". `PROBE_KEEP=1` keeps going.
+
 ## Switch reference
 
 ### Always safe to leave on
@@ -79,16 +102,9 @@ These are not style preferences; each one cost real debugging time.
 | `SQUIROLL_FREE_JOURNAL=1` | holds ~16 MB | Defers real-heap frees so a rollback cannot re-enter one. Has never fired; kept for a suspected rollback use-after-free. |
 | `SQUIROLL_CLGUARD_RECOVER=1` | corrupts stacks, see rule 1 | Only when surviving a known fault is genuinely the point. |
 | `SQUIROLL_DESYNC_INJECT=<frame>` | one frame | Proves the desync detector end to end. Set on ONE peer. Never in a real match. |
-
-7. **A test hook that forges simulation state must be driven by a frame number
-   both peers agree on.** `SQUIROLL_ROUND_FRAMES` wrote `::battle.time` from each
-   peer's local state machine. The peers forged the timer on different simulated
-   frames, timed out on different frames, and one entered the round-end demo
-   while the other did not — 3 of 4 runs "desynced" with no netcode fault. Worse,
-   exempting `time` from the checksum made the divergence grow to 96% of the
-   state, because the timer drives the transition. It is now keyed on the gekko
-   frame inside `advance_one_frame`, which both peers agree on and a re-sim
-   reproduces.
+| `SQUIROLL_BPVALIDATE=1` | ~2x the bp section | Round-trip self-test on every restore for the whole session, plus a full free-list walk cross-checked against the hot/cold partition. **The oracle for any change to `battle_pools.cpp`.** |
+| `SQUIROLL_BPCANON=0` | slower | A/B arm: the pre-2026-09-08 free-list format and no hot/cold partition, in the same binary. |
+| `SQUIROLL_ARENAMAP=1` | one walk | Reports how much of the cpp arena's write-watch query holds live blocks. |
 
 ## Reading the numbers
 
@@ -97,96 +113,101 @@ into the small-blob serialization and the page capture) and load, per 240 saves.
 `[perf-sect]` splits the small blob by section. `[perf] save_battle` is the
 structural checksum walk.
 
-Current cost per frame on the dual rig at 55 ms delay / 20 ms jitter / 6% loss,
-ship config (no HEAPCHECK, no TRACE), medians over 10+ measurement windows:
+Current cost per call, measured on the SOLO rig (`probe_solo.sh`), which rolls
+back 8 frames every frame and so exercises save/load far harder than netplay.
+Medians over 240-save windows, ship config, after the 2026-09-08 pool pass:
 
-| Phase | Cost | Largest component |
-|---|---|---|
-| advance | ~1.3 ms | the game's own tick |
-| save | ~2.3 ms | `battle_pools::save` ~1.4 ms |
-| load (rollback only) | ~3.1 ms | reverse-apply ~1.1 ms, `battle_pools::load` ~1.0 ms |
+| Phase | before this pass | now | largest component now |
+|---|---|---|---|
+| save | 3705 µs | **~1900 µs** | arena capture ~1450 (`battle_pools` is ~200) |
+| load | 3899 µs | **~2300 µs** | reverse-apply ~1100, restore step 0 ~675 |
 
-Save was 7.3 ms at the start of this work. What is left, measured:
+`[perf-bp]` splits the pool section (walk / canonical relink / live-slot copy,
+and on load slot restore / free rebuild) and prints the slot census.
+`[perf-sect]` and `[perf-load]` split the small blob by section.
+`[perf-restore]` splits the restore. `[snapshot_ring] dirty/cap` gives the
+dirty-page counts and where capture's time goes.
+
+What is left, measured:
 
 | item | µs | why it is hard |
 |---|---|---|
-| `battle_pools::save` free-list walk | ~700 | dependent pointer chase over ~43,000 free nodes |
-| `battle_pools::save` slot copy | ~315 | 3,000 live slots, already cheap |
-| reverse-apply on load | ~1140 | real restore work, scales with rollback distance |
-| `battle_pools::load` | ~1040 | relinks the free list |
-| dirty page copy | ~400 | ~450 pages, two memcpys each |
-| GetWriteWatch (capture+restore) | ~800 | 106 MB queried; cpp arena's bump is 70 MB |
-| boost pools | ~250 save / ~450 load | |
+| reverse-apply on load | ~1100 | real restore work: 8 frames x ~350 dirty pages, two 4 KB copies per unique page |
+| `GetWriteWatch` (capture + step 0 + reset) | ~775 | 112 MB queried per pass; the cpp arena is 91 MB of it — see below |
+| dirty page copy | ~730 | ~350 pages, pre-image to the delta plus a mirror sync |
+| restore step 0 copy | ~355 | reverts the post-capture window (render pass + game-loop dispatch) |
+| boost pools on load | ~230 | |
+| `battle_pools` save | ~200 | walk ~70, relink ~18, live-slot copy ~135 |
+| fold_checksum | ~320 | solo only — dual uses the structural cross-peer checksum |
 
-**Incremental pool tracking was attempted and REVERTED — read this before retrying.**
-The idea is right: the pools hold ~46,400 slots of which ~3,000 are live, so both
-save and load spend their time rediscovering a free list that changed by a
-handful of entries. The free list is LIFO (allocation pops the head, free pushes
-at the head, and `TPoolAllocator::Grow` at th155 0x37C30 links a fresh block and
-sets the head), so between saves it differs only in a prefix near the head. Cache
-it reversed (tail at index 0) so pushes and pops both land at the end of the
-array and every stable entry keeps its index.
+**The pool subsystem is no longer the problem.** It went from 1654 µs to ~200 µs
+on save and 1157 µs to 50 µs on the load-side free-list rebuild, by two changes:
 
-Three things went wrong, all worth knowing:
+*Canonical free list.* The free list's ORDER is real state — it decides which
+slot the next allocation returns and a re-simulation has to hand out the same
+ones — but it is order we are free to CHOOSE, as long as both peers and both
+timelines choose identically. `save()` rewrites it into ascending slot-index
+order (index, not address: the index is peer-independent by construction), which
+makes the list a pure function of the free SET. The blob carries a bitmap
+instead of ~43,000 addresses and the load relinks with one ascending pass.
 
-1. **`g_freebits` is shared scratch reused across pools.** The full-walk code got
-   away with that because it rebuilt the bitmap per pool; an incremental cache
-   carries state between frames, so pool N reads pool N+1's bits. This did not
-   show up as a wrong bitmap — it showed up as a NULL dereference inside the game
-   a few frames later. The bitmap has to live in the per-pool cache.
-2. **The slot to position map goes stale within a single frame.** A slot that is
-   allocated and then freed again comes back at the head still carrying its old
-   index, and that index can still hold it, so the prefix walk stops early and
-   the cache silently loses the middle of the list. Confirm a join for real: the
-   list is tail-first, so the node following the candidate must be `rev[k-1]`.
-3. **Not every pool is LIFO.** `SqFunctionHolder` (slot lifetimes driven by
-   Squirrel closures) disagreed with the validator repeatedly. Any retry needs
-   per-pool fallback to the full walk, not a global assumption.
+*Hot/cold partition.* `pregrow()` sizes every pool to ~2016 slots so it never has
+to grow mid-match, but `[bppeak]` shows 21 of the 22 pools peak at 168 live or
+fewer. Each pool now carries a high-water index `w` with the invariant that
+every slot above `w` is free and still linked in the ascending chain the last
+canonicalisation wrote, so the chase stops at the cold tail. Chase nodes went
+43,239 -> 3,152. `w` is rolled-back state (it is in the blob) so both timelines
+partition identically; three independent conditions have to hold to take the
+fast path, because a false fast path would be a wrong free set — the failure
+mode that got the previous incremental-tracking attempt reverted.
 
-Even with all three addressed the result still executed pool memory as code
-during a re-simulation (`eip` inside the 0x44M pool region) — the signature of a
-wrong live/free set. A wrong state-serialisation path is the worst class of bug
-here, so it was reverted rather than shipped. **Retry it against the SOLO rig
-with `SQUIROLL_BPVALIDATE=1` first**, where a mistake is a validator line rather
-than a cross-peer desync, and only then bring it to the dual rig.
+**The trap that blocked this for two attempts:** th155 `0x37C30` is not a plain
+`Grow`. Its last three statements pop the new block's first slot and return it —
+it is the allocation slow path, grow AND allocate. `pregrow()` called it to
+pre-size the pools and threw the return value away, leaking one permanently-live
+slot at the base of every block. Slot index runs oldest-block-first (Grow links
+new blocks at the head), so those leaked slots sit at the TOP of each pool and
+`maxlive` came back as exactly 992 — the newest block's base index — in all 22
+pools, pinning the boundary at the end and making the partition worth 21%
+instead of 7x. The IDB now calls it `TF4__TPoolAllocator__GrowAndAlloc`.
 
-**Two further attempts, both reverted — record of what was tried.**
+**One hazard the partition introduced, and the shape of it is worth keeping.**
+The per-pool cache that holds the boundary is OUR bookkeeping and is not rolled
+back, so "the cache says the cold tail is drawn at w, and the blob says w"
+is NOT sufficient to reuse the tail on a restore. If the hot range was exhausted
+between the save being restored and the restore itself — a round-end burst does
+exactly that — the game allocated out of the cold tail, and those slots hold
+live objects. Relinking the hot chain's tail onto slot w+1 then splices the free
+list through a live object and hands the same memory out twice, which surfaces
+as a garbage vtable and `__purecall` hundreds of frames later, on the client
+only, near a round transition. `load()` now verifies the tail sentinel and its
+first link before trusting it, exactly as `save()`'s chase does, and rewrites
+the whole chain when either fails. Generalised: **any state derived from the
+simulation that is cached outside the snapshot has to be re-validated against
+memory after a restore, not against a matching version number.**
 
-*Limited saving* (`GekkoConfig::limited_saving`, which GekkoNet already implements
-as GDC §9). It does cut saves from ~1.9 per frame to roughly one per prediction
-window, but it is the wrong trade for this game: rollbacks then rewind to the last
-saved frame rather than the mispredicted one, so the cost reappears as deeper
-re-simulation and worse frame-time spikes. It also desynced within 120 frames,
-because `snapshot_ring::restore` requires an unbroken per-frame delta chain
-(`ring[f].frame == f` for every f from current back to the target) and sparse
-saves leave gaps. Supporting it would mean re-keying the ring on captures rather
-than frames. Not pursued: hiding cost in spikes is not the goal.
-
-*Pool paging* — the right idea, and the one to finish. The pool region is OUR
-allocation (tf4_arena's VirtualAlloc hook) and already carries MEM_WRITE_WATCH,
-so pool slots can ride the same dirty-page delta the arenas use, turning both the
-save walk and the load relink into O(pages actually written). The whole region is
-unusable for this (a background audio thread dirties ~3550 pages a frame in it)
-but `GetWriteWatch` takes a sub-range and the pool blocks are a small subset, so
-you register region B and restrict the query to the blocks. Wired up quickly;
-died at frame 2 of the first re-simulation. Likely causes, in order: the mirror is
-filled at arm time so any block created later has no valid pre-image, and each
-block's last 8 bytes are mspace link metadata that a rollback would rewind while
-the allocator's own state outside the blocks is not.
-
-**The next real win is still incremental pool tracking or pool paging.** The pools hold ~46,400 slots
-(~13.6 MB) of which only ~3,000 are live, so both save and load spend most of
-their time rediscovering a free list that changed by a handful of entries.
-Hooking the pool allocate/free to maintain the live set and free-list order as
-they change removes the ~700 µs walk, the ~1 ms relink, and ~172 KB of the
-~400 KB blob. Two alternatives are already ruled out by measurement: copying
-whole blocks would make the blob 13.6 MB per save, and collapsing the two
-free-list chases into one made it *worse* because the second chase rides warm
-cache.
+**The next win is the write-watch query, and here is the measurement for it.**
+`GetWriteWatch` is charged per page of the range it is asked about, and we ask
+about the cpp arena's whole SIM bump (91 MB) twice a frame to find ~70 dirty
+pages. `SQUIROLL_ARENAMAP=1` says live blocks occupy only 7,545 of the 23,484
+queried pages (32%), clustered into 88 contiguous runs — so narrowing the query
+is worth roughly 400 µs/frame. It is not as simple as "query the pages holding
+live blocks": the per-class free lists thread their links through the headers of
+DEAD blocks, and those links are allocator state that has to roll back, so
+`arena_free` writes into pages with no live block on them. A correct narrowed
+query has to cover the free-list tail blocks too, and a page entering the
+queried set needs its mirror re-synced before it can contribute a delta.
 
 ## The rig
 
 `th155_alt/probe_stall.sh <first_run> <count>` runs the two-instance rig
 repeatedly, archives each run under `runs/stall_N/`, and stops at the first
-anomaly. Both launcher batches use `setlocal` so the two peers cannot share
-environment variables — see rule 4.
+anomaly (`PROBE_KEEP=1` keeps going — see rule 10). Both launcher batches use
+`setlocal` so the two peers cannot share environment variables — see rule 4.
+
+`th155_alt/probe_solo.sh [seconds] [bat]` runs the SOLO rollback stress session,
+which rolls back 8 frames every frame in one process. This is where any change
+to state serialisation gets developed, with `run_solo_val.bat`
+(`SQUIROLL_BPVALIDATE=1`): a mistake is a validator line within seconds instead
+of a cross-peer desync three minutes into a dual run. `run_solo_perf.bat` is the
+same rig with the validator off, for measurement.

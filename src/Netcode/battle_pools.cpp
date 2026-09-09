@@ -1129,9 +1129,6 @@ void load(const uint8_t* blob, uint32_t len) {
             // on the first restore, and whenever a rollback crosses a save
             // where the working set grew. w is part of the blob precisely so
             // both timelines partition the same way (see PoolCache).
-            PoolCache& pc = g_pc[i];
-            const bool need_cold = !pc.valid || pc.total != total || pc.coldw != w;
-            const uint32_t cbound = need_cold ? (total ? total - 1 : 0) : w;
             auto addr_of = [&](uint32_t x) -> uint32_t {
                 for (uint32_t b = 0; b < nblk; ++b)
                     if (x >= blk[b].base_idx && x < blk[b].base_idx + blk[b].nslots)
@@ -1139,6 +1136,28 @@ void load(const uint8_t* blob, uint32_t len) {
                 return 0;
             };
             const uint32_t cold_head = (w + 1 < total) ? addr_of(w + 1) : 0;
+
+            PoolCache& pc = g_pc[i];
+            // The cold tail may be reused as-is only if it is STILL the intact
+            // ascending chain someone wrote for this boundary. pc is our own
+            // bookkeeping and is NOT rolled back, so pc.coldw agreeing with the
+            // blob is not enough: if the hot range was exhausted between the
+            // save being restored and now -- a round-end burst does exactly
+            // that -- the game allocated out of the cold tail, and those slots
+            // now hold live objects. Relinking the hot chain's tail onto slot
+            // w+1 would then splice the free list into a live object and hand
+            // the same memory out twice. Verify the sentinel and the first link
+            // the same way save()'s chase does, and rewrite the whole chain
+            // when either fails.
+            bool cold_intact = pc.valid && pc.total == total && pc.coldw == w;
+            if (cold_intact && cold_head) {
+                const uint32_t cold_second = (w + 2 < total) ? addr_of(w + 2) : 0;
+                const uint32_t link = *(const uint32_t*)(uintptr_t)cold_head;
+                const uint32_t mag  = *(const uint32_t*)(uintptr_t)(cold_head + 4);
+                if (mag != COLD_MAGIC || link != cold_second) cold_intact = false;
+            }
+            const bool need_cold = !cold_intact;
+            const uint32_t cbound = need_cold ? (total ? total - 1 : 0) : w;
             const uint32_t tail_link = need_cold ? 0 : cold_head;
             uint32_t prev = 0, idx = 0;
             bool done = false;
