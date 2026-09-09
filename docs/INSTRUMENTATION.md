@@ -208,39 +208,40 @@ arm** (55 ms delay / 20 ms jitter / 6% loss, medians over 240-save windows):
 | small blob | ~2000 µs | **~690 µs** |
 | restore reverse-apply | ~1290 µs | ~730 µs |
 
-**The next win is the write-watch query, and here is the measurement for it.**
-`GetWriteWatch` is charged per page of the range it is asked about, and we ask
-about the cpp arena's whole SIM bump (91 MB) twice a frame to find ~70 dirty
-pages. `SQUIROLL_ARENAMAP=1` says live blocks occupy only 7,545 of the 23,484
-queried pages (32%), clustered into 88 contiguous runs — so narrowing the query
-is worth roughly 400 µs/frame. It is not as simple as "query the pages holding
-live blocks": the per-class free lists thread their links through the headers of
-DEAD blocks, and those links are allocator state that has to roll back, so
-`arena_free` writes into pages with no live block on them. A correct narrowed
-query has to cover the free-list tail blocks too.
+**The write-watch query was the obvious next win and it is NOT one.** Narrowing
+it was tried and reverted, and the measurement is worth keeping because it
+rules out a whole family of ideas.
 
-The design that follows from it, for whoever picks this up:
+`SQUIROLL_ARENAMAP=1` says live blocks occupy only 7,545 of the 23,484 pages we
+query in the cpp arena (32%), clustered into 88 contiguous runs, so asking about
+35 MB instead of 91 MB looked like ~400 µs/frame. Building it (and the coverage
+worked — 91 MB → 35 MB in 21 ranges) took `getww` from **380 µs to 1344 µs**.
 
-* `cpp_arena` keeps `live[page]` (live blocks on the page, ++ in `arena_alloc`,
-  -- in `arena_free` **after** the free has written the header, so the freeing
-  write is still covered) and `tail[page]` (how many of the 21 per-class
-  free-list tails sit on the page, updated when a tail changes). A page is
-  queryable when either is non-zero, plus page 0 for `Meta`.
-* `snapshot_ring::arena_used_ranges` asks `cpp_arena` for the coalesced ranges
-  instead of `[0, bump)`. Rebuilding them from a 32,768-bit map is a few µs;
-  merging small gaps caps the range count.
-* **No mirror re-sync is needed, and that is worth proving rather than
-  assuming:** arena memory is only ever written by (a) the game, into a live
-  block, (b) `arena_alloc`, which marks the page before writing the header,
-  (c) `arena_free`, into a block that was live, or (d) the free-list tail link.
-  Every one of those is covered at the moment of the write, so a page cannot be
-  written while outside the queried set and the mirror cannot go stale.
-* **The risk to weigh before shipping it:** today every quarantined block is
-  captured and restored, which silently masks a stale writer touching a freed
-  block — exactly what `QUARANTINE_FRAMES` exists to tolerate. Narrowing the
-  query stops rolling those writes back. Keeping a page queryable while it holds
-  a block freed within the last 90 frames closes that hole and costs a small
-  per-frame expiry walk.
+Solving the two configurations for cost = a·calls + b·pages:
+
+    4 calls, 28,672 pages -> 380 us          a = ~52 us per CALL
+    24 calls, 15,872 pages -> 1344 us        b = ~6 ns per page
+
+**GetWriteWatch is call-dominated, not range-dominated.** Of the 380 µs, about
+208 µs is four syscalls and only ~172 µs is the pages. So any scheme that trades
+one wide range for several narrow ones loses, and the only lever left is fewer
+calls — of which there are four (sq, bullet, cpp sim, cpp render) and they are
+separate reservations. Merging the two cpp ranges into one call saves ~104 µs of
+call cost and adds ~93 µs of page cost: not worth it. Treat ~380 µs capture +
+~370 µs step 0 as the floor.
+
+That leaves the arena snapshot itself as the remaining budget, and both items are
+memory-bandwidth bound and proportional to the ~250-300 dirty pages the Squirrel
+VM heap produces per frame:
+
+* **reverse-apply, ~730 µs** — two 4 KB copies per unique page over the rollback
+  distance. The mirror copy could in principle be avoided by making mirror pages
+  indirect (hand the old mirror page to the delta record and point the mirror at
+  a fresh one), which halves the traffic; it complicates ring recycling.
+* **dirty page copy, ~500 µs** — pre-image to the delta plus a mirror sync, same
+  trade.
+* **the dirty pages themselves** — 1.2 MB/frame of Squirrel VM churn. Reducing
+  that is a game-side question, not a snapshot one.
 
 ## The rig
 
