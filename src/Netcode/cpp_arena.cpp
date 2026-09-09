@@ -893,6 +893,20 @@ static const ExclRange g_excl[] = {
     // tf4_ogg_alloc_shared — operator new shared_ptr<TF4::Ogg>, the Ogg/Vorbis
     // audio decoder object; the audio thread mutates it every frame.
     { 0x16B380u, 0x16B400u },
+    // NOT excluded, but recorded: th155's own network client has objects in
+    // this arena, and they are therefore rewound by every rollback. A crash
+    // record named one directly --
+    //   __purecall: this=34A5E710 vtable=0078B680 region=sim ret=0057770A
+    //   arena block payload=34A5E710 size=16 alloc_rva=00175E4B
+    // with the stack resolving to th155's boost.asio IOCP reactor thread
+    // (boost thread_start -> ref_TF4::UDP_ -> reactor_process_or_initialize ->
+    // iocp_reactor_process_event -> init_NetworkClient_obj_40). That thread is
+    // neither the sim nor a deterministic worker, so the object reached the
+    // arena through the pre-gate window (before set_sim_thread every thread is
+    // admitted). Excluding just that one alloc site {0x175E10,0x175EB9} was
+    // TRIED and did not change the crash rate (5 of 6 runs, same as before), so
+    // it is not the whole story and the exclusion was removed rather than left
+    // in unvalidated -- see the note below about splitting linked structures.
     // NOTE (2026-07-02): do NOT exclude the g_gameloop_scriptapi lazy-init site
     // (0x5161, the 0x14-byte game-loop dispatch signal). Tried: moving the
     // signal OBJECT to the real heap while its connection-list NODES stay in

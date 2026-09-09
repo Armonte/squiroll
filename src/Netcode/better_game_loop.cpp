@@ -305,6 +305,21 @@ void stdcall better_game_loop() {
     // [r2diag] a silent process exit (no crash, no watchdog) = the frame loop
     // returned; name why so a window close / quit message is distinguishable.
     log_printf("[loop] frame loop exited: exit_requested=%d real_frame=%u\n", (int)exit_requested, (unsigned)g_real_frame);
+    // Tear the rollback stack down BEFORE handing control to th155's own
+    // shutdown below. WM_DESTROY runs the engine's destructors, and until this
+    // call the session is still live, cpp_arena is still armed, and the
+    // RunOneFrame hook is still intercepting -- so the engine destroyed objects
+    // while the game-loop and background ScriptAPI threads were still walking
+    // arena state through our hooks. That is the crash every run of this rig
+    // ended with: a __purecall a handful of frames past the last heartbeat,
+    // i.e. during teardown, on whichever peer got there first. It looked like a
+    // netcode failure class "past ~3100 frames" in every batch measured, and
+    // ~3200 is just where a 60 s run lands.
+    //
+    // It matters beyond the harness: the same path runs when a peer drops
+    // (PlayerDisconnected -> request_shutdown), so it is a real client crash on
+    // the surviving side.
+    gekko_bridge::shutdown();
     log_flush();
 
 

@@ -1254,46 +1254,6 @@ static void apply_test_round_frames();
 // first tick with no prediction outstanding (GekkoNet refuses otherwise).
 static const bool DUAL_TRANSITION_LOCKSTEP = true;
 
-// PREDICTION WINDOW USED ACROSS THE ROUND SEAM.
-//
-// This was 0 ("lockstep"), and 0 is the one value GameSession::SetPredictionWindow
-// can REFUSE: it returns false while any prediction is outstanding, because at
-// window 0 AddInput stops checking for mispredictions and an outstanding one
-// would go uncorrected. Every advance adds local input and so creates new
-// predictions, so at any real latency the request lost that race indefinitely --
-// measured, the switch landed ~900 frames late, at the NEXT round's end:
-//
-//     round-end latch f=939 reached -> LOCKSTEP transition requested
-//     LOCKSTEP ON (prediction window 0) at f=1833
-//
-// Two things were wrong with that, and the second is worse than the first. The
-// burst the seam protection exists to protect was never protected. AND the
-// transition state machine, which is gated on the window actually being down,
-// was therefore always observing the WRONG ROUND -- it watched round N+1's
-// state-8 exit believing it was round N's.
-//
-// Forcing 0 to engage on time is not the answer either: with no prediction
-// gekko advances only once the remote's input for that exact frame has arrived,
-// so the local delay must cover the RTT, and gekko caps delay at 9 frames
-// (150 ms). Above that the peers deadlock (measured at 166-183 ms).
-//
-// Any window >= 1 sets unconditionally and instantly, and still predicts, so it
-// has no RTT dependency. 1 bounds the rollback depth across the burst to a
-// single frame instead of the full window, engages ON the latch frame, and lets
-// the state machine watch the round it is actually in.
-static uint8_t seam_window() {
-    static int v = -1;
-    if (v < 0) {
-        char b[8] = {0};
-        v = 1;
-        if (GetEnvironmentVariableA("SQUIROLL_SEAM_WINDOW", b, sizeof b) > 0) {
-            v = 0; for (const char* c = b; *c >= '0' && *c <= '9'; ++c) v = v * 10 + (*c - '0');
-            if (v > 9) v = 9;
-        }
-    }
-    return (uint8_t)v;
-}
-static bool  g_lockstep_req = false;      // switch to lockstep requested
 static bool  g_in_lockstep  = false;      // transition running under lockstep
 static bool  g_lockstep_seen_leave = false; // state left 8 since the latch (the round really ended)
 static int   g_lockstep_drain = 0;        // ticks spent draining predictions for lockstep
@@ -1332,6 +1292,7 @@ static int lockstep_delay_for_ping() {
     return d;
 }
 static constexpr int LOCKSTEP_DRAIN_MAX = 150;  // ~2.5 s at 60 Hz before giving up
+static bool  g_lockstep_req = false;      // seam requested at the round-end latch
 static bool  g_restore_req  = false;      // prediction restore requested (next Round_Fight seen)
 // Rollback depth. SQUIROLL_PREDICTION_WINDOW overrides it; 0 means the session
 // never predicts and therefore never rolls back, while every other part of the
@@ -1351,6 +1312,58 @@ static unsigned char prediction_window() {
     return (unsigned char)w;
 }
 #define PREDICTION_WINDOW (prediction_window())
+
+// PREDICTION WINDOW USED ACROSS THE ROUND SEAM.
+//
+// This was 0 ("lockstep"), and 0 is the one value GameSession::SetPredictionWindow
+// can REFUSE: it returns false while any prediction is outstanding, because at
+// window 0 AddInput stops checking for mispredictions and an outstanding one
+// would go uncorrected. Every advance adds local input and so creates new
+// predictions, so at any real latency the request lost that race indefinitely --
+// measured, the switch landed ~900 frames late, at the NEXT round's end:
+//
+//     round-end latch f=939 reached -> LOCKSTEP transition requested
+//     LOCKSTEP ON (prediction window 0) at f=1833
+//
+// Two things were wrong with that, and the second is worse than the first. The
+// burst the seam protection exists to protect was never protected. AND the
+// transition state machine, which is gated on the window actually being down,
+// was therefore always observing the WRONG ROUND -- it watched round N+1's
+// state-8 exit believing it was round N's.
+//
+// Forcing 0 to engage on time is not the answer either: with no prediction
+// gekko advances only once the remote's input for that exact frame has arrived,
+// so the local delay must cover the RTT, and gekko caps delay at 9 frames
+// (150 ms). Above that the peers deadlock (measured at 166-183 ms).
+//
+// Any window >= 1 sets unconditionally and instantly, and still predicts, so it
+// has no RTT dependency. 1 bounds the rollback depth across the burst to a
+// single frame instead of the full window, engages ON the latch frame, and lets
+// the state machine watch the round it is actually in.
+// DEFAULT: no narrowing. Measured on the dual rig, 8 runs each: narrowing to 1
+// did NOT reduce the crash rate (7 of 8 runs anomalous either way) and it cost
+// real time -- rollbacks went from ~500 a run to 1091-1233, because at window 1
+// every mispredicted frame triggers its own full restore (~1.5 ms, dominated by
+// the restore itself rather than the depth) and at 166 ms ping with delay 2 the
+// peers are ~10 frames apart, so nearly every frame mispredicts. That is the
+// "chugging on round-end frames" a player sees. Constant shallow rollbacks are
+// worse than occasional deep ones here.
+//
+// The state machine below is still correct and still runs (it engages on the
+// latch, tracks the right round, and releases after the burst); it just does
+// not clamp prediction unless asked. SQUIROLL_SEAM_WINDOW=1 restores the clamp.
+static uint8_t seam_window() {
+    static int v = -1;
+    if (v < 0) {
+        char b[8] = {0};
+        v = PREDICTION_WINDOW;
+        if (GetEnvironmentVariableA("SQUIROLL_SEAM_WINDOW", b, sizeof b) > 0) {
+            v = 0; for (const char* c = b; *c >= '0' && *c <= '9'; ++c) v = v * 10 + (*c - '0');
+            if (v > 9) v = 9;
+        }
+    }
+    return (uint8_t)v;
+}
 
 static void reset_input_command_reserves();
 
@@ -3605,10 +3618,32 @@ void advance_one_frame() {
             exit_secs = (n > 0 && v > 0) ? v : -1;
         }
         if (exit_secs > 0 && (GetTickCount() - t_start) >= (DWORD)exit_secs * 1000) {
-            log_printf("[gekko_bridge] SQUIROLL_EXIT_SECONDS=%d reached (f=%d, %ums) — exiting clean\n",
-                       exit_secs, g_trace_frame, GetTickCount() - t_start);
-            Sleep(400);
-            ExitProcess(0);
+            // ASK the frame loop to stop; do NOT ExitProcess from here.
+            //
+            // ExitProcess kills every other thread at whatever instruction it
+            // happens to be on and then runs teardown over the wreckage. The
+            // game-loop thread is usually inside Act::ScriptAPI::RunOneFrame,
+            // so teardown walked half-destroyed objects and called a virtual on
+            // one, landing in __purecall -> abort.
+            //
+            // That is the "crash class past ~3100 frames" that has been in the
+            // stability numbers all along. It is not past 3100 frames and it is
+            // not a netcode fault: the __purecall frame tracks the LAST FRAME OF
+            // THE RUN whatever that number is (3210/3210, 3181/3180, 2309/2310,
+            // 2341/2340, 3174/3150 across four exit budgets), because ~3200 is
+            // simply where a 60 s run lands. It was reported as a netcode
+            // failure in roughly half of every batch measured today.
+            //
+            // request_shutdown() drops out of the frame loop at a frame
+            // boundary, so the loop tears down in order.
+            static bool asked = false;
+            if (!asked) {
+                asked = true;
+                log_printf("[gekko_bridge] SQUIROLL_EXIT_SECONDS=%d reached (f=%d, "
+                           "%ums) — requesting clean shutdown\n",
+                           exit_secs, g_trace_frame, GetTickCount() - t_start);
+                request_shutdown();
+            }
         }
     }
     // cpp_arena alloc-sequence divergence trace ([cpptrace]) — env-gated. The old
