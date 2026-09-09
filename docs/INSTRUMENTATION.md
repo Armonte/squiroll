@@ -81,6 +81,18 @@ These are not style preferences; each one cost real debugging time.
    failing run's logs and useless when the question is "is this class more
    common than before my change?". `PROBE_KEEP=1` keeps going.
 
+11. **Compare stability arms at equal simulated FRAMES, not equal wall time.**
+   The dual rig is time-boxed (`SQUIROLL_EXIT_SECONDS=60`), so making save/load
+   twice as fast made every run reach ~3210 frames instead of ~2600 — past the
+   third round transition instead of stopping before it. Measured against the
+   slow arm the fast build looked like a stability regression (12 anomalies in
+   15 runs vs 3 in 14) and it was not: re-run the slow arm at 75 s, so it
+   reaches the same frames, and both arms fail at 7 in 8. The failures are a
+   pre-existing class concentrated past the second round transition. An hour
+   went into chasing a regression that was a measurement artifact; the tell was
+   that the crash signatures (`__purecall`, `vtable=008451CC`, `ret=0046D9D7`,
+   `region=none`) were identical in both arms.
+
 ## Switch reference
 
 ### Always safe to leave on
@@ -186,6 +198,16 @@ the whole chain when either fails. Generalised: **any state derived from the
 simulation that is cached outside the snapshot has to be re-validated against
 memory after a restore, not against a matching version number.**
 
+**Dual-rig A/B for the pool pass, same binary, `SQUIROLL_BPCANON=0` as the slow
+arm** (55 ms delay / 20 ms jitter / 6% loss, medians over 240-save windows):
+
+| | legacy | canonical + partition |
+|---|---|---|
+| save | 3353 µs | **2033 µs** |
+| load | 3383 µs | **2420 µs** |
+| small blob | ~2000 µs | **~690 µs** |
+| restore reverse-apply | ~1290 µs | ~730 µs |
+
 **The next win is the write-watch query, and here is the measurement for it.**
 `GetWriteWatch` is charged per page of the range it is asked about, and we ask
 about the cpp arena's whole SIM bump (91 MB) twice a frame to find ~70 dirty
@@ -195,8 +217,30 @@ is worth roughly 400 µs/frame. It is not as simple as "query the pages holding
 live blocks": the per-class free lists thread their links through the headers of
 DEAD blocks, and those links are allocator state that has to roll back, so
 `arena_free` writes into pages with no live block on them. A correct narrowed
-query has to cover the free-list tail blocks too, and a page entering the
-queried set needs its mirror re-synced before it can contribute a delta.
+query has to cover the free-list tail blocks too.
+
+The design that follows from it, for whoever picks this up:
+
+* `cpp_arena` keeps `live[page]` (live blocks on the page, ++ in `arena_alloc`,
+  -- in `arena_free` **after** the free has written the header, so the freeing
+  write is still covered) and `tail[page]` (how many of the 21 per-class
+  free-list tails sit on the page, updated when a tail changes). A page is
+  queryable when either is non-zero, plus page 0 for `Meta`.
+* `snapshot_ring::arena_used_ranges` asks `cpp_arena` for the coalesced ranges
+  instead of `[0, bump)`. Rebuilding them from a 32,768-bit map is a few µs;
+  merging small gaps caps the range count.
+* **No mirror re-sync is needed, and that is worth proving rather than
+  assuming:** arena memory is only ever written by (a) the game, into a live
+  block, (b) `arena_alloc`, which marks the page before writing the header,
+  (c) `arena_free`, into a block that was live, or (d) the free-list tail link.
+  Every one of those is covered at the moment of the write, so a page cannot be
+  written while outside the queried set and the mirror cannot go stale.
+* **The risk to weigh before shipping it:** today every quarantined block is
+  captured and restored, which silently masks a stale writer touching a freed
+  block — exactly what `QUARANTINE_FRAMES` exists to tolerate. Narrowing the
+  query stops rolling those writes back. Keeping a page queryable while it holds
+  a block freed within the last 90 frames closes that hole and costs a small
+  per-frame expiry walk.
 
 ## The rig
 
