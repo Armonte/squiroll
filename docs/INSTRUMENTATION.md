@@ -243,6 +243,17 @@ VM heap produces per frame:
 * **the dirty pages themselves** — 1.2 MB/frame of Squirrel VM churn. Reducing
   that is a game-side question, not a snapshot one.
 
+## Stability, as of 2026-09-08
+
+14 dual runs after the pool pass: 7 clean, 7 with one peer failing, and the
+failures cluster in runs that get past ~3100 frames (the third round
+transition). That is unchanged from before the pass — the pool work neither
+helped nor hurt it. The crash signatures (`__purecall`, `vtable=008451CC`,
+`ret=0046D9D7`, `region=none`, and a VEH access violation executing at a
+non-module address) are identical in the fast and slow arms, so this is a
+pre-existing class near the round seam and it is still open. An early "5 of 6
+clean" batch during this pass was small-sample noise; see rule 11.
+
 ## The rig
 
 `th155_alt/probe_stall.sh <first_run> <count>` runs the two-instance rig
