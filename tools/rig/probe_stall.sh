@@ -40,6 +40,15 @@ for ((r=first; r<first+count; r++)); do
   mkdir -p runs/stall_$r; cp -f $p1 $p2 runs/stall_$r/ 2>/dev/null; cp -f aocf_crash.log runs/stall_$r/ 2>/dev/null
   if [ "$hung" = 1 ] || [ "$e1" = 0 ] || [ "$e2" = 0 ] || [ "${cl:-0}" != 0 ] || [ "${hk:-0}" != 0 ]; then
     echo "   >>> anomaly in run $r"
+    # PROBE_KEEP=1: keep going instead of stopping at the first anomaly. Needed
+    # whenever the question is a RATE ("is this class more common than before?")
+    # rather than "give me the failing run's logs" -- stopping at the first one
+    # makes a rate impossible to estimate.
+    if [ "${PROBE_KEEP:-0}" = 1 ]; then
+      grep -h "heapchk\] !!\|\[ivec\] !!" $p1 $p2 | head -3
+      grep -h "__purecall\|FASTFAIL via abort\|std::terminate\|CRASH (squiroll VEH)" aocf_crash.log | head -4
+      continue
+    fi
     grep -h "heapchk\] !!\|\[ivec\] !!\|insguard" $p1 $p2 | head -8
     grep -A3 "__purecall\|FASTFAIL via abort\|std::terminate\|CRASH (squiroll VEH)" aocf_crash.log | head -40
     break

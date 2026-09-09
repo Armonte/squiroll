@@ -6,6 +6,20 @@ stop at the first anomaly so the failing run's logs are the ones left in place.
 
     ./probe_stall.sh    <first_run_no> <count>   # normal rollback rig
     ./probe_lockstep.sh <first_run_no> <count>   # same rig, prediction window 0
+    ./probe_solo.sh     [seconds] [bat]          # single-instance rollback stress
+
+`probe_solo.sh` drives the SOLO session (`run_solo_val.bat` /
+`run_solo_perf.bat`), which rolls back 8 frames every frame in one process. Any
+change to state serialisation gets developed there first, with
+`SQUIROLL_BPVALIDATE=1`: a mistake is a validator line within seconds instead of
+a cross-peer desync three minutes into a dual run. `run_solo_perf.bat` is the
+same rig with the validator off, for measurement.
+
+`PROBE_KEEP=1 ./probe_stall.sh ...` keeps going past an anomaly instead of
+stopping at the first one. Use it whenever the question is a RATE. And compare
+arms at equal simulated FRAMES, not equal wall time — the rig is time-boxed, so
+a build that is twice as fast reaches a later round transition and can look like
+a stability regression when it is not (see rule 11 in docs/INSTRUMENTATION.md).
 
 `probe_lockstep.sh` is the A/B arm: `SQUIROLL_PREDICTION_WINDOW=0` keeps the
 snapshots, arenas and cross-peer checksum fully armed but never rolls back
