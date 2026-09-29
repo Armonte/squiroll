@@ -321,6 +321,101 @@ story.
 
 ## The rig
 
+## Solo 8f-stress "desync" — diagnosed 2026-09-28 (it is NOT sim divergence)
+
+`run_solo_perf.bat` shows one DESYNC early (f=8-140) and then a sustained run of
+them. It is **not** a gameplay divergence and **not** new. Two measurements
+settle it:
+
+**1. The canonical checksum says clean.** Solo compares the *raw* arena hash
+(`snapshot_ring::capture`'s `cs`), which is pointer- and render-contaminated. Run
+solo with the same canonical structural `::battle` checksum dual uses
+(`SQUIROLL_SOLO_STRUCT_CS=1`, every frame): **0 desyncs over 600 frames**, where
+the raw hash reports one at f=8. The small blob (`bp/mp/eng/irec/ihist/rng`) is
+byte-identical on every save; only the Squirrel arena pages differ.
+
+**2. The divergent state is render wall-clock.** With `SQUIROLL_DIAG=1` the first
+divergence is `sq_arena` block `Hdr@0x2122F0 {cls=16 -> 64B block, reqsize=0x100,
+magic='SQAB'}`, payload `@0x212300`, diff `@+0x4CC` — an OT_INTEGER. It moves
+per save. Bisecting the four `SQUIROLL_DET` hooks (per-hook gates
+`SQUIROLL_DET_TIME` / `SQUIROLL_DET_LOCALTIME` / `SQUIROLL_DET_KEY`):
+
+| hooks enabled | first DESYNC |
+|---|---|
+| none | f=8 |
+| time only (`timeGetTime`/`GetTickCount`/`sq_push_current_time_ms`) | f=3 |
+| localtime only (`GetLocalTime` RNG seed) | f=27 |
+| key only (`GetAsyncKeyState`) | f=57 |
+| **all three** | **clean** |
+
+So several wall-clock reads each perturb the *value* of one non-sim Squirrel
+integer, and the effect is non-additive (pin the dominant one and the residual
+changes f=8 -> f=117). This is the `CRASH_NONDET_HANDOFF.md` class: the render/
+effect scripts read wall-clock, the sim does not, so the render churns
+non-deterministically and a raw-hash oracle flags it. A Dr0 write-watch on the
+exact address (`SQUIROLL_WATCH_ADDR=0x2127CC`) does not fire — the write is
+cross-thread / memcpy, not a single-thread store.
+
+**Consequences.** (a) Solo determinism must be judged with the structural
+checksum, not the raw hash — `SQUIROLL_SOLO_STRUCT_CS=1` exists for this. (b) The
+real prize is the inverse: a **render-only desync detector** (structural = sim,
+raw-with-render-excluded = render; a mismatch on identical sim is a render
+non-determinism worth catching) to pursue once a dual run reaches 60 fps. (c)
+`SQUIROLL_DET` is whole-session and test-only (three of its hooks are `(void)`
+no-ops until enabled); do not ship it as-is.
+
+## 8f-stress profile — measured 2026-09-28 (release build)
+
+First profile of the current `merge-daze-menus` build at full rollback stress.
+Rig: `th155_alt/run_solo_perf.bat` (GekkoStressSession, `check_distance=8`,
+validator OFF, `SQUIROLL_NO_TF4A=1`), 90 s, **RELEASE** build (`BUILD_TYPE=release
+FORCE_FULL_REBUILD=1`).
+
+**Result: ~51 fps early, degrading to ~39 fps over 90 s. 8f stress is below 60.**
+(A `-Od` dev build of the same source gives ~37 fps, so always profile a release
+build — the earlier dev-build number is not comparable to anything in this doc.)
+
+Per-call microseconds, medians near the start of the run:
+
+| cost | µs/call | calls per displayed frame | µs/frame |
+|---|---|---|---|
+| advance | ~690 | 9 (1 forward + 8 re-sim) | ~6,200 |
+| save | ~970 | 9 | ~8,700 |
+| load | ~1,470 | 8 | ~11,800 |
+| **rollback total** | | | **~26,700 (~27 ms)** |
+
+That is ~1.6 frames of work per displayed frame, so the frame is late and render
+drops. This is the number to move; nothing else in the frame comes close.
+
+The two 9x terms dominate:
+
+* **advance ~690 µs** is the whole sim step (engine update + Squirrel). Paid 9x
+  because a stress session runs 1 forward + 8 re-sim per displayed frame.
+* **save ~970 µs** = small blob ~195 + capture ~775. Capture (snapshot_ring) is
+  `getww=265-278  dirtycopy=343-350  sblobcopy=68-74  fold=134-141` over ~300 sq
+  + ~25 bt + ~30 cpp dirty pages (~1.4 MB). Full breakdown: `[perf-sect] bp=64
+  mp=17 eng=10` (small blob, cheap after the pool pass) + `[snapshot_ring]`.
+
+The restore path (`load`, ~1,470 µs): `syncpin=2 step0_getww=265 step0_copy=147
+reverse=929 pin_reapply=39 final_resetww=75`. `reverse` (apply the deltas back)
+and `step0` are the memory-bandwidth items; the two GetWriteWatch calls are
+~340 of it.
+
+GetWriteWatch is ~263-278 µs for cpp (2 calls, 23,492 pages scanned, ~30 dirty)
++ ~68 sq + ~26 bt ≈ **~370 µs/call-set, twice a frame**. Already proven the floor:
+it is *call*-dominated (~52 µs/call + ~6 ns/page), and narrowing the query to
+fewer pages costs *more* (see the c368c89 note in §"Reading the numbers").
+
+Levers that remain, in order of size: (1) pool the save/restore page copies to
+cut `dirtycopy`+`reverse`; (2) skip the redundant capture where the re-sim is a
+pure replay of a frame already in the ring (the ~9x save is 1 forward + 8 re-sim
+captures); (3) the per-arena GetWriteWatch set (already at its floor).
+
+Separately, a **solo-only** DESYNC fires at f≈118-140 in both builds. It is
+pre-existing (every archived `*_solo*.log*` shows exactly 1) and is the `com_*`
+CPU-AI divergence documented in `M4_HANDOFF.md` ("the `com_*` CPU-AI divergences
+are solo-only and don't exist in PvP"). Not a regression; not perf-relevant.
+
 `th155_alt/probe_stall.sh <first_run> <count>` runs the two-instance rig
 repeatedly, archives each run under `runs/stall_N/`, and stops at the first
 anomaly (`PROBE_KEEP=1` keeps going — see rule 10). Both launcher batches use

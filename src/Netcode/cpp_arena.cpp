@@ -1447,6 +1447,20 @@ void install() {
     // residual nondeterminism source is still being chased).
     if (getenv("SQUIROLL_DET"))
     {   // Patch th155's real-time IATs to frame-deterministic stubs (render determinism).
+    // SQUIROLL_DET sets all three unless an individual SKIP_* is 0.
+    auto on = [](const char* name, bool all) -> bool {
+        char b[8] = {0};
+        DWORD n = GetEnvironmentVariableA(name, b, sizeof b);
+        if (n > 0 && n < sizeof b && b[0] == '0') return false;   // explicit off
+        if (n > 0) return true;                                    // explicit on
+        return all;
+    };
+    const bool full_det = true;   // inside the SQUIROLL_DET guard
+    const bool do_key   = on("SQUIROLL_DET_KEY",   full_det);
+    const bool do_time  = on("SQUIROLL_DET_TIME",  full_det);
+    const bool do_loc   = on("SQUIROLL_DET_LOCALTIME", full_det);
+    log_printf("[det] gates: key=%d time=%d localtime=%d\n",
+               (int)do_key, (int)do_time, (int)do_loc);
     // Pin th155's entire dynamic address space (heap segments + pools) to deterministic bases.
     // Gated behind SQUIROLL_VABUMP: only useful once the allocation SEQUENCE is deterministic
     // (it isn't yet — the pre-match/render alloc count varies, so the bump just relocates noise).
@@ -1458,13 +1472,13 @@ void install() {
                        (unsigned)g_va_next);
         }
     }
-    g_h_scripttime = safetyhook::create_inline((void*)(0x49450_R),  (void*)scripttime_hook);
+    if (do_time) g_h_scripttime = safetyhook::create_inline((void*)(0x49450_R),  (void*)scripttime_hook);
     {
-        struct { uint32_t iat; void* fn; const char* nm; } pat[] = {
-            { 0x3883CC_R, (void*)&det_getasynckeystate, "GetAsyncKeyState" },
-            { 0x3884BC_R, (void*)&det_timegettime,      "timeGetTime"      },
-            { 0x3880A4_R, (void*)&det_gettickcount,     "GetTickCount"     },
-            { 0x3880E0_R, (void*)&det_getlocaltime,     "GetLocalTime(RNG seed)" },
+        struct { uint32_t iat; void* fn; const char* nm; bool en; } pat[] = {
+            { 0x3883CC_R, (void*)&det_getasynckeystate, "GetAsyncKeyState",      do_key },
+            { 0x3884BC_R, (void*)&det_timegettime,      "timeGetTime",          do_time },
+            { 0x3880A4_R, (void*)&det_gettickcount,     "GetTickCount",         do_time },
+            { 0x3880E0_R, (void*)&det_getlocaltime,     "GetLocalTime(RNG seed)", do_loc },
             // QPC NOT hooked: it's pure PROFILING (effect vftable_19 stores it into a
             // perf-stats struct for UpdateLayerPerfCounter), not animation. Our small
             // frame value vs the real pre-hook baseline made elapsed negative -> worse.
@@ -1473,6 +1487,7 @@ void install() {
         };
         (void)det_qpc; (void)det_qpf;
         for (auto& p : pat) {
+            if (!p.en) continue;
             void** iat = (void**)(uintptr_t)p.iat;
             DWORD old = 0;
             if (VirtualProtect(iat, sizeof(void*), PAGE_READWRITE, &old)) {

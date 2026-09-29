@@ -1772,10 +1772,20 @@ uint32_t save_state_to_buf(void* buf, uint32_t cap, uint32_t* out_checksum,
                                      : (cs_every == 1 ? "every frame"
                                                       : "sampled"));
         }
-        const bool cs_due = !g_solo && cs_every > 0 &&
+        // SQUIROLL_SOLO_STRUCT_CS=1 also runs the canonical structural checksum
+        // in a SOLO (GekkoStressSession) run, so solo forward-vs-re-sim is
+        // compared on the canonical ::battle state instead of the pointer-/
+        // render-contaminated raw arena hash. This answers whether a solo
+        // "desync" is a real sim divergence or render-only noise.
+        static int solo_struct = -1;
+        if (solo_struct < 0) {
+            char b[8] = {0};
+            solo_struct = GetEnvironmentVariableA("SQUIROLL_SOLO_STRUCT_CS", b, sizeof b) > 0;
+        }
+        const bool cs_due = (g_solo ? solo_struct != 0 : true) && cs_every > 0 &&
                             (cs_every == 1 || (frame % (uint32_t)cs_every) == 0);
-        if (!g_solo && !cs_due) final_cs = GEKKO_CHECKSUM_UNAVAILABLE;
-        if (!g_solo && cs_due) {
+        if (!cs_due) final_cs = GEKKO_CHECKSUM_UNAVAILABLE;
+        if (cs_due) {
             static uint8_t* sqscratch = nullptr;
             static const uint32_t SQSCRATCH = 1u << 20;
             if (!sqscratch)
