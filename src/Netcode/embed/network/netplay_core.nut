@@ -92,7 +92,7 @@ class Server extends ::manbow.NetworkServer {
         ::network.Initialize();
         ::network.client_num = 2;
         ::network.inst_connect = this;
-        Init(port,client_num); if (mode & 1 && ::LOBBY.GetNetworkState() == 2)::punch.init_wait(); return true; 
+        Init(port,::network.client_num); if (mode & 1 && ::LOBBY.GetNetworkState() == 2)::punch.init_wait(); return true; 
     }
 
     function HandleRequest(id,request) {

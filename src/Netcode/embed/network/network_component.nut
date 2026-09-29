@@ -103,12 +103,20 @@ IsPlaying <- @()inst && !is_watch;
 IsEnableStreamingBuffer <- @()inst.StreamingPlay();
 GetDelay <- @()func_get_delay();
 
+// [merge] Daze's netplay rewrite moved the listen/connect implementation into the
+// Server/Client classes (netplay_core.nut, xx.Open()/Join()). These are the old
+// entry points the auto_connect test path (boot.nut) and netplay.Host()/Connect()
+// still call; wire them to the new classes so delay netcode (and the gekko watch
+// armed over it) actually connects. The real-flow path goes through
+// netplay.WaitInLobby/SearchInLobby -> Server.Open/Client.Join directly.
 function StartupServer(port,mode) {
-	//::netplay.Server(port,mode);
+	local srv = ::netplay.Server();
+	return srv.Open(port, mode, (mode & 1) != 0);
 }
 
 function StartupClient(addr,port,mode) {
-	//::netplay.Client(addr,port,mode);
+	local cli = ::netplay.Client();
+	return cli.Join(addr, port, mode);
 }
 
 function HostAFK() {
