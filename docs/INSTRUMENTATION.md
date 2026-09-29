@@ -356,13 +356,30 @@ non-deterministically and a raw-hash oracle flags it. A Dr0 write-watch on the
 exact address (`SQUIROLL_WATCH_ADDR=0x2127CC`) does not fire — the write is
 cross-thread / memcpy, not a single-thread store.
 
-**Consequences.** (a) Solo determinism must be judged with the structural
-checksum, not the raw hash — `SQUIROLL_SOLO_STRUCT_CS=1` exists for this. (b) The
-real prize is the inverse: a **render-only desync detector** (structural = sim,
-raw-with-render-excluded = render; a mismatch on identical sim is a render
-non-determinism worth catching) to pursue once a dual run reaches 60 fps. (c)
-`SQUIROLL_DET` is whole-session and test-only (three of its hooks are `(void)`
-no-ops until enabled); do not ship it as-is.
+**FIX (2026-09-28).** The sources are named by IDA (th155 GUI session,
+`mcp__ida_pro_mcp__*`): `sq_push_current_time_ms` (0x49450) reads `timeGetTime`
+and is registered by `__Init_Act__ScriptApi` — a Squirrel binding the Act
+HUD/effect scripts call; `Ew_sRandom__ctor` (0xe95a0) seeds its SFMT RNG from
+`GetLocalTime`, so every effect's randomization differs per launch. `timeGetTime`
+/ `GetTickCount` are otherwise th155's *profiling* timers (`update_profile_timers`,
+`timer_get_elapsed_us`, `gProfileClock`) — hooking them broadly nearly **doubles
+`advance`**, so they stay off by default.
+
+`cpp_arena.cpp` now, **by default and scoped to a live battle only**, pins the
+two render sources: `sq_push_current_time_ms` -> `g_trace_frame*16` and
+`GetLocalTime` -> constant. Outside a session the real clock/seed is kept, so
+lobby/CSS timing and cosmetic effect RNG are untouched. Result on the solo 8f
+rig: **0 desyncs over 3,540 frames** (was diverge-at-f=8 then 300+ sustained),
+perf unchanged (`advance` 625-653, `save` 969-1025, `load` 1492-1591 us).
+Knobs: `SQUIROLL_DET=0` restores wall-clock; `SQUIROLL_DET_TIMEGETTIME=1` adds
+the profiling timers (measurement only); `SQUIROLL_DET_KEY=1` adds the
+`GetAsyncKeyState` null (harness only — blanks real input).
+
+**Consequences.** (a) Solo determinism can also be judged with the structural
+checksum (`SQUIROLL_SOLO_STRUCT_CS=1`), which reads the canonical sim state rather
+than the render-tainted raw hash. (b) The inverse is still worth building: a
+**render-only desync detector** (structural = sim, raw = render; a mismatch on
+identical sim is render non-determinism) once a dual run reaches 60 fps.
 
 ## 8f-stress profile — measured 2026-09-28 (release build)
 

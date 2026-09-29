@@ -1281,8 +1281,30 @@ static uintptr_t cdecl hook_beginthreadex(void* sec, unsigned stk, void* start,
 static SafetyHookInline g_h_scripttime{};
 static SafetyHookInline g_h_scriptkey{};
 typedef void (cdecl* sq_pushint_t)(void* vm, int i);
+// RENDER-CLOCK DETERMINISM (scoped). When a gekko session is LIVE, the render/
+// effect layer must see a clock that advances with the LOGICAL frame
+// (identical forward vs re-sim) and a stable RNG seed, or the Act/HUD Squirrel
+// state written into sq_arena varies run-to-run and the raw snapshot hash
+// diverges (solo f=8; the dual analog). Outside a battle the real clock/seed is
+// kept, so lobby/CSS timing and cosmetic effect RNG are untouched. Gated by
+// SQUIROLL_DET=0 to restore the pre-fix behaviour, and SQUIROLL_DET_CLOCKS=0 to
+// scope it off. (IDA: sq_push_current_time_ms 0x49450 <- timeGetTime; Ew_sRandom__ctor
+// 0xe95a0 <- GetLocalTime; effects also read GetTickCount.)
+static bool det_clocks() {
+    static int v = -1;
+    if (v < 0) {
+        char b[8] = {0};
+        v = 1;
+        if (GetEnvironmentVariableA("SQUIROLL_DET", b, sizeof b) > 0 && b[0] == '0') v = 0;
+        if (GetEnvironmentVariableA("SQUIROLL_DET_CLOCKS", b, sizeof b) > 0 && b[0] == '0') v = 0;
+    }
+    return v != 0;
+}
 static int cdecl scripttime_hook(void* vm) {
-    ((sq_pushint_t)(0x184370_R))(vm, gekko_bridge::g_trace_frame * 16);   // 16 ms/frame, deterministic
+    if (det_clocks() && gekko_bridge::is_session_started())
+        ((sq_pushint_t)(0x184370_R))(vm, gekko_bridge::g_trace_frame * 16);
+    else
+        ((sq_pushint_t)(0x184370_R))(vm, (int)(unsigned long)timeGetTime());
     return 1;
 }
 static int cdecl scriptkey_hook(void* vm) {
@@ -1298,10 +1320,16 @@ static short __stdcall det_getasynckeystate(int /*vKey*/) { return 0; }
 // dispatch the rollback corrupts varies per run. squiroll's own perf/exit timing uses
 // Netcode.dll's IAT (not patched), so the wall-clock harness exit still works.
 static unsigned long __stdcall det_timegettime() {
-    int f = gekko_bridge::g_trace_frame; return (unsigned long)((f < 0 ? 0 : f) * 16);
+    if (det_clocks() && gekko_bridge::is_session_started()) {
+        int f = gekko_bridge::g_trace_frame; return (unsigned long)((f < 0 ? 0 : f) * 16);
+    }
+    return timeGetTime();
 }
 static unsigned long __stdcall det_gettickcount() {
-    int f = gekko_bridge::g_trace_frame; return (unsigned long)((f < 0 ? 0 : f) * 16);
+    if (det_clocks() && gekko_bridge::is_session_started()) {
+        int f = gekko_bridge::g_trace_frame; return (unsigned long)((f < 0 ? 0 : f) * 16);
+    }
+    return GetTickCount();
 }
 // The Ew::sTask scheduler AND every effect (Ew_tEftShine/Orb/Spark/Particle/...) time their
 // animations off QueryPerformanceCounter — the dominant render-dispatch nondeterminism. Make
@@ -1348,7 +1376,13 @@ static void __stdcall det_getlocaltime(unsigned short* st) {
                    (ra >= 0xE95A0 && ra <= 0xE9736) ? "<<< RNG SEED (Ew_sRandom__ctor)" : "(cosmetic)");
     }
     if (!st) return;
-    st[0]=2026; st[1]=1; st[2]=0; st[3]=1; st[4]=0; st[5]=0; st[6]=0; st[7]=0;
+    // Scoped: during a live battle the effect RNG seed must be stable (identical
+    // forward vs re-sim); outside battle the real local time is kept.
+    if (det_clocks() && gekko_bridge::is_session_started()) {
+        st[0]=2026; st[1]=1; st[2]=0; st[3]=1; st[4]=0; st[5]=0; st[6]=0; st[7]=0;
+    } else {
+        GetLocalTime((LPSYSTEMTIME)st);
+    }
 }
 
 } // namespace
@@ -1441,29 +1475,28 @@ void install() {
     g_h_numdigit  = safetyhook::create_inline((void*)(0x158A40_R), (void*)numdigit_hook);
     (void)g_h_scripttime; (void)scripttime_hook; (void)g_h_scriptkey; (void)scriptkey_hook;
     (void)det_getasynckeystate; (void)det_timegettime; (void)det_gettickcount;
-    // Render-clock determinism is TEST infrastructure (SQUIROLL_DET=1): frame-based clocks
-    // freeze pre-match wall-clock, so it's for reproducing/diagnosing the render-dispatch
-    // rollback crash, not a default-on fix. It reduces but doesn't eliminate the crash (the
-    // residual nondeterminism source is still being chased).
-    if (getenv("SQUIROLL_DET"))
-    {   // Patch th155's real-time IATs to frame-deterministic stubs (render determinism).
-    // SQUIROLL_DET sets all three unless an individual SKIP_* is 0.
-    auto on = [](const char* name, bool all) -> bool {
+    // RENDER-CLOCK DETERMINISM (scoped, default ON). The render/effect layer reads
+    // wall-clock (timeGetTime via sq_push_current_time_ms, GetTickCount, GetLocalTime
+    // for the effect RNG seed) but the sim never does; during a LIVE battle those reads
+    // must be frame-deterministic or the Squirrel render state written into sq_arena
+    // varies forward vs re-sim and the raw snapshot hash diverges (solo f=8; the dual
+    // analog). The stubs above keep the REAL clock/seed outside a battle, so lobby/CSS
+    // timing and cosmetic effect RNG are untouched. IDA named the sources:
+    //   sq_push_current_time_ms 0x49450 <- timeGetTime (Act HUD/effect binding)
+    //   Ew_sRandom__ctor        0xe95a0 <- GetLocalTime (effect RNG seed)
+    // SQUIROLL_DET=0 restores the old wall-clock behaviour; SQUIROLL_DET_CLOCKS=0 scopes
+    // off the clock hooks; SQUIROLL_DET_KEY=1 adds the GetAsyncKeyState null (harness only,
+    // NOT default — it blanks real input).
+    auto on_ = [](const char* name) -> bool {
         char b[8] = {0};
         DWORD n = GetEnvironmentVariableA(name, b, sizeof b);
-        if (n > 0 && n < sizeof b && b[0] == '0') return false;   // explicit off
-        if (n > 0) return true;                                    // explicit on
-        return all;
+        return !(n > 0 && n < sizeof b && b[0] == '0');
     };
-    const bool full_det = true;   // inside the SQUIROLL_DET guard
-    const bool do_key   = on("SQUIROLL_DET_KEY",   full_det);
-    const bool do_time  = on("SQUIROLL_DET_TIME",  full_det);
-    const bool do_loc   = on("SQUIROLL_DET_LOCALTIME", full_det);
-    log_printf("[det] gates: key=%d time=%d localtime=%d\n",
-               (int)do_key, (int)do_time, (int)do_loc);
-    // Pin th155's entire dynamic address space (heap segments + pools) to deterministic bases.
-    // Gated behind SQUIROLL_VABUMP: only useful once the allocation SEQUENCE is deterministic
-    // (it isn't yet — the pre-match/render alloc count varies, so the bump just relocates noise).
+    const bool do_clocks = det_clocks();
+    const bool do_key    = on_("SQUIROLL_DET_KEY") && getenv("SQUIROLL_DET_KEY") != nullptr;
+    log_printf("[det] clocks=%d key=%d\n", (int)do_clocks, (int)do_key);
+    // Optional deterministic address space (harness): only meaningful once the allocation
+    // SEQUENCE is deterministic; gated behind SQUIROLL_VABUMP.
     if (getenv("SQUIROLL_VABUMP"))
     if (HMODULE nt = GetModuleHandleA("ntdll.dll")) {
         if (void* p = (void*)GetProcAddress(nt, "NtAllocateVirtualMemory")) {
@@ -1472,18 +1505,19 @@ void install() {
                        (unsigned)g_va_next);
         }
     }
-    if (do_time) g_h_scripttime = safetyhook::create_inline((void*)(0x49450_R),  (void*)scripttime_hook);
+    if (do_clocks) g_h_scripttime = safetyhook::create_inline((void*)(0x49450_R), (void*)scripttime_hook);
     {
+        // GetTickCount / timeGetTime are th155's PROFILING timers (IDA: update_profile_timers,
+        // timer_get_elapsed_us, gProfileClock) and are called constantly in the sim -- hooking
+        // them broadly nearly doubles advance. They are NOT the render-nondeterminism source,
+        // so they are off by default; opt in only for a determinism experiment.
+        char tb[8] = {0};
+        bool do_tt = (GetEnvironmentVariableA("SQUIROLL_DET_TIMEGETTIME", tb, sizeof tb) > 0);
         struct { uint32_t iat; void* fn; const char* nm; bool en; } pat[] = {
-            { 0x3883CC_R, (void*)&det_getasynckeystate, "GetAsyncKeyState",      do_key },
-            { 0x3884BC_R, (void*)&det_timegettime,      "timeGetTime",          do_time },
-            { 0x3880A4_R, (void*)&det_gettickcount,     "GetTickCount",         do_time },
-            { 0x3880E0_R, (void*)&det_getlocaltime,     "GetLocalTime(RNG seed)", do_loc },
-            // QPC NOT hooked: it's pure PROFILING (effect vftable_19 stores it into a
-            // perf-stats struct for UpdateLayerPerfCounter), not animation. Our small
-            // frame value vs the real pre-hook baseline made elapsed negative -> worse.
-            // { 0x3880D8_R, (void*)&det_qpc, "QueryPerfCounter" },
-            // { 0x3880DC_R, (void*)&det_qpf, "QueryPerfFreq" },
+            { 0x3883CC_R, (void*)&det_getasynckeystate, "GetAsyncKeyState",       do_key },
+            { 0x3884BC_R, (void*)&det_timegettime,      "timeGetTime",           do_tt },
+            { 0x3880A4_R, (void*)&det_gettickcount,     "GetTickCount",          do_tt },
+            { 0x3880E0_R, (void*)&det_getlocaltime,     "GetLocalTime(RNG seed)", do_clocks },
         };
         (void)det_qpc; (void)det_qpf;
         for (auto& p : pat) {
@@ -1497,7 +1531,6 @@ void install() {
             }
         }
     }
-    }   // end if (SQUIROLL_DET)
     g_h_haspend   = safetyhook::create_inline((void*)(0x2FA00_R),  (void*)haspend_hook);
     // numdispose hook NOT installed: proven not the crash (0x64D80 Number-dispose is never
     // called during the rollback). The ~f60-70 abort is the game-loop ScriptAPI's slot-list
