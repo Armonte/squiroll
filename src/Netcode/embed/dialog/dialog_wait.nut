@@ -55,8 +55,8 @@ function Update() {
 		}
 	}
 
-    if (::network.received_request) {
-		local request = ::network.received_request;
+    if (::network.request) {
+		local request = ::network.request;
 		local timeleft = 30 - (::menu.network.timeout / 60);
 		timeleft = ::math.clamp(timeleft, 0, 30);
 		str = ::format("Match Found!\\n%s#%dms(%d)", request.name, ::network.GetDelay(),timeleft);

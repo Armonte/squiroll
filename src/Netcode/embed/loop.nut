@@ -117,7 +117,6 @@ function Move( env )
 function Update()
 {
 	::input_all.Update();
-
 	// Gekko rollback: once the gekko session owns the frame loop, the
 	// scene must advance EXACTLY ONCE per engine frame, ungated. The
 	// vanilla netplay branch below runs the scene inside
@@ -148,7 +147,7 @@ function Update()
 			v.Update();
 		}
 	}
-	else if (::network.IsPlaying() && ::network.ready && !::network.received_request)
+	else if (::network.IsPlaying() && ::network.ready && !::network.request)
 	{
 		if (::network.input_local)
 		{
@@ -190,10 +189,15 @@ function Update()
 		//::rollback.postframe();
 	}
 
-	foreach( v in this.task_async )
-	{
-		v.Update();
-	}
+    local now = ::manbow.timeGetTime();
+    local i = 0;
+	foreach(v in this.task_async) {
+        v.Update();
+	    local n = ::manbow.timeGetTime();
+        //::print(::format("task %d took %d ms\n", i,n - now));
+        i++;
+        now = n;
+    }
 }
 
 function Pause( count )

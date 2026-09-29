@@ -383,8 +383,8 @@ function Update()
                 break;
 
             case "wait_host":
-                if (::network.received_request != null) {
-                    ::print("[squiroll boot] received_request from peer, AcceptMatch\n");
+                if (::network.request != null) {
+                    ::print("[squiroll boot] request from peer, AcceptMatch\n");
                     this.stage = "in_css";
                     ::network.AcceptMatch();
                 }

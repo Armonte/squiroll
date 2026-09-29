@@ -1,37 +1,71 @@
-timeout <- 0;
-upnp_timeout <- 0;
-lobby_user_state <- 0;
-lobby_interval <- 10000;
-lobby_time_stamp <- ::manbow.timeGetTime() - lobby_interval + 1000; 
+room_name <- ["Free","Novice","Veteran","EU","NA","SA","Asia","Dev"];
+help_prompt <- ["B1","ok",null,"B2","cancel"];
+help_cancel <- ["B2","cancel"];
+
+::manbow.CompileFile("squiroll/network/netplay_core.nut",this);
+::manbow.CompileFile("squiroll/network/netplay_update.nut",this);
+
+Init();
 
 function WaitInLobby() {
-    if (::LOBBY.GetNetworkState() != 2){
-        ::print("Lobby is offline\n");
-        return false;
-    }
-    ::LOBBY.SetExternalPort(::config.network.hosting_port);
-    ::LOBBY.SetUserData("" + ::config.network.hosting_port);
-    upnp_timeout = 0;
-    lobby_user_state = ::LOBBY.WAIT_INCOMMING;
-    if (!::config.network.upnp)::LOBBY.SetLobbyUserState(lobby_user_state);
-    ::network.use_lobby = true;
-    ::network.StartupServer(::config.network.hosting_port,0);
-    ::print("[lobbydbg] HOST WaitInLobby: WAIT_INCOMMING port=" + ::config.network.hosting_port + " ext_port=" + ::config.network.hosting_port + "\n");
-    ::lobby.inc_user_count();
+    //if (::LOBBY.GetNetworkState() != 2){
+    //    ::print("Lobby is offline\n");
+    //    return false;
+    //}
+    //::LOBBY.SetExternalPort(::config.network.hosting_port);
+    //::LOBBY.SetUserData("" + ::config.network.hosting_port);
+    //upnp_timeout = 0;
+    //if (!::config.network.upnp)::LOBBY.SetLobbyUserState(::LOBBY.WAIT_INCOMMING);
+    //user_state  = ::LOBBY.WAIT_INCOMMING;
+    //::network.use_lobby = true;
+    //::network.StartupServer(::config.network.hosting_port,0);
+    //::lobby.inc_user_count();
+    local srv = Server();
+    if (!srv.Open(::config.network.hosting_port,0,true))return false;
+    update = UpdateMatch;
     return true;
 }
 
 function SearchInLobby() {
-    if (::LOBBY.GetNetworkState() != 2) {
-        ::print("Lobby is offline\n");
-        return false;
-    }
-    ::LOBBY.SetExternalPort(::config.network.hosting_port);
-    ::LOBBY.SetUserData("" + ::config.network.hosting_port);
-    lobby_user_state = ::LOBBY.MATCHING;
-    ::LOBBY.SetLobbyUserState(lobby_user_state);
-    ::print("[lobbydbg] CLIENT SearchInLobby: MATCHING, ext_port=" + ::config.network.hosting_port + "\n");
+    //if (::LOBBY.GetNetworkState() != 2) {
+    //    ::print("Lobby is offline\n");
+    //    return false;
+    //}
+    //::LOBBY.SetExternalPort(::config.network.hosting_port);
+    //::LOBBY.SetUserData("" + ::config.network.hosting_port);
+    //user_state = ::LOBBY.MATCHING;
+    //::LOBBY.SetLobbyUserState(user_state);
+    local srv = Client();
+    if(!srv.JoinLobby())return false;
+    update = UpdateMatch;
     return true;
+}
+
+function HaltInLobby() {
+    if(user_state == ::LOBBY.WAIT_INCOMMING)::lobby.dec_user_count();
+    ::LOBBY.SetLobbyUserState(::LOBBY.NO_OPERATION);
+    ::network.Terminate();
+    //::loop.End();
+    update = UpdateIdle;
+}
+
+function BeginMatchmaking(lobby,host = true) {
+    SetLobby(lobby);
+    update = function() {
+        if (timeout++ > 360) HaltInLobby();
+        if (::LOBBY.GetNetworkState() != 2)return;
+        timeout = 0;
+        if (host)WaitInLobby();
+        else SearchInLobby();
+        ::UI.Popup.Utility.Notification.Top(::UI.Network.Dialog.Matchmaking);
+    }
+}
+
+function SetLobby(idx) {
+    ::config.network.lobby_name = room_name[idx];
+    ::config.Save();
+    time_stamp = ::manbow.timeGetTime() - 9000;
+    ::LOBBY.Close();
 }
 
 function Host() {
@@ -50,20 +84,18 @@ function Connect(addr,port,mode) {
 function FoundMatch() {
     local host = ::LOBBY.GetMatchHost();
     if (host != "") {
-        lobby_user_state = ::LOBBY.NO_OPERATION;
-        ::LOBBY.SetLobbyUserState(lobby_user_state);
+        ::LOBBY.SetLobbyUserState(::LOBBY.NO_OPERATION);
         ::network.Terminate();
-        local userdata = ::LOBBY.GetMatchUserData();
-        return true;
+        return host;
     }
-    return false;
+    return null;
 }
 
 function IsConnecting() {
     if (::LOBBY.GetLobbyUserState() == 102) {
         if (timeout++ > 360) {
-            if (retry_count++ > 5)lobby_user_state = ::LOBBY.MATCHING;
-            ::LOBBY.SetLobbyUserState(lobby_user_state);
+            if (retry_count++ > 5)::LOBBY.SetLobbyUserState(::LOBBY.MATCHING);
+            ::LOBBY.SetLobbyUserState(user_state);
             timeout = 0;
             return 2;
         }
@@ -77,8 +109,26 @@ function IsHostAfk() {
     ::print("host is afk\n");
     ::network.HostAFK();
     ::LOBBY.Connect("","","",::config.network.lobby_name,::config.network.lobby_name);
-    lobby_user_state = ::LOBBY.MATCHING;
-    ::LOBBY.SetLobbyUserState(lobby_user_state);
+    ::LOBBY.SetLobbyUserState(::LOBBY.MATCHING);
+    update = UpdateMatch;
     timeout = 0;
     return true;
 }
+
+function MatchCancelled() {
+    ::LOBBY.Connect("","","",::config.network.lobby_name,::config.network.lobby_name);
+    user_state = ::LOBBY.WAIT_INCOMMING;
+    ::LOBBY.SetLobbyUserState(user_state);
+    ::network.StartupServer(::config.network.hosting_port, 0);
+    update = UpdateMatch;
+}
+
+function GetHost(str) {
+    local ret = {ip="",port=-1};
+    local delim = str.find(":");
+    if (!delim)return ret;
+    ret.ip = str.slice(0,delim);
+    ret.port = str.slice(delim+1);
+    return ret;
+}
+::loop.AddTask(this);

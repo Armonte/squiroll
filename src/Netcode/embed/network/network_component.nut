@@ -1,52 +1,41 @@
 lobby_prefix <- "th155_";
 lobby_version_sig <- GetVersionSignature();
 lobby_name <- "Free";
+
 inst <- null;
 inst_connect <- null;
 return_code <- -1;
 client_num <- 0;
+
 is_client <- false;
 is_parent_vs <- false;
-allow_watch <- false;
+is_disconnect <- false;
 is_watch <- false;
+
+allow_watch <- false;
 hide_host_ip <- true;
 host_ip <- "";
-is_disconnect <- false;
 use_lobby <- false;
 upnp_port <- 0;
+
 local_device_id <- 0;
 input_local <- null;
 rand_seed <- 0;
-// [#44 netcode negotiation] per-MATCH resolved netcode: true = GekkoNet rollback,
-// false = vanilla delay. The HOST computes the symmetric AND of both peers'
-// wants (`gekko_enabled`, or the per-match menu pick from #45) and ships the
-// result in the "yes" handshake so both sides arm identically. A peer that never
-// advertises `rollback_wanted` (vanilla / older squiroll) resolves to delay.
-use_rollback <- false;
-server_profile <- null;
-client_profile <- null;
-history <- [];
-history_load_count <- 0;
-hidden_char <- 0;
-use_matching <- false;
-numbattle <- 1;
-frame_score <- 0;
-frame_count <- 0;
-player_name <- [
-	"",
-	""
-];
-color_num <- [
-	8,
-	8
-];
-icon <- [
-	null,
-	null
-];
+
+player_name <- ["",""];
+color_num <- [8,8];
+icon <- [null,null];
 local_icon <- "";
-received_request <- null;
-ready <- false;
+
+request <- null;//N
+ready <- false;//N
+
+// [#44 netcode negotiation] per-MATCH resolved netcode: true = GekkoNet
+// rollback, false = vanilla delay. The HOST computes the symmetric AND of both
+// peers' wants (`gekko_enabled`, or the per-match menu pick from #45) and ships
+// the result in the "yes" handshake so both sides arm identically. A peer that
+// never advertises `rollback_wanted` (vanilla / older squiroll) resolves to delay.
+use_rollback <- false;
 
 function Initialize() {
     ready = false;
@@ -62,7 +51,7 @@ function Initialize() {
 	allow_watch = false;
 	is_disconnect = false;
 	client_num = 0;
-	received_request = null;
+	request = null;
 	icon = ["",""];
 	func_get_delay <- @()0;
 	
@@ -76,291 +65,26 @@ function Initialize() {
 }
 
 function Terminate() {
-	::menu.network.timeout = 0;
-	received_request = null;
+    ::netplay.Terminate();
+	request = null;
 	// Rollback: clear any armed-but-unfired gekko watch (and tear down a live
 	// session) so a cancelled/aborted online match can't arm gekko on a later
 	// LOCAL fight. Safe no-op when nothing is armed.
 	if (::setting.network.gekko_enabled) {
 		try { ::setting.network.gekko_shutdown(); } catch (_e) {}
 	}
-	if (upnp_port > 0)
-	{
-		try
-		{
-			local ret = ::UPnP.DeletePort(upnp_port, "UDP");
-		}
-		catch( _e )
-		{
-		}
-
+	if (upnp_port > 0) {
+		try ::UPnP.DeletePort(upnp_port, "UDP")
+		catch(_e);
 		upnp_port = 0;
 	}
-
+    
 	inst = null;
 	inst_connect = null;
 	is_disconnect = true;
 }
 
-
-function StartupServer(port,mode) {
-	if (::config.network.upnp) {
-		upnp_port = port;
-		try local ret = ::UPnP.AddPort(port, port, "UDP")
-		catch (e);
-	}else upnp_port = 0;
-
-	Initialize();
-	local mb_server = ::manbow.NetworkServer();
-	mb_server.ConnectRequest = function (id,context,request,reply) {
-		reply.message <- "";
-		//||||||||||||||||||||||||||||
-		//||Match Rejection Handling||
-		//||||||||||||||||||||||||||||
-
-		//version mismatch
-		if (!("version" in request) || request.version != GetVersion()) {
-			reply.message = "version";
-			return false;
-		}
-		if ("is_watch" in request) {
-			if (id > 0) {
-				//spectator accepted
-				if (allow_watch) {
-					reply.is_parent_vs <- true;
-					reply.is_watch <- true;
-					return true;
-				}
-				//spectate disabled
-				reply.message = "watch";
-				return false;
-			}else {
-				//match not started
-				if (::config.network.allow_watch) {
-					reply.message = "ready";
-					return false;
-				}
-				//spectate disabled
-				reply.message = "watch";
-				return false;
-			}
-		}
-		//matched already
-		if (id > 0) {
-			reply.message = "busy";
-			return false;
-		}
-
-		//match singleton check
-		if (inst) return false;
-
-		//||||||||||||||||||||||||
-		//||Match Request Prompt||
-		//||||||||||||||||||||||||
-		if (::LOBBY.GetNetworkState() != ::LOBBY.CLOSED)::LOBBY.Close();
-		inst = inst_connect;
-		func_get_delay = @()::network.inst.GetChildDelay(0);
-		::sound.PlaySE(120);
-		received_request = {
-			name = request.name
-			color = request.color
-			allow_watch = request.allow_watch
-			// [#44] the connecting client's netcode want (absent on a vanilla
-			// peer -> treated as false -> delay, preserving cross-play).
-			rollback_wanted = ("rollback_wanted" in request) ? request.rollback_wanted : false
-		};
-		::print("[#44] host got connection request: req_has_rollback_wanted=" + ("rollback_wanted" in request) + " val=" + received_request.rollback_wanted + "\n");
-		reply.name <- ::config.network.player_name;
-		return true;
-	}.bindenv(this);
-
-	mb_server.DisconnectChild = function (id) {
-		::print("[vdisc] native DisconnectChild id=" + id + "\n");
-		if (id == 0) Disconnect();
-	}.bindenv(this);
-
-	mb_server.ReceiveFromChild = function (id,table) {
-		try {
-			if ("message" in table) {
-				switch(table.message) {
-					case "profile":
-						::print("p2 profile chunk\n");
-						icon[1] += table.icon_chunk;
-						break;
-					case "nvm":
-						Terminate();
-						::menu.network.update = ::menu.network.UpdateMatch;
-						::LOBBY.Connect("","","",::config.network.lobby_name,::config.network.lobby_name);
-						::menu.network.lobby_user_state = ::LOBBY.WAIT_INCOMMING;
-						::LOBBY.SetLobbyUserState(::menu.network.lobby_user_state);
-						::network.StartupServer(::config.network.hosting_port, 0);
-						break;
-					case "afk":
-						Terminate();
-						::menu.network.update = ::menu.network.UpdateMain;
-						::loop.End();
-						break;
-				}
-			}
-		} catch (e);
-	}.bindenv(this);
-
-	client_num = 2;
-	inst_connect = mb_server;
-	local ret = mb_server.Init(port,client_num);
-	if (mode & 1 && ::LOBBY.GetNetworkState() == 2)::punch.init_wait();
-	return ret;
-}
-
-function StartupClient(addr,port,mode) {
-	Initialize();
-	local mb_client = ::manbow.NetworkClient();
-	client_num = 3;
-
-	if (mode & 2 && ::LOBBY.GetNetworkState() == 2)::punch.init_connect(addr, port);
-	if (!mb_client.Init(0,client_num)) {
-		inst = null;
-		mb_client = null;
-		return false;
-	}
-
-	mb_client.ConnectRequest = function (id,context,request,reply) {
-		reply.message = "";
-
-		//||||||||||||||||||||||||||||
-		//||Match Rejection Handling||
-		//||||||||||||||||||||||||||||
-
-		//mismatched versions
-		if (!("version" in request) && request.version != ::GetVersion()) {
-			reply.message = "version";
-			return false;
-		}
-
-		//spectate not allowed
-		if (!("is_watch" in request)) {
-			reply.message = "busy";
-			return false;
-		}
-
-		//spectate not allowed
-		if (!::network.allow_watch) {
-			reply.message = "watch";
-			return false;
-		}
-
-	    reply.is_parent_vs <- ::network.is_parent_vs;
-		reply.is_watch <- true;
-		return true;
-	}
-
-
-	mb_client.ConnectComplete = function (id,context,reply) {
-		if (::LOBBY.GetNetworkState() != ::LOBBY.CLOSED)::LOBBY.Close();
-		if (inst) return;
-		if ("is_watch" in reply) {
-			allow_watch = true;
-			is_parent_vs = reply.is_parent_vs;
-			is_watch = true;
-			inst = inst_connect;
-			::sound.PlaySE(120);
-			::loop.Fade(function () {
-				::discord.rpc_set_details("Spectating");
-				::menu.network.Suspend();
-				::menu.watch.Initialize();
-			});
-			return;
-		}
-		inst = inst_connect;
-		func_get_delay = @()::network.inst.GetParentDelay();
-		received_request = {name = reply.name};
-		return;
-	}.bindenv(this);
-	mb_client.ConnectReject = function (context,table) {
-		if ("message" in table) {
-			switch (table.message) {
-				case "busy":
-					return_code = 1;
-					break;
-				case "version":
-					return_code = 2;
-					break;
-				case "watch":
-					return_code = 3;
-					break;
-				case "ready":
-					return_code = 4;
-					break;
-				case "blocked":
-					return_code = 5;
-					break;
-			}
-		}
-	}.bindenv(this);
-	mb_client.DisconnectParent = function () {
-		::print("[vdisc] native DisconnectParent is_parent_vs=" + is_parent_vs + "\n");
-		if (is_parent_vs) {
-			local t = {message = "end_vs"};
-			for (local i = 0; i < client_num; ++i) {
-				inst.SendToChild(i, t);
-			}
-			Disconnect();
-			return;
-		}
-		if (is_watch && inst)inst.Reconnect();
-	}.bindenv(this);
-	mb_client.ReceiveFromParent = function (table) {
-		try{
-			if ("message" in table) {
-				switch (table.message) {
-					case "end_vs":
-						::print("[vdisc] received end_vs from parent\n");
-						for (local i = 0; i < ::network_client_num; ++i) {
-							::network_inst.SendToChild(i, table);
-						}
-						Disconnect();
-						break;
-					case "profile":
-						::print("p1 profile image chunk\n");
-						icon[0] += table.icon_chunk;
-						break;
-					case "yes":
-						BeginMatch(table);
-						break;
-					case "no":
-						Terminate();
-						::menu.network.update = ::menu.network.UpdateMatch;
-						::LOBBY.Connect("","","",::config.network.lobby_name,::config.network.lobby_name);
-						::menu.network.lobby_user_state = ::LOBBY.MATCHING;
-						::LOBBY.SetLobbyUserState(::menu.network.lobby_user_state);
-						// ::loop.End();
-						break;
-				}
-			}
-		} catch (e);
-	}.bindenv(this);
-
-	local connect_param = {
-		version = ::GetVersion()
-		allow_watch = ::config.network.allow_watch
-		battle_num = 1
-		name = ::config.network.player_name.len() > 16 ? "P2" : ::config.network.player_name
-		color = ::savedata.GetColorNum()
-		// [#44] this peer's netcode preference. Source is gekko_enabled for now;
-		// #45's per-match menu pick overrides it. The host ANDs it with its own.
-		rollback_wanted = ::setting.network.gekko_enabled
-	};
-	::print("[#44] client Connect: connect_param has rollback_wanted=" + connect_param.rollback_wanted + " (fields=" + connect_param.len() + ")\n");
-
-	if (mode & 1)connect_param.is_watch <- false;
-
-	host_ip = addr+":"+port;
-	inst_connect = mb_client;
-	return mb_client.Connect(addr, port, connect_param);
-}
-
 function Disconnect( scene = true ) {
-	::print("[vdisc] Disconnect(scene=" + scene + ") is_disconnect=" + is_disconnect + " active=" + IsActive() + "\n");
 	if (is_disconnect || !IsActive())return;
 	is_disconnect = true;
 
@@ -368,159 +92,40 @@ function Disconnect( scene = true ) {
 		::loop.Fade(function () {
 			if (::network.IsActive()) {
 				::network.Terminate();
-				::loop.End(::menu.network);
+				//::loop.End(::netplay);
 			}
 		});
 	}else::network.Terminate();
-}
-
-function GetDelay() {
-	// Defensive: func_get_delay resolves to inst.GetChildDelay/GetParentDelay,
-	// which don't exist on the auto_connect test-rig connection (and can be
-	// unset before a real match fully binds). ping_display.Update polls this
-	// every frame; an uncaught throw here halts the game on the Squirrel
-	// exception break. Return 0 when the delay source isn't available.
-	if (func_get_delay == null) return 0;
-	try {
-		return func_get_delay();
-	} catch (_e) {
-		return 0;
-	}
-}
-
-function BeginMatch(table) {
-	received_request = null;
-	ready = true;
-	is_parent_vs = true;
-	is_client = true;
-	rand_seed = table.rand_seed;
-	srand(rand_seed);
-	// [#44] the host already computed the symmetric-AND result; adopt it so the
-	// client arms delay/rollback identically. Absent (older host) -> delay.
-	use_rollback = ("use_rollback" in table) ? table.use_rollback : false;
-	::print("[#44] BeginMatch: table.use_rollback=" + ("use_rollback" in table ? table.use_rollback : "ABSENT") + " -> use_rollback=" + use_rollback + "\n");
-
-	player_name = [table.name.len() > 16 ? "P1" : table.name,::config.network.player_name];
-	color_num = [table.color, ::savedata.GetColorNum()];
-	icon = ["", local_icon];
-
-	allow_watch = table.allow_watch;
-	hide_host_ip = !("hide_ip" in table) || table.hide_ip;
-	use_lobby = table.use_lobby;
-
-	// func_get_delay = function () {
-	// 	return::network.inst.GetParentDelay();
-	// }
-	::sound.PlaySE(120);
-	::loop.Fade(function () {
-        foreach (chunk in ::network.chunked_icon) {
-		    ::network.inst.SendToParent({
-			    message = "profile"
-			    icon_chunk = chunk
-		    });
-        }
-		::discord.rpc_set_details("VS Online");
-		::menu.network.Suspend();
-		// ROLLBACK (real-flow arm, client = slot 1): the REAL online path now
-		// arms the gekko watch — CSS + the vs intro stay on the vanilla delay
-		// netcode (BeginSyncInput creates the ManbowNetworkInputSession gekko
-		// hijacks); the GekkoGameSession is created at Round_Fight by
-		// pre_arm_poll. rand_seed is already peer-synced by this handshake.
-		// Round ends soft-disarm gekko and the transition falls back to the
-		// delay lockstep (the while(SyncInput()) gate in loop.nut) — delay for
-		// menus, rollback for battle. peer_ip/peer_port come from ::setting
-		// for now (two-local-instance testing); the punched-endpoint resolve
-		// is the next step.
-		// [#44] arm on the negotiated result, not the raw config flag.
-		if (::network.use_rollback) {
-			local gk_port_base = ::setting.network.peer_port;
-			::setting.network.gekko_watch_for_fight_dual(
-				gk_port_base + 11, gk_port_base + 10, 1,
-				::setting.network.peer_ip);
-		}
-		::menu.character_select.Initialize(1);
-	});
-}
-
-function CancelRequest() {
-	inst.SendToParent({message = "nvm"});
-	Terminate();
-	::LOBBY.Connect("","","",::config.network.lobby_name,::config.network.lobby_name);
-	::menu.network.lobby_user_state = ::LOBBY.NO_OPERATION;
-	::LOBBY.SetLobbyUserState(::menu.network.lobby_user_state);
-	::loop.End();
-}
-
-function HostAFK() {
-	inst.SendToParent({message = "afk"});
-	Terminate();
-}
-
-function AcceptMatch() {
-	ready = true;
-	player_name = [::config.network.player_name, received_request.name.len() > 16 ? "P2" : received_request.name];
-	color_num = [::savedata.GetColorNum(), received_request.color];
-	icon = [local_icon, ""];
-	rand_seed = ::manbow.timeGetTime();
-	srand(rand_seed);
-	allow_watch = ::config.network.allow_watch && received_request.allow_watch;
-	// [#44] symmetric AND — rollback only if BOTH the host wants it (gekko_enabled
-	// / #45 pick) AND the connecting client advertised rollback_wanted. The host
-	// is authoritative and ships the result in "yes" so both peers arm identically.
-	use_rollback = ::setting.network.gekko_enabled && received_request.rollback_wanted;
-	::print("[#44] AcceptMatch: my_want=" + ::setting.network.gekko_enabled
-	        + " client_want=" + received_request.rollback_wanted
-	        + " -> use_rollback=" + use_rollback + "\n");
-	received_request = null;
-	::sound.PlaySE(120);
-	::loop.Fade(function () {
-		::network.inst.SendToChild(0, {
-			message = "yes"
-			rand_seed = ::network.rand_seed
-			is_parent_vs = true
-			allow_watch = ::network.allow_watch
-			hide_ip = ::setting.network.hide_ip || !::setting.network.share_watch_ip
-			use_lobby = ::network.use_lobby
-			name = ::config.network.player_name.len() > 16 ? "P1" : ::config.network.player_name
-			color = ::network.color_num[0]
-			// [#44] the negotiated result — client arms delay/rollback to match.
-			use_rollback = ::network.use_rollback
-		});
-		foreach (chunk in ::network.chunked_icon) {
-            ::network.inst.SendToChild(0, {
-		        message = "profile"
-			    icon_chunk = chunk
-		    });
-        }
-        ::discord.rpc_set_details("VS online");
-		::menu.network.Suspend();
-		// ROLLBACK (real-flow arm, host = slot 0) — see the BeginMatch note.
-		// [#44] arm on the negotiated result, not the raw config flag.
-		if (::network.use_rollback) {
-			local gk_port_base = ::setting.network.peer_port;
-			// [#43 TODO] peer_ip/peer_port are the LAN test-rig values; real NAT
-			// play must feed the punched endpoint (punch_ip_buffer) here.
-			::setting.network.gekko_watch_for_fight_dual(
-				gk_port_base + 10, gk_port_base + 11, 0,
-				::setting.network.peer_ip);
-		}
-		::menu.character_select.Initialize(1);
-	})
-}
-
-function RejectMatch() {
-	::network.inst.SendToChild(0, {message = "no"});
-	Terminate();
-	::LOBBY.Connect("", "", "", ::config.network.lobby_name, ::config.network.lobby_name);
-	::menu.network.lobby_user_state = ::LOBBY.WAIT_INCOMMING;
-	::LOBBY.SetLobbyUserState(::menu.network.lobby_user_state);
-	StartupServer(::config.network.hosting_port, 0);
 }
 
 IsActive <- @()inst != null;
 IsPlaying <- @()inst && !is_watch;
 IsEnableStreamingBuffer <- @()inst.StreamingPlay();
 GetDelay <- @()func_get_delay();
+
+function StartupServer(port,mode) {
+	//::netplay.Server(port,mode);
+}
+
+function StartupClient(addr,port,mode) {
+	//::netplay.Client(addr,port,mode);
+}
+
+function HostAFK() {
+    inst.HostAFK();
+}
+
+function CancelRequest() {
+    inst.CancelRequest();	
+}
+
+function AcceptMatch() {
+	inst.AcceptMatch();
+}
+
+function RejectMatch() {
+	inst.RejectMatch();
+}
 
 function BeginStreaming() {
 	inst.BeginStreaming();

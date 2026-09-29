@@ -57,7 +57,7 @@ class modifier extends modifier {
             notation = ::split(config.notation,",");
 
             for (local i = 0; i < config.count; ++i) {
-                local t = ::UI.Core.Text("");
+                local t = ::UI.Text();
                 t.x = config.x;
                 t.y = config.y - (i * config.offset);
                 t.sx = config.sx;
