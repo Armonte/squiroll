@@ -61,7 +61,7 @@ class Server extends ::manbow.NetworkServer {
                         break;
                     case "afk":
                         ::network.Terminate();
-                        ::netplay.update = ::netplay.UpdateMain;
+                        ::netplay.update = ::netplay.UpdateIdle;
                         ::loop.End();
                         break;
                 }
